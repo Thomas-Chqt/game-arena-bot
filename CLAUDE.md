@@ -27,7 +27,9 @@ games/amoeba/
   src/encode.cpp
   test/encode_test.cpp          offline
   test/random_test.cpp          live server parity harness
-amoeba_bot_1/                   empty main; will become the arena client
+amoeba_bot_1/
+  mcts.hpp / mcts.cpp           PUCT search + rollout evaluator
+  main.cpp                      arena client
 ```
 
 ## Current state
@@ -41,6 +43,7 @@ The rules engine works. ~296k plies/sec, ~3.7k full random games/sec, single-thr
 - Terminal conditions agree with `amoeba-reference.md`: repetition on the 3rd occurrence, staleness
   80, move cap 250, adjudication by controlled stacks then by enemy pieces held inside them.
 - `encode()` and its test.
+- PUCT search and a rollout evaluator, wired into `amoeba_bot_1` as a playable arena client.
 
 **`random_test` has still never been run against the server.** `amoeba-reference.md` is a document,
 and the reference *Python* implementation is what was differentially tested — our C++ engine has not
@@ -121,6 +124,107 @@ the move you send and for training targets.
 bit for bit. Verified to have teeth — dropping the coordinate rotation, the colour swap, or the
 direction remap each fails on the first position.
 
+## Search (MCTS)
+
+`amoeba_bot_1/mcts.hpp` / `mcts.cpp`. PUCT, the AlphaZero variant — no rollouts *inside* the search;
+a new position's value comes from a `bot::Evaluator`.
+
+### The pieces
+
+- `Evaluator` — `evaluate(span<const Board*>, span<Evaluation>)`, where `Evaluation` is a 444-float
+  policy plus a value in `[-1, 1]`. The span form is deliberate even though the search asks one at a
+  time: a single-position MLX forward pass wastes the device, and widening the interface later would
+  touch every implementation.
+- `RolloutEvaluator` — uniform priors, value from one uniformly random playout to the end of the
+  game. Knows nothing about Amoeba, but it makes the search playable before the network exists and it
+  is the baseline the network has to beat.
+- `Search::run(root, history) -> VisitCounts` — 444 visit counts. `bestMove()` is the argmax;
+  normalised, the same array is the policy target for training.
+
+### Invariants that are easy to break
+
+- **Every stored value is from the point of view of the side to move at the node that owns it**, so
+  the backup flips sign once per level. Inverting this yields a bot that actively seeks its own worst
+  lines — it loses to random play, which is at least a loud symptom.
+- **The statistics live on the edge, not the child node.** PUCT needs a prior and a visit count for
+  moves that have never been played, i.e. before the resulting position exists. Measured branching is
+  52 at the opening and 27 on average, so an 800-simulation search holds ~801 nodes and ~21,600
+  edges; making every edge a node would mean 27× the `apply()` calls and 8.5 MB instead of 432 KB.
+- **`m_path` is the repetition history**, maintained as one vector: the caller's game history as a
+  fixed prefix, one hash pushed per node stepped into during the descent, truncated back to the
+  prefix at the top of every simulation. At the `apply()` call its last element is the board being
+  applied — exactly what that function's contract asks for.
+- **No transposition table.** A node's terminal `state` is path-dependent (draw by repetition), and
+  with one path per node it stays valid forever. Sharing statistics across paths would make a cached
+  `Draw` verdict a lie on the other path.
+
+### The board in the node
+
+`Node` is 392 bytes because it holds a whole `Board`. The alternative is replaying `applyRaw` down
+the descent path every simulation. Storing won because `apply()` — the expensive call, it runs
+`generateLegal` — is then paid exactly once per node, and a node needs path-dependent state anyway.
+The cost is cache: the descent reads only `visits`, `edgeCount` and `board.hash` out of those 392
+bytes. Splitting hot (~24 B) from cold would fix it, and is not worth doing while the evaluator is
+~99% of the time.
+
+### Deliberately absent
+
+- **Dirichlet root noise** — self-play variety only, ~6 lines at the root. Without it every self-play
+  game from a given network is identical and training stalls.
+- **Temperature sampling** — same. Competition wants the argmax; self-play must sample, `T = 1` for
+  the first ~15 plies then `T → 0`.
+- **Tree reuse between moves** — the subtree under the played move stays valid, and re-rooting is
+  roughly 20-40% more effective simulations for free. `m_nodes` / `m_edges` are members so
+  allocations are reused, but the tree is cleared on every `run()`.
+- **A search deadline** — 2000 fixed simulations measure **351 ms** worst case over the first 24
+  plies, against a 5 s turn limit. Safe only while an evaluation is a rollout.
+- **Leaf batching with virtual loss** — see Training below. Cheaper to build before the network than
+  to retrofit after.
+
+### Verification gap
+
+A `strength_check` binary existed: rollout MCTS against uniformly random legal play, alternating
+colours, seed `20260819`. It scored **97.5%** (39-0-1) at 200 simulations and **100%** (20-0-0) at
+800. Both numbers mattered — the second showed strength rising with simulation count, which is the
+property a broken tree does not have. It was deleted on request, so nothing offline checks the search
+any more.
+
+## Arena client
+
+`amoeba_bot_1/main.cpp`. Four callbacks, same shape as the reference's random bot.
+
+- **Translation.** The engine names a move `(from, dir, splitting)`; the server names it
+  `(pos, destination, splitting)`. `collectServerMoves()` turns the server's list into engine move
+  ids, the search picks one, and `chooseMove()` finds it back in that list to recover the server's
+  own strings.
+- **The bot keeps its own board.** `arena_game_state_t` carries a position and nothing else — no ply
+  count, no history — so `syncToServer()` works out which legal move the opponent played and applies
+  it locally. Re-parsing the server's board each turn instead would silently reset `ply` and
+  `staleness` to zero every ply, and would leave no hash history for the search to detect repetition
+  with.
+- **Two fallbacks, because forfeiting is worse than wrong bookkeeping.** If no legal move reaches the
+  server's position, adopt that position and carry `ply` forward — that is a rules bug, and
+  `amoeba_random_test` should have caught it first. If the search picks a move the server did not
+  offer, play the server's first move.
+- **Never run against the live server.** The credential check and both fallbacks are exercised;
+  actual match play is not.
+
+## Code conventions
+
+- **Never `using namespace`** — not in headers, not in `.cpp` files, not inside `main`. Qualify
+  everything (`amoeba::Board`). No `namespace game = amoeba;` aliases either. `games/amoeba/test/*`
+  predates this rule and still has `using namespace amoeba;`.
+- **One short namespace per target**, named after it: `amoeba_bot_1/` is `namespace bot`. Everything
+  in the target goes in it, including a file's internal helpers (anonymous namespace nested inside);
+  `main` stays at global scope and just calls in. No per-feature namespace (`mcts`) beside it.
+- **Private members are `m_`-prefixed**, not underscore-suffixed: `m_nodes`, not `nodes_`.
+- **No new targets or modules without asking.** The search lives inside `amoeba_bot_1`, not in a
+  `search/` library. Only `games/amoeba` earns its own module, because keeping it MLX-free is a real
+  constraint.
+- Comments explain *why*, never *what*. Newest standard-library facility that fits — `std::print`,
+  ranges, `std::span`. No `--flag` parsing in tools; env vars are enough.
+- **No README.** This file is the documentation.
+
 ## Network — not written yet
 
 - **Attention over the 37 hex tokens, not convolution.** Amoeba's interactions are long-range by
@@ -159,12 +263,12 @@ direction remap each fails on the first position.
 
 ## Next steps
 
-1. **MCTS with a dummy evaluator** — uniform policy over `Board::legal`, value 0 or a random rollout.
-   No ML involved, and it isolates search bugs before a network exists to blame.
-2. **Network** in MLX.
-3. **Self-play → training loop.**
-4. **`amoeba_bot_1`** becomes the arena client. Budget the search against a **5 second** wall clock
-   (10 s for the first move) and always keep a fallback move ready — invalid moves do not reset it.
+1. **Run `amoeba_random_test` against the server**, and play `amoeba_bot_1` in a practice room.
+   Neither has ever touched the live server, and everything downstream assumes they would pass.
+2. **Network** in MLX, behind the existing `bot::Evaluator` interface. The search does not change.
+3. **Self-play → training loop.** Needs Dirichlet root noise, temperature sampling and a real search
+   deadline added first — see Search above for why none of them exist yet.
+4. **Head-to-head harness**, generation 2 vs generation 1.
 
 Run the whole pipeline end to end at a deliberately tiny scale first — 2 attention blocks, 50 sims,
 200 games. "It runs and the loss goes down" proves almost nothing; AlphaZero bugs produce clean
@@ -196,6 +300,11 @@ CMake + Ninja, multi-config, build tree in `build.nosync/`.
 ```
 cmake -S . -B build.nosync
 cmake --build build.nosync
+```
+
+```
+BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot_1/Release/amoeba_bot_1        # one ranked match
+ROOM_ID=… BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot_1/Release/amoeba_bot_1   # practice room
 ```
 
 Two test binaries, neither using a test framework:
