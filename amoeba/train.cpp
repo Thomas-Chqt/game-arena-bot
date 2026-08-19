@@ -18,6 +18,11 @@
 // AlphaZero bugs produce clean loss curves, so nothing is promoted on a curve -
 // only on games won.
 //
+// The defaults are meant for a real overnight run, not a smoke test. To check
+// the wiring quickly instead:
+//
+//   BLOCKS=2 WIDTH=64 HEADS=4 GAMES=8 SIMULATIONS=50 STEPS=100 GATE_GAMES=8
+//
 // Environment, all optional:
 //   network     BLOCKS WIDTH HEADS          (only read when starting from scratch)
 //   generating  SEED GAMES SIMULATIONS LEAVES SAMPLING_PLIES NOISE
@@ -74,25 +79,49 @@ float envFloat(const char* name, float fallback)
     return text == nullptr ? fallback : std::stof(text);
 }
 
+// The defaults are sized for an overnight run on one Mac, not for a smoke test.
+// A generation at these settings is expected to take on the order of an hour;
+// if it takes much longer, GAMES is the knob to turn down first, because it is
+// the only one that trades directly against how many generations a night holds.
 struct Settings
 {
-    uint64_t     seed          = static_cast<uint64_t>(envInt("SEED", 20260819));
-    NetworkShape shape         = {.blocks = envInt("BLOCKS", 2),
-                                  .width  = envInt("WIDTH", 64),
-                                  .heads  = envInt("HEADS", 4)};
-    Config       search        = {.simulations = envInt("SIMULATIONS", 100),
-                                  .batchSize   = envInt("LEAVES", 16)};
-    int          games         = envInt("GAMES", 30);
-    int          samplingPlies = envInt("SAMPLING_PLIES", 20);
-    float        noise         = envFloat("NOISE", 0.25f);
+    uint64_t seed = static_cast<uint64_t>(envInt("SEED", 20260819));
 
-    int    steps     = envInt("STEPS", 300);
-    int    batchSize = envInt("BATCH", 128);
-    float  rate      = envFloat("RATE", 1e-3f);
-    float  decay     = envFloat("DECAY", 1e-4f);
-    size_t buffer    = static_cast<size_t>(envInt("BUFFER", 50000));
+    // Read only when there is no checkpoint to load - otherwise the shape comes
+    // out of the file. ~1.2M parameters, which is the size the encoder and the
+    // relative-position bias were designed around.
+    NetworkShape shape = {.blocks = envInt("BLOCKS", 6),
+                          .width  = envInt("WIDTH", 128),
+                          .heads  = envInt("HEADS", 8)};
 
-    int   gateGames = envInt("GATE_GAMES", 40);
+    // 400 simulations is half of AlphaZero's 800, which is the usual trade on one
+    // machine: the policy target is a distribution over visits, and doubling the
+    // visits sharpens it far less than doubling the games broadens it.
+    Config search = {.simulations = envInt("SIMULATIONS", 400),
+                     .batchSize   = envInt("LEAVES", 16)};
+
+    // 200 games is roughly 20k positions. Fewer than that and each generation's
+    // training set is mostly the previous generation's, so the gate compares two
+    // networks that saw nearly the same data and rejects almost everything.
+    int   games         = envInt("GAMES", 200);
+    int   samplingPlies = envInt("SAMPLING_PLIES", 20);
+    float noise         = envFloat("NOISE", 0.25f);
+
+    int   steps     = envInt("STEPS", 1000);
+    int   batchSize = envInt("BATCH", 256);
+    float rate      = envFloat("RATE", 1e-3f);
+    float decay     = envFloat("DECAY", 1e-4f);
+
+    // About the last ten generations. Older positions came from networks several
+    // generations weaker and hold the current one back; keeping none of them at
+    // all makes each generation overfit the games it just played. ~440 MB.
+    size_t buffer = static_cast<size_t>(envInt("BUFFER", 200000));
+
+    // 200 games puts the gate's error bar at +/-3.5%, which is what it takes for
+    // a 55% result to mean anything - at 40 games the bar is +/-8% and promotion
+    // is close to a coin flip. It costs as much as the self-play it judges, and
+    // that is the price of the only honest signal in the system.
+    int   gateGames = envInt("GATE_GAMES", 200);
     float gate      = envFloat("GATE", 0.55f);
 };
 
@@ -412,8 +441,8 @@ double gate(const Network& candidate, const Network& champion, const Settings& s
     const double score = (wins + 0.5 * draws) / settings.gateGames;
 
     // Standard error of a proportion, so a result is not read as more precise than
-    // it is. At 40 games this is about 8 points, which cannot separate 55% from a
-    // coin flip - raise GATE_GAMES into the hundreds before trusting a promotion.
+    // it is: at the default 200 games it is about 3.5 points, and at 40 it is 8,
+    // which cannot separate 55% from a coin flip.
     const double error = std::sqrt(score * (1.0 - score) / settings.gateGames);
     report("[gate] candidate {:.1f}% +/- {:.1f}% ({}-{}-{}) over {} games", 100.0 * score,
            100.0 * error, wins, losses, draws, settings.gateGames);

@@ -286,6 +286,16 @@ One generation is three steps: play `GAMES` games of the current best against it
 buffer, train a candidate on batches from that buffer, then play the candidate against the current
 best and promote only if it wins.
 
+**The defaults are sized for a real overnight run**, not a smoke test: 6 blocks at width 128
+(~1.2M parameters), 400 simulations, 200 self-play games and a 200-game gate. A generation is
+expected to take on the order of an hour; `GAMES` is the knob to turn down first, because it is the
+only one that trades directly against how many generations a night holds. To check the wiring
+quickly instead:
+
+```
+BLOCKS=2 WIDTH=64 HEADS=4 GAMES=8 SIMULATIONS=50 STEPS=100 GATE_GAMES=8 ./build.nosync/amoeba_train
+```
+
 Env vars, all optional: `BLOCKS WIDTH HEADS` (read only when starting from scratch — otherwise the
 shape comes out of the checkpoint), `SEED GAMES SIMULATIONS LEAVES SAMPLING_PLIES NOISE`,
 `STEPS BATCH RATE DECAY BUFFER`, `GATE_GAMES GATE`.
@@ -322,8 +332,10 @@ shape comes out of the checkpoint), `SEED GAMES SIMULATIONS LEAVES SAMPLING_PLIE
 - **Games are never written to disk**, so a restart loses the replay buffer and has to regenerate it.
   Only the weights survive.
 - **Adam's moment estimates are not checkpointed**, so a generation cannot be resumed part way.
-- **The gate needs hundreds of games.** At the default 40 its error bar is ±8%, which cannot separate
-  55% from a coin flip. It prints the error bar rather than pretending otherwise.
+- **The gate needs hundreds of games**, which is why the default is 200 — an error bar of ±3.5%,
+  against ±8% at 40 where promotion is close to a coin flip. It costs as much as the self-play it
+  judges, and that is the price of the only honest signal in the system. It prints the error bar
+  every time; read it before believing a promotion.
 - **Leaves are batched within one game.** Batching across many concurrent games is the real
   throughput win and is a much larger change.
 
@@ -522,8 +534,9 @@ entropy of the search's own disagreement with itself.
    harness that would have caught a rules disagreement is gone. If the engine and the server disagree,
    `syncToServer()` silently resyncs and a bad rating cannot be told apart from a bad network. Do this
    before spending days of compute.
-2. **Run the loop at a scale where the gate means something** — hundreds of gate games, not 40.
-   Everything it needs exists; what is missing is compute and patience.
+2. **Run the loop overnight at the defaults** and count promotions in the morning. Several means the
+   loop works and the rest is compute; zero means something is wrong and more compute will not fix
+   it. That count, not a rating, is what the first night is for.
 3. **Persist the replay buffer.** A restart currently throws away every game played and regenerates
    them, which is by far the most expensive thing the trainer does.
 4. **Batch leaves across concurrent games**, not just within one. That is the real throughput win.
@@ -571,7 +584,7 @@ directory. Run them side by side in the same directory and the bot picks up each
 next game.
 
 ```
-# train forever, starting from random weights if the file does not exist
+# train forever at the overnight defaults, starting from random weights if the file does not exist
 ./build.nosync/amoeba_train                       # ./amoeba.safetensors
 ./build.nosync/amoeba_train run7.safetensors
 
