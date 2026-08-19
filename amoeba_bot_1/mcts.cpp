@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 #include <ranges>
 
 namespace bot
@@ -10,16 +11,21 @@ namespace bot
 namespace
 {
 
-// The result of a finished game seen by whoever is to move in it - which, at a
-// terminal position, is the side that was just mated or ran out of moves.
+// Seen by whoever is to move in it - which, at a terminal position, is the side
+// that was just mated or ran out of moves.
 float terminalValue(const amoeba::Board& b)
 {
-    if (b.state == amoeba::State::Draw)
-        return 0.0f;
-    return (b.state == amoeba::State::WhiteWins) == b.whiteToMove ? 1.0f : -1.0f;
+    return outcomeFor(b.state, b.whiteToMove);
 }
 
 } // namespace
+
+float outcomeFor(amoeba::State state, bool whiteToMove)
+{
+    if (state == amoeba::State::Draw)
+        return 0.0f;
+    return (state == amoeba::State::WhiteWins) == whiteToMove ? 1.0f : -1.0f;
+}
 
 uint16_t randomLegalMove(const amoeba::Board& b, std::mt19937_64& rng)
 {
@@ -32,6 +38,24 @@ uint16_t randomLegalMove(const amoeba::Board& b, std::mt19937_64& rng)
 uint16_t bestMove(const VisitCounts& counts)
 {
     return static_cast<uint16_t>(std::ranges::max_element(counts) - counts.begin());
+}
+
+uint16_t sampleMove(const VisitCounts& counts, float temperature, std::mt19937_64& rng)
+{
+    std::array<double, amoeba::kNumMoveIds> weights{};
+    const double exponent = 1.0 / temperature;
+    for (size_t id = 0; id < counts.size(); ++id)
+        if (counts[id] > 0)
+            weights[id] = std::pow(static_cast<double>(counts[id]), exponent);
+
+    const double total = std::accumulate(weights.begin(), weights.end(), 0.0);
+    double       point = std::uniform_real_distribution<double>(0.0, total)(rng);
+
+    for (size_t id = 0; id < weights.size(); ++id)
+        if ((point -= weights[id]) < 0.0)
+            return static_cast<uint16_t>(id);
+
+    return bestMove(counts);   // only reachable if rounding eats the whole total
 }
 
 // ---------------------------------------------------------------------------
@@ -55,9 +79,7 @@ float RolloutEvaluator::playout(amoeba::Board b)
     while (b.state == amoeba::State::Ongoing)
         b = amoeba::apply(b, amoeba::Move::fromId(randomLegalMove(b, m_rng)));
 
-    if (b.state == amoeba::State::Draw)
-        return 0.0f;
-    return (b.state == amoeba::State::WhiteWins) == mover ? 1.0f : -1.0f;
+    return outcomeFor(b.state, mover);
 }
 
 // ---------------------------------------------------------------------------
@@ -80,6 +102,24 @@ std::pair<uint32_t, float> Search::addNode(const amoeba::Board& b)
 
     m_nodes[index].edgeCount = b.moveCount;
     return {index, ev.value};
+}
+
+void Search::addRootNoise()
+{
+    const Node& root = m_nodes[0];
+    std::gamma_distribution<float> gamma(m_config.rootNoiseAlpha, 1.0f);
+
+    m_noise.clear();
+    double total = 0.0;
+    for (uint32_t i = 0; i < root.edgeCount; ++i)
+        total += m_noise.emplace_back(gamma(m_rng));
+
+    for (uint32_t i = 0; i < root.edgeCount; ++i)
+    {
+        Edge& e = m_edges[root.firstEdge + i];
+        e.prior = (1.0f - m_config.rootNoiseWeight) * e.prior
+                + m_config.rootNoiseWeight * static_cast<float>(m_noise[i] / total);
+    }
 }
 
 uint32_t Search::selectEdge(uint32_t node) const
@@ -109,9 +149,20 @@ VisitCounts Search::run(const amoeba::Board& root, std::span<const uint64_t> his
     const size_t baseLength = m_path.size();
 
     addNode(root);
+    if (m_config.rootNoiseWeight > 0.0f)
+        addRootNoise();
+
+    const auto expiry = std::chrono::steady_clock::now() + m_config.deadline;
 
     for (int sim = 0; sim < m_config.simulations; ++sim)
     {
+        // One clock read per simulation is nothing next to an evaluation, and
+        // the alternative - checking every k - overshoots by a whole batch. The
+        // first simulation always runs: an empty set of visit counts has no
+        // move in it to play and no distribution in it to train on.
+        if (sim > 0 && std::chrono::steady_clock::now() >= expiry)
+            break;
+
         m_path.resize(baseLength);
         m_trail.clear();
 

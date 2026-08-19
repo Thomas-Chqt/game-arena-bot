@@ -69,4 +69,29 @@ inline constexpr int kGlobalInCheck        = 7;
 // fromString() both do it.
 void encode(const Board& b, std::span<float, kEncodedSize> out);
 
+// The other half of the perspective flip: encode() writes the board in the
+// mover's frame, so a policy over that input is indexed by flipped move ids and
+// has to come back through here before it can name a move, and a training
+// target has to go through it in the other direction. Both directions are the
+// same table - rotating twice and taking the opposite twice are both identities.
+//
+// Only meaningful when Black is to move; White's frame is already absolute.
+inline constexpr auto kFlippedMove = [] -> std::array<uint16_t, kNumMoveIds>
+{
+    std::array<uint16_t, kNumMoveIds> table{};
+    for (uint16_t id = 0; id < kNumMoveIds; ++id)
+    {
+        const Move m = Move::fromId(static_cast<uint16_t>(id));
+        table[id] = Move{kFlipped[m.from], opposite(m.dir), m.splitting}.id();
+    }
+    return table;
+}();
+
+static_assert([] {
+    for (uint16_t id = 0; id < kNumMoveIds; ++id)
+        if (kFlippedMove[kFlippedMove[id]] != id)
+            return false;
+    return true;
+}(), "the perspective flip must undo itself, or a policy cannot be mapped back");
+
 } // namespace amoeba

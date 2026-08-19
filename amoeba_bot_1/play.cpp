@@ -1,20 +1,31 @@
-// Plays Amoeba on Game Arena with the search. The SDK side is the same shape as
-// the random bot in the reference: fill arena_move_t with the strings the server
-// sent, and copy the piece's splitting flag straight back.
+// amoeba_bot_1: plays Amoeba on Game Arena, and does nothing else. Training
+// lives in amoeba_bot_1_train; the two programs only ever meet in the checkpoint
+// directory, so either one can be killed and restarted without the other
+// noticing.
+//
+// The SDK side is the same shape as the random bot in the reference: fill
+// arena_move_t with the strings the server sent, and copy the piece's splitting
+// flag straight back.
 //
 // The server sends a position and nothing else - no ply count, no history - so
 // the bot keeps its own board and replays the opponent's move onto it. That is
 // what keeps ply, staleness and the repetition history right, and the search
 // needs all three to see draws and adjudications coming.
 
+#include "checkpoints.hpp"
 #include "mcts.hpp"
+#include "network.hpp"
 
 #include <arena/arena.h>
 
 #include <algorithm>
 #include <charconv>
 #include <cstdlib>
+#include <exception>
+#include <filesystem>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <print>
 #include <random>
 #include <span>
@@ -27,10 +38,32 @@ namespace bot
 namespace
 {
 
-// 5 s a move on the server, 0.5 s of grace. Measured worst case over the first
-// 24 plies is 350 ms, so a fixed count is a safe way to budget a turn - but only
-// while an evaluation is a rollout. The network will need a real deadline.
-constexpr int kSimulations = 2000;
+// 5 s a move on the server. The simulation count is generous and the deadline
+// is what actually ends the search: the trainer may be running on the same
+// machine and holding the GPU, and a turn that arrives late is a forfeit, while
+// a turn that ran only 300 simulations is merely a weaker move.
+constexpr int                       kSimulations = 20000;
+constexpr std::chrono::milliseconds kTurnBudget{4000};
+
+// A C++ exception unwinding through the SDK's C frames is undefined behaviour,
+// so nothing may leave a callback. A turn that goes unanswered times out and
+// loses one game; a crash here loses every game that would have followed.
+template <typename Fn>
+void guarded(const char* callback, Fn&& body)
+{
+    try
+    {
+        body();
+    }
+    catch (const std::exception& error)
+    {
+        std::println(stderr, "[bot] {} threw: {}", callback, error.what());
+    }
+    catch (...)
+    {
+        std::println(stderr, "[bot] {} threw something that is not an exception", callback);
+    }
+}
 
 struct ServerMove
 {
@@ -40,12 +73,16 @@ struct ServerMove
     bool         splitting;   // the server's own per-piece flag, echoed verbatim
 };
 
+// The model is loaded once per game and held for the whole of it. Swapping it
+// mid-game would mean one tree scoring its positions with two different
+// networks, which is incoherent and would not show up in any log.
 struct Context
 {
-    RolloutEvaluator      evaluator{std::random_device{}()};
-    Search                search{evaluator, {.simulations = kSimulations}};
-    amoeba::Board         board;
-    std::vector<uint64_t> history;
+    Checkpoints                    checkpoints = Checkpoints::fromEnvironment();
+    std::unique_ptr<Network>       network;
+    std::optional<Search>          search;
+    amoeba::Board                  board;
+    std::vector<uint64_t>          history;
 };
 
 // ---------------------------------------------------------------------------
@@ -173,7 +210,7 @@ const ServerMove& chooseMove(Context& context, const std::vector<ServerMove>& mo
         return moves.front();
     }
 
-    const VisitCounts counts = context.search.run(context.board, context.history);
+    const VisitCounts counts = context.search->run(context.board, context.history);
     const uint16_t    chosen = bestMove(counts);
 
     const auto found = std::ranges::find_if(moves, [chosen](const ServerMove& m) { return m.move.id() == chosen; });
@@ -187,44 +224,72 @@ const ServerMove& chooseMove(Context& context, const std::vector<ServerMove>& mo
     return *found;
 }
 
+// Between games, and only between games: whatever the trainer has promoted
+// since the last one.
+void loadBestNetwork(Context& context)
+{
+    const std::optional<std::filesystem::path> best = context.checkpoints.best();
+    if (!best.has_value())
+        throw std::runtime_error("no promoted model in the checkpoint directory - run amoeba_bot_1_train first");
+
+    context.network = loadNetwork(*best);
+    context.search.emplace(*context.network,
+                           Config{.simulations = kSimulations, .deadline = kTurnBudget});
+    std::println("[bot] playing with {}", best->filename().string());
+}
+
 void onGameStart(const arena_game_state_t* state, void* userData)
 {
-    Context& context = *static_cast<Context*>(userData);
-    context.board    = amoeba::fromString(state->board, state->current_turn == ARENA_SIDE_WHITE);
-    context.history.assign(1, context.board.hash);
+    guarded("on_game_start", [&] {
+        Context& context = *static_cast<Context*>(userData);
+        loadBestNetwork(context);
 
-    std::println("[bot] game start, I am {}, {} to move", arena_side_str(state->my_side), arena_side_str(state->current_turn));
+        context.board = amoeba::fromString(state->board, state->current_turn == ARENA_SIDE_WHITE);
+        context.history.assign(1, context.board.hash);
+
+        std::println("[bot] game start, I am {}, {} to move", arena_side_str(state->my_side), arena_side_str(state->current_turn));
+    });
 }
 
 void onMove(const arena_game_state_t* state, arena_move_t* output, void* userData)
 {
-    Context& context = *static_cast<Context*>(userData);
-    syncToServer(context, state->board, state->current_turn);
+    guarded("on_move", [&] {
+        Context& context = *static_cast<Context*>(userData);
+        if (!context.search.has_value())
+        {
+            std::println(stderr, "[bot] no model loaded, cannot move");
+            return;
+        }
 
-    const std::vector<ServerMove> moves = collectServerMoves(*state, context.board);
-    if (moves.empty())
-    {
-        std::println(stderr, "[bot] no usable move in the server's list for {}", state->board);
-        return;
-    }
+        syncToServer(context, state->board, state->current_turn);
 
-    const ServerMove& chosen = chooseMove(context, moves);
+        const std::vector<ServerMove> moves = collectServerMoves(*state, context.board);
+        if (moves.empty())
+        {
+            std::println(stderr, "[bot] no usable move in the server's list for {}", state->board);
+            return;
+        }
 
-    // The SDK owns these strings for the duration of the callback, and they
-    // carry the server's own spelling of the move.
-    output->from_pos  = chosen.from;
-    output->to_pos    = chosen.to;
-    output->side      = nullptr;
-    output->splitting = chosen.splitting;
+        const ServerMove& chosen = chooseMove(context, moves);
 
-    advance(context, chosen.move);
+        // The SDK owns these strings for the duration of the callback, and they
+        // carry the server's own spelling of the move.
+        output->from_pos  = chosen.from;
+        output->to_pos    = chosen.to;
+        output->side      = nullptr;
+        output->splitting = chosen.splitting;
+
+        advance(context, chosen.move);
+    });
 }
 
 void onGameEnd(const arena_game_end_t* state, void* userData)
 {
-    const Context& context = *static_cast<Context*>(userData);
-    const char*    result  = !state->has_winner ? "draw" : state->winner == state->my_side ? "won" : "lost";
-    std::println("[bot] {} after {} plies", result, context.board.ply);
+    guarded("on_game_end", [&] {
+        const Context& context = *static_cast<Context*>(userData);
+        const char*    result  = !state->has_winner ? "draw" : state->winner == state->my_side ? "won" : "lost";
+        std::println("[bot] {} after {} plies", result, context.board.ply);
+    });
 }
 
 void onDisconnect(const char* reason, void*)
@@ -247,6 +312,12 @@ int main()
     }
 
     bot::Context context;
+    if (!context.checkpoints.best().has_value())
+    {
+        std::println(stderr, "no promoted model yet - run amoeba_bot_1_train until it promotes a generation");
+        return EXIT_FAILURE;
+    }
+
     const arena_bot_config_t config{
         .bot_id    = botId,
         .api_key   = apiKey,
@@ -259,7 +330,13 @@ int main()
         .user_data = &context,
     };
 
-    // A practice room when one is named, a ranked match otherwise.
-    const char* roomId = std::getenv("ROOM_ID");
-    return roomId == nullptr ? arena_start(&config, ARENA_GAME_AMOEBA) : arena_start_practice(&config, roomId);
+    // A practice room when one is named, otherwise ranked games back to back
+    // for as long as the process lives. arena_start_continuous only returns on
+    // error, so reaching the println below always means something went wrong.
+    if (const char* roomId = std::getenv("ROOM_ID"))
+        return arena_start_practice(&config, roomId);
+
+    const int status = arena_start_continuous(&config, ARENA_GAME_AMOEBA);
+    std::println(stderr, "[bot] continuous play stopped with status {}", status);
+    return status;
 }

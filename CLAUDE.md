@@ -29,8 +29,19 @@ games/amoeba/
   test/random_test.cpp          live server parity harness
 amoeba_bot_1/
   mcts.hpp / mcts.cpp           PUCT search + rollout evaluator
-  main.cpp                      arena client
+  checkpoints.hpp / .cpp        the model directory and the `best` link
+  network.hpp                   the seam with the network branch - declarations only
+  play.cpp                      arena client        -> amoeba_bot_1
+  train.cpp                     self-play + training -> amoeba_bot_1_train
 ```
+
+**Two programs, on purpose.** `amoeba_bot_1` plays and never trains;
+`amoeba_bot_1_train` trains and never talks to the server — it does not even link the arena SDK.
+They share a checkpoint directory and nothing else, so both can run at once on the same machine and
+either can be killed and restarted without the other noticing. A match costs almost nothing next to
+self-play (one game is ~4 minutes of thinking, most of it waiting on the opponent's clock), so
+continuous ranked play takes a couple of percent off training throughput. Coordinating them in one
+process would buy the ability to pause training during a turn, which is not worth the coupling.
 
 ## Current state
 
@@ -42,8 +53,14 @@ The rules engine works. ~296k plies/sec, ~3.7k full random games/sec, single-thr
 - `generateLegal`, `kernelAttacked`, `applyRaw` / `apply`, `fromString` / `toString`.
 - Terminal conditions agree with `amoeba-reference.md`: repetition on the 3rd occurrence, staleness
   80, move cap 250, adjudication by controlled stacks then by enemy pieces held inside them.
-- `encode()` and its test.
-- PUCT search and a rollout evaluator, wired into `amoeba_bot_1` as a playable arena client.
+- `encode()`, its test, and `kFlippedMove` — the 444-entry permutation that maps a policy out of
+  the mover's frame. `static_assert`ed to be its own inverse.
+- `openingBoard()`, the position self-play starts every game from.
+- PUCT search with a deadline, Dirichlet root noise and temperature sampling; a rollout evaluator.
+- `amoeba_bot_1` (continuous arena play) and `amoeba_bot_1_train` (self-play, training, gating),
+  both complete except for the network. `network.hpp` declares the eight symbols the model branch
+  owes them; there is no `network.cpp`, so **both targets compile and fail to link**, which is the
+  intended state until the model lands.
 
 **`random_test` has still never been run against the server.** `amoeba-reference.md` is a document,
 and the reference *Python* implementation is what was differentially tested — our C++ engine has not
@@ -167,19 +184,26 @@ The cost is cache: the descent reads only `visits`, `edgeCount` and `board.hash`
 bytes. Splitting hot (~24 B) from cold would fix it, and is not worth doing while the evaluator is
 ~99% of the time.
 
-### Deliberately absent
+### Self-play knobs, now present
 
-- **Dirichlet root noise** — self-play variety only, ~6 lines at the root. Without it every self-play
-  game from a given network is identical and training stalls.
-- **Temperature sampling** — same. Competition wants the argmax; self-play must sample, `T = 1` for
-  the first ~15 plies then `T → 0`.
+- **`Config::deadline`** — the search stops at the simulation count *or* the clock, whichever comes
+  first, and always runs at least one simulation so the visit counts can never be all zero. Match
+  play sets the count high and lets the deadline bind: the trainer may be holding the GPU, and a
+  late turn is a forfeit while a short search is only a weaker move. Self-play does the reverse, so
+  its data does not depend on how busy the machine was.
+- **`Config::rootNoiseWeight`** — Dirichlet noise mixed into the root priors, 0.25 in self-play and
+  0 everywhere else. Without it every self-play game from one network is the same game.
+- **`sampleMove(counts, temperature, rng)`** — picks in proportion to `visits^(1/T)`. Self-play and
+  the gate use it for the first 15 plies, then `bestMove`. It deliberately does not accept `T = 0`;
+  call `bestMove` for the greedy phase.
+
+### Still deliberately absent
+
 - **Tree reuse between moves** — the subtree under the played move stays valid, and re-rooting is
   roughly 20-40% more effective simulations for free. `m_nodes` / `m_edges` are members so
   allocations are reused, but the tree is cleared on every `run()`.
-- **A search deadline** — 2000 fixed simulations measure **351 ms** worst case over the first 24
-  plies, against a 5 s turn limit. Safe only while an evaluation is a rollout.
-- **Leaf batching with virtual loss** — see Training below. Cheaper to build before the network than
-  to retrofit after.
+- **Leaf batching with virtual loss** — see Trainer below. Cheaper to build before the network than
+  to retrofit after, and it is what unlocks concurrent self-play games.
 
 ### Verification gap
 
@@ -191,7 +215,8 @@ any more.
 
 ## Arena client
 
-`amoeba_bot_1/main.cpp`. Four callbacks, same shape as the reference's random bot.
+`amoeba_bot_1/play.cpp`. Four callbacks, same shape as the reference's random bot. With no
+`ROOM_ID` it runs `arena_start_continuous`, which queues game after game and only returns on error.
 
 - **Translation.** The engine names a move `(from, dir, splitting)`; the server names it
   `(pos, destination, splitting)`. `collectServerMoves()` turns the server's list into engine move
@@ -206,8 +231,43 @@ any more.
   server's position, adopt that position and carry `ply` forward — that is a rules bug, and
   `amoeba_random_test` should have caught it first. If the search picks a move the server did not
   offer, play the server's first move.
+- **The model is loaded once per game**, in `on_game_start`, from the `best` link. Between games is
+  the only safe moment: one tree scoring its positions with two different networks is incoherent and
+  would not show up in any log.
+- **Every callback is wrapped in `guarded()`.** A C++ exception unwinding through the SDK's C frames
+  is undefined behaviour. An unanswered turn times out and loses one game; a crash loses every game
+  that would have followed.
 - **Never run against the live server.** The credential check and both fallbacks are exercised;
   actual match play is not.
+
+## Trainer
+
+`amoeba_bot_1/train.cpp`. One generation is three steps: self-play with the champion into a replay
+buffer, gradient steps on batches from that buffer, then a match against the champion. Everything is
+tunable by env var (`AMOEBA_SELFPLAY_GAMES`, `AMOEBA_TRAIN_STEPS`, `AMOEBA_GATE_GAMES`, …).
+
+- **The gate is the point of the file.** Training does not improve monotonically, so "newest model"
+  and "strongest model" are different things, and AlphaZero bugs produce clean loss curves. A
+  generation is promoted only if it scores ≥ 55% over 100 games against the incumbent. `play.cpp`
+  reads only `best`; pointing it at the newest file instead would make its rating a random walk over
+  checkpoint noise.
+- **Gate games must not be deterministic.** Both sides play the argmax, so without the sampled
+  opening the whole match is one game replayed 100 times and the score is 0% or 100%. Colours
+  alternate, because White moving first is worth something.
+- **The learner is carried across generations**, and is *not* reset to the champion after a failed
+  gate — that would throw away a generation of training and make a two-generation plateau
+  impossible to cross. Self-play uses the champion (the AlphaGo Zero arrangement), the learner is
+  what gets gated.
+- **`Sample` holds a `Board`, not its encoding.** Six times smaller in the buffer, and the 12×
+  symmetry augmentation has to permute hexes and directions, which it cannot do to a flat array of
+  floats. Its `policy` is in absolute move ids; flipping it into the mover's frame is the trainer's
+  job, next to the `encode()` it has to agree with — one place, so the two flips cannot drift apart.
+- **The replay buffer is a ring over the last 500k positions**, persisted to `replay.bin` beside the
+  checkpoints so a crash does not cost a day of self-play. Written staging-then-rename, like the
+  `best` link.
+- **Self-play is one game at a time.** The first thing to fix once the network exists: `Evaluator`
+  already takes a span of boards, so the shape to move to is many concurrent games collecting leaves
+  into one batched forward pass.
 
 ## Code conventions
 
@@ -238,11 +298,19 @@ any more.
   `Move::id`. Mask with `Board::legal` (set illegal logits to −∞ before softmax).
 - **Value head:** mean-pool → MLP → tanh. ~1-2M params total.
 
-## Training — not written yet
+## Training — what is left
 
-- **Value sign.** The value means "good for the side to move", not "good for White". Negate it for
-  every position where the mover lost. Getting this backwards trains a bot that reliably plays badly
-  while every loss curve looks healthy.
+The orchestration in `train.cpp` is done; the gradient step is not. What the network branch owes it
+is the eight symbols in `network.hpp`: `loadNetwork`, `newNetwork`, `~Network`, `Network::evaluate`,
+`Network::save`, `Trainer::Trainer`, `Trainer::~Trainer`, `Trainer::step`. That header is where the
+two branches are expected to meet and disagree exactly once.
+
+- **Value sign.** Handled by `outcomeFor()`, and `train.cpp` signs every target with it. The value
+  means "good for the side to move", not "good for White". Getting this backwards trains a bot that
+  reliably plays badly while every loss curve looks healthy.
+- **`Trainer::step` owns both flips.** It gets `Sample`s holding a `Board` and an absolute-move-id
+  policy, and has to call `encode()` and permute the policy through `kFlippedMove` itself. Keeping
+  the encode and the policy flip in one function is what stops them drifting apart.
 - **Symmetry augmentation is 12×, not 24×.** The hex board's symmetry group is D6 — 6 rotations × a
   reflection — and the rules are direction-agnostic, so evaluation is invariant under all 12. Colour
   swap is *not* an extra factor: once positions are canonicalised to the mover's view, swapping
@@ -263,17 +331,18 @@ any more.
 
 ## Next steps
 
-1. **Run `amoeba_random_test` against the server**, and play `amoeba_bot_1` in a practice room.
-   Neither has ever touched the live server, and everything downstream assumes they would pass.
-2. **Network** in MLX, behind the existing `bot::Evaluator` interface. The search does not change.
-3. **Self-play → training loop.** Needs Dirichlet root noise, temperature sampling and a real search
-   deadline added first — see Search above for why none of them exist yet.
-4. **Head-to-head harness**, generation 2 vs generation 1.
+1. **Run `amoeba_random_test` against the server**, and play in a practice room. Neither has ever
+   touched the live server, and everything downstream assumes they would pass. Worth doing before
+   the model lands: if the engine and the server disagree about the rules, a bad rating later cannot
+   be told apart from a bad network, and `syncToServer`'s resync fallback hides it.
+2. **Network** in MLX, filling in `network.hpp`. Nothing else has to change.
+3. **Concurrent self-play with batched leaf evaluation.** One game at a time wastes the device.
+4. **Tree reuse between moves**, worth 20-40% more effective simulations.
 
 Run the whole pipeline end to end at a deliberately tiny scale first — 2 attention blocks, 50 sims,
-200 games. "It runs and the loss goes down" proves almost nothing; AlphaZero bugs produce clean
-training curves. **The real first milestone is generation 2 beating generation 1 over 100 games**, so
-build the head-to-head harness early. It is the only honest signal.
+20 games a generation. "It runs and the loss goes down" proves almost nothing; AlphaZero bugs
+produce clean training curves. **The real first milestone is generation 1 beating generation 0** —
+that is what the gate in `train.cpp` reports, and it is the only honest signal.
 
 ## Game Arena SDK
 
@@ -302,10 +371,29 @@ cmake -S . -B build.nosync
 cmake --build build.nosync
 ```
 
+`amoeba_bot_1_core` (search + checkpoints) is shared; `play.cpp` and `train.cpp` each build one
+executable on top of it. Only the player links the arena SDK. **Both fail to link** until
+`network.cpp` arrives — the eight undefined symbols are the whole of the model branch's contract.
+
 ```
-BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot_1/Release/amoeba_bot_1        # one ranked match
-ROOM_ID=… BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot_1/Release/amoeba_bot_1   # practice room
+# ranked games back to back, for as long as the process lives
+BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot_1/Release/amoeba_bot_1
+
+# one practice game
+ROOM_ID=… BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot_1/Release/amoeba_bot_1
+
+# self-play and training, forever; no credentials, never touches the network
+./build.nosync/amoeba_bot_1/Release/amoeba_bot_1_train
 ```
+
+Both read `AMOEBA_CHECKPOINTS` (default `./checkpoints`). Run them side by side and the player picks
+up each promoted generation at its next game start. The trainer writes `gen-NNNN.safetensors` per
+generation plus `replay.bin`, and moves the `best` symlink only when a generation passes the gate.
+
+Everything else the trainer takes is an env var with a default: `AMOEBA_SELFPLAY_GAMES` (200),
+`AMOEBA_SELFPLAY_SIMULATIONS` (400), `AMOEBA_TRAIN_STEPS` (1000), `AMOEBA_BATCH` (512),
+`AMOEBA_GATE_GAMES` (100), `AMOEBA_GATE_SIMULATIONS` (400), `AMOEBA_GATE_THRESHOLD` (0.55),
+`AMOEBA_OPENING_PLIES` (15), `AMOEBA_BUFFER` (500000), `AMOEBA_SEED`.
 
 Two test binaries, neither using a test framework:
 

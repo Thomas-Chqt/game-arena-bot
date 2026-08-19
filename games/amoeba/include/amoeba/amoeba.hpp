@@ -381,4 +381,7 @@ Board apply(const Board&, Move, std::span<const uint64_t> history = {});
 Board fromString(const std::string&, bool whiteToMove = true);
 std::string toString(const Board&);
 
+// The position every game starts from, White to move, ready to play.
+Board openingBoard();
+
 } // namespace amoeba
