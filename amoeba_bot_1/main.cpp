@@ -15,6 +15,13 @@
 //   BLOCKS WIDTH HEADS                        network size
 //   STEPS BATCH RATE DECAY                    training
 //   OUT                                       where the checkpoint goes
+//
+// MODE=match instead loads CHECKPOINT and plays PLAYER against OPPONENT over GAMES
+// games, each being one of random, rollout or network. Nothing is generated or
+// trained. This is the honest test: rollout MCTS beat random play 97.5% of the time
+// at 200 simulations, so a network that has learned anything should be in that
+// region, and a network that has learned a better leaf evaluation should beat
+// rollout MCTS head to head.
 
 #include "training.hpp"
 
@@ -24,6 +31,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <limits>
+#include <memory>
 #include <numeric>
 #include <print>
 #include <random>
@@ -54,6 +63,7 @@ struct Sample
     amoeba::Board board;
     VisitCounts visits;
     float outcome = 0.0f;
+    int game = 0;
 };
 
 int envInt(const char* name, int fallback)
@@ -175,14 +185,17 @@ std::vector<Sample> generate(int games, int simulations, int samplingPlies, uint
             Search search{evaluator, {.simulations = simulations}};
             std::mt19937_64 rng{seed ^ (0x9e3779b97f4a7c15ULL * (static_cast<uint64_t>(game) + 1))};
 
-            perGame[static_cast<size_t>(game)] = playGame(search, samplingPlies, rng);
+            std::vector<Sample> played = playGame(search, samplingPlies, rng);
+            for (Sample& sample : played) {
+                sample.game = game;
+            }
+            perGame[static_cast<size_t>(game)] = std::move(played);
 
             const int done = completed.fetch_add(1) + 1;
             if (done == 1 || done % 25 == 0 || done == games)
             {
                 const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-                report("[generate] {}/{} games, {:.0f}s elapsed, {:.0f}s left",
-                       done, games, elapsed, elapsed / done * (games - done));
+                report("[generate] {}/{} games, {:.0f}s elapsed, {:.0f}s left", done, games, elapsed, elapsed / done * (games - done));
             }
         }
     };
@@ -204,23 +217,139 @@ std::vector<Sample> generate(int games, int simulations, int samplingPlies, uint
         // The last sample's mover lost, drew, or was adjudicated against; read the
         // result back off it rather than threading the final Board out of playGame.
         const float last = game.back().outcome;
-        if (last == 0.0f) ++draws;
-        else if (game.back().board.whiteToMove == (last > 0.0f)) ++whiteWins;
-        else ++blackWins;
+        if (last == 0.0f)
+            ++draws;
+        else if (game.back().board.whiteToMove == (last > 0.0f))
+            ++whiteWins;
+        else
+            ++blackWins;
     }
 
-    report("[generate] {} positions from {} games: {} White, {} Black, {} drawn",
-           samples.size(), games, whiteWins, blackWins, draws);
+    report("[generate] {} positions from {} games: {} White, {} Black, {} drawn", samples.size(), games, whiteWins, blackWins, draws);
     return samples;
 }
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Playing a match
+// ---------------------------------------------------------------------------
+
+struct Player
+{
+    virtual ~Player() = default;
+    virtual uint16_t pick(const amoeba::Board& board, std::span<const uint64_t> history) = 0;
+};
+
+class RandomPlayer final : public Player
+{
+public:
+    explicit RandomPlayer(uint64_t seed) : m_rng(seed) {}
+
+    uint16_t pick(const amoeba::Board& board, std::span<const uint64_t>) override
+    {
+        return randomLegalMove(board, m_rng);
+    }
+
+private:
+    std::mt19937_64 m_rng;
+};
+
+class SearchPlayer final : public Player
+{
+public:
+    SearchPlayer(Evaluator& evaluator, int simulations) : m_search(evaluator, {.simulations = simulations}) {}
+
+    uint16_t pick(const amoeba::Board& board, std::span<const uint64_t> history) override
+    {
+        return bestMove(m_search.run(board, history));
+    }
+
+private:
+    Search m_search;
+};
+
+// +1 if White won, -1 if Black, 0 drawn.
+int playMatch(Player& white, Player& black, int& plies)
+{
+    amoeba::Board board = amoeba::startPosition();
+    std::vector<uint64_t> history{board.hash};
+
+    while (board.state == amoeba::State::Ongoing)
+    {
+        Player& mover = board.whiteToMove ? white : black;
+        board = amoeba::apply(board, amoeba::Move::fromId(mover.pick(board, history)), history);
+        history.push_back(board.hash);
+        ++plies;
+    }
+    return board.state == amoeba::State::Draw ? 0 : board.state == amoeba::State::WhiteWins ? 1 : -1;
+}
+
+// A player named by a string, so a match can be spelled out with two env vars.
+// Returns nothing for "random"; the caller owns whatever the network needs.
+std::unique_ptr<Player> makePlayer(const std::string& kind, int simulations, uint64_t seed,
+                                   std::vector<std::unique_ptr<Evaluator>>& owned, const Network& net)
+{
+    if (kind == "random")
+        return std::make_unique<RandomPlayer>(seed);
+
+    if (kind == "rollout")
+        owned.push_back(std::make_unique<RolloutEvaluator>(seed));
+    else if (kind == "network")
+        owned.push_back(std::make_unique<NetworkEvaluator>(net));
+    else
+        throw std::runtime_error(std::format("PLAYER/OPPONENT must be random, rollout or network, not {}", kind));
+
+    return std::make_unique<SearchPlayer>(*owned.back(), simulations);
+}
+
+// Alternates colours so the first-move advantage cancels out rather than being
+// handed to whichever side happens to be listed first.
+void runMatch(const std::string& playerKind, const std::string& opponentKind, int games, int simulations,
+              uint64_t seed, const Network& net)
+{
+    report("[match] {} vs {} over {} games at {} simulations, alternating colours",
+           playerKind, opponentKind, games, simulations);
+
+    int wins = 0, losses = 0, draws = 0, plies = 0;
+    const auto start = std::chrono::steady_clock::now();
+
+    for (int game = 0; game < games; ++game)
+    {
+        std::vector<std::unique_ptr<Evaluator>> owned;
+        const std::unique_ptr<Player> player =
+            makePlayer(playerKind, simulations, seed + static_cast<uint64_t>(game), owned, net);
+        const std::unique_ptr<Player> opponent =
+            makePlayer(opponentKind, simulations, seed + 0xabcdef + static_cast<uint64_t>(game), owned, net);
+
+        const bool playerIsWhite = game % 2 == 0;
+        const int result = playerIsWhite ? playMatch(*player, *opponent, plies)
+                                         : playMatch(*opponent, *player, plies);
+        const int forPlayer = playerIsWhite ? result : -result;
+
+        if (forPlayer > 0) ++wins;
+        else if (forPlayer < 0) ++losses;
+        else ++draws;
+
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        report("[match] {}/{}: {}-{}-{}  ({:.0f}s elapsed, {:.0f}s left)", game + 1, games, wins, losses, draws,
+               elapsed, elapsed / (game + 1) * (games - game - 1));
+    }
+
+    // Counting a draw as half a win, the usual convention for a match score.
+    const double score = (wins + 0.5 * draws) / games;
+    // Standard error of a proportion, so a result is not read as more precise than it is.
+    const double error = std::sqrt(score * (1.0 - score) / games);
+    report("[match] {} scored {:.1f}% +/- {:.1f}% ({}-{}-{}) over {} games, {} plies average",
+           playerKind, 100.0 * score, 100.0 * error, wins, losses, draws, games, plies / games);
+}
+
 } // namespace bot
 
 int main()
 {
-    const int games = bot::envInt("GAMES", 200);
+    const std::string mode = bot::envText("MODE", "train");
+    const int games = bot::envInt("GAMES", 300);
     const int simulations = bot::envInt("SIMULATIONS", 200);
     const int samplingPlies = bot::envInt("SAMPLING_PLIES", 20);
     const uint64_t seed = static_cast<uint64_t>(bot::envInt("SEED", 20260819));
@@ -231,31 +360,53 @@ int main()
         .heads = bot::envInt("HEADS", 4)
     };
 
-    const int steps = bot::envInt("STEPS", 2000);
+    const int steps = bot::envInt("STEPS", 600);
     const int batchSize = bot::envInt("BATCH", 256);
     const float rate = bot::envFloat("RATE", 1e-3f);
     const float decay = bot::envFloat("DECAY", 1e-4f);
     const std::filesystem::path out = bot::envText("OUT", "gen1.safetensors");
 
+    // MODE=match loads a checkpoint and plays it; nothing is generated or trained.
+    if (mode == "match")
+    {
+        const std::filesystem::path checkpoint = bot::envText("CHECKPOINT", "gen1.safetensors");
+        const bot::Network net{checkpoint};
+        bot::report("[config] loaded {}: {} blocks, width {}, {} heads, {} parameters", checkpoint.string(),
+                    net.shape().blocks, net.shape().width, net.shape().heads, net.parameterCount());
+
+        bot::runMatch(bot::envText("PLAYER", "network"), bot::envText("OPPONENT", "random"),
+                      bot::envInt("GAMES", 20), simulations, seed, net);
+        return 0;
+    }
+
     bot::report("[config] sampling the first {} plies, seed {}", samplingPlies, seed);
-    bot::report("[config] {} blocks, width {}, {} heads | {} steps, batch {}, rate {}, decay {}",
-                shape.blocks, shape.width, shape.heads, steps, batchSize, rate, decay);
+    bot::report("[config] {} blocks, width {}, {} heads | {} steps, batch {}, rate {}, decay {}", shape.blocks, shape.width, shape.heads, steps, batchSize, rate, decay);
     bot::report("[config] checkpoint goes to {}", out.string());
 
     std::vector<bot::Sample> samples = bot::generate(games, simulations, samplingPlies, seed);
 
-    // Held out by game, not by position: positions from one game are near-copies of
-    // each other, so splitting inside a game would let the network see almost the
-    // answer and the validation loss would flatter it.
+    // Hold out whole games. Positions within one game are near-copies of each other
+    // and every one of them carries the same outcome label, so splitting by position
+    // leaves a held-out position's own game in the training set and the value head
+    // scores well by recognising the game rather than by reading the board. That
+    // makes the held-out loss look better the fewer games you generate, which is
+    // exactly backwards.
     std::mt19937_64 rng{seed};
-    std::vector<size_t> order(samples.size());
-    std::iota(order.begin(), order.end(), 0);
-    const size_t validationSize = order.size() / 10;
-    std::ranges::shuffle(order, rng);
-    const std::span<const size_t> validation{order.data(), validationSize};
-    const std::span<const size_t> training{order.data() + validationSize, order.size() - validationSize};
+    std::vector<int> gameOrder(static_cast<size_t>(games));
+    std::iota(gameOrder.begin(), gameOrder.end(), 0);
+    std::ranges::shuffle(gameOrder, rng);
 
-    const bot::Batch validationBatch = bot::batchFrom(samples, validation.subspan(0, std::min<size_t>(1024, validationSize)));
+    std::vector<bool> heldOut(static_cast<size_t>(games), false);
+    for (int i = 0; i < std::max(1, games / 10); ++i) {
+        heldOut[static_cast<size_t>(gameOrder[static_cast<size_t>(i)])] = true;
+    }
+
+    std::vector<size_t> training, validation;
+    for (size_t i = 0; i < samples.size(); ++i) {
+        (heldOut[static_cast<size_t>(samples[i].game)] ? validation : training).push_back(i);
+    }
+
+    const bot::Batch validationBatch = bot::batchFrom(samples, std::span{validation}.subspan(0, std::min<size_t>(1024, validation.size())));
 
     bot::Network net{shape, seed};
     std::vector<mlx::core::array> params = net.parameters();
@@ -263,12 +414,20 @@ int main()
     std::vector<int> argnums(params.size());
     std::iota(argnums.begin(), argnums.end(), 0);
 
-    bot::report("[train] {} parameters, {} training positions, {} held out",
-                net.parameterCount(), training.size(), validationSize);
+    bot::report("[train] {} parameters, {} positions from {} games, {} held out from {} games",
+                net.parameterCount(), training.size(), games - std::max(1, games / 10),
+                validation.size(), std::max(1, games / 10));
     bot::report("{:>7}  {:>9}  {:>9}  {:>9}  {:>9}", "step", "policy", "value", "held.pol", "held.val");
 
     bot::Adam adam{params};
-    std::vector<size_t> picks(batchSize);
+    std::vector<size_t> picks(static_cast<size_t>(batchSize));
+    // Keep the weights from the best step, not the last. Held-out loss turns back
+    // up well before training ends, so saving the final parameters ships a network
+    // measurably worse than one we already had. Copying the vector is cheap - an
+    // mlx::core::array is a handle, and these are already evaluated.
+    std::vector<mlx::core::array> best = params;
+    float bestHeld = std::numeric_limits<float>::max();
+    int bestStep = 0;
 
     for (int step = 1; step <= steps; ++step)
     {
@@ -288,13 +447,22 @@ int main()
             const std::vector<mlx::core::array> held = bot::loss(params, shape, validationBatch, 0.0f);
             mlx::core::eval(values);
             mlx::core::eval(held);
-            bot::report("{:>7}  {:>9.4f}  {:>9.4f}  {:>9.4f}  {:>9.4f}", step,
-                        values[1].item<float>(), values[2].item<float>(),
-                        held[1].item<float>(), held[2].item<float>());
+            // Judge on policy and value together: both feed the search, one orders
+            // the moves and the other evaluates the leaves.
+            const float combined = held[1].item<float>() + held[2].item<float>();
+            if (combined < bestHeld)
+            {
+                bestHeld = combined;
+                bestStep = step;
+                best = params;
+            }
+            bot::report("{:>7}  {:>9.4f}  {:>9.4f}  {:>9.4f}  {:>9.4f}", step, values[1].item<float>(), values[2].item<float>(), held[1].item<float>(), held[2].item<float>());
         }
     }
 
-    net.replaceParameters(params);
+    bot::report("[train] best held-out loss {:.4f} at step {} of {}, keeping those weights", bestHeld, bestStep, steps);
+
+    net.replaceParameters(best);
     net.save(out);
     bot::report("[train] wrote {}", out.string());
 }
