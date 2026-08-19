@@ -134,6 +134,12 @@ Board applyRaw(const Board& b, Move m)
     Hex& src = n.hexes[m.from];
     const uint8_t h = src.height();
 
+    // Only the last hex of the path counts: intermediate captures made during a
+    // sow do not reset the staleness counter.
+    const uint8_t dest    = static_cast<uint8_t>(ray(m.from, m.dir, h));
+    const Piece   landedOn = b.hexes[dest].top();
+    const bool    seized   = landedOn != Piece::Empty && isWhite(landedOn) != b.whiteToMove;
+
     Piece buf[kMaxHeight];
     for (uint8_t i = 0; i < h; ++i)
     {
@@ -152,8 +158,7 @@ Board applyRaw(const Board& b, Move m)
 
     if (!m.splitting)
     {
-        const uint8_t to = static_cast<uint8_t>(ray(m.from, m.dir, h));
-        for (uint8_t i = 0; i < h; ++i) place(to, buf[i]);  // order preserved
+        for (uint8_t i = 0; i < h; ++i) place(dest, buf[i]);  // order preserved
     }
     else
     {
@@ -168,6 +173,8 @@ Board applyRaw(const Board& b, Move m)
     n.whiteToMove = !n.whiteToMove;
     n.hash ^= kZobrist.blackToMove;
     ++n.ply;
+    n.staleness = seized ? 0 : static_cast<uint16_t>(n.staleness + 1);
+    n.repeats   = 1;
     return n;
 }
 
@@ -228,6 +235,37 @@ void generateLegal(Board& b)
 
 // ---------------------------------------------------------------------------
 
+namespace
+{
+
+// Both adjudicated endings score the same way: most controlled stacks, then most
+// enemy pieces held inside those stacks, then a draw.
+State adjudicate(const Board& b)
+{
+    int stacks[2]{};     // [0] white, [1] black
+    int prisoners[2]{};
+
+    for (uint8_t i = 0; i < kNumHexes; ++i)
+    {
+        const Hex&  hx = b.hexes[i];
+        const Piece t  = hx.top();
+        if (t == Piece::Empty) continue;
+
+        const int controller = isWhite(t) ? 0 : 1;
+        ++stacks[controller];
+        for (uint8_t d = 0; d < hx.height(); ++d)
+            if (isWhite(hx.at(d)) != isWhite(t)) ++prisoners[controller];
+    }
+
+    if (stacks[0] != stacks[1])
+        return stacks[0] > stacks[1] ? State::WhiteWins : State::BlackWins;
+    if (prisoners[0] != prisoners[1])
+        return prisoners[0] > prisoners[1] ? State::WhiteWins : State::BlackWins;
+    return State::Draw;
+}
+
+} // namespace
+
 Board apply(const Board& b, Move m, std::span<const uint64_t> history)
 {
     const bool mover = b.whiteToMove;
@@ -261,6 +299,7 @@ Board apply(const Board& b, Move m, std::span<const uint64_t> history)
         int seen = 1;  // n itself
         for (uint64_t past : history)
             if (past == n.hash) ++seen;
+        n.repeats = static_cast<uint8_t>(seen);
         if (seen >= kRepetitionLimit)
         {
             n.state = State::Draw;
@@ -268,20 +307,8 @@ Board apply(const Board& b, Move m, std::span<const uint64_t> history)
         }
     }
 
-    // Move cap: adjudicate by stack control.
-    if (n.ply >= kMoveCap)
-    {
-        int white = 0, black = 0;
-        for (uint8_t i = 0; i < kNumHexes; ++i)
-        {
-            const Piece t = n.hexes[i].top();
-            if (t == Piece::Empty) continue;
-            isWhite(t) ? ++white : ++black;
-        }
-        n.state = white > black ? State::WhiteWins
-                : black > white ? State::BlackWins
-                                : State::Draw;
-    }
+    if (n.staleness >= kStalenessLimit || n.ply >= kMoveCap)
+        n.state = adjudicate(n);
 
     return n;
 }

@@ -17,6 +17,7 @@ inline constexpr int kRadius     = 3;
 inline constexpr int kNumHexes   = 37;
 inline constexpr int kNumDirs    = 6;
 inline constexpr int kMaxHeight  = 22;                        // total pieces on the board
+inline constexpr int kPiecesPerSide = 11;                     // 10 standard + 1 kernel, each side
 inline constexpr int kMovableMax = 6;                         // stacks taller than this can never move
 inline constexpr int kNumMoveIds = kNumHexes * kNumDirs * 2;  // 444, policy size
 inline constexpr int kMaskWords  = (kNumMoveIds + 63) / 64;   // 7, one bit per move id
@@ -244,6 +245,8 @@ struct Board
     uint8_t  whiteKernelHex{};         // cached; the kernel may be buried mid-stack
     uint8_t  blackKernelHex{};
     uint16_t ply{};                    // for the move cap
+    uint16_t staleness{};              // moves since the last landing capture
+    uint8_t  repeats{1};               // occurrences of this position; only apply() with a history fills it
     bool     whiteToMove{true};
     State    state{State::Ongoing};    // derived data - see note below
 
@@ -300,21 +303,17 @@ struct Board
 // yourself before reading it.
 
 // ---------------------------------------------------------------------------
-// Rule parameters that the original rules and the Game Arena docs disagree on,
-// or that the docs leave unstated. VERIFY BOTH AGAINST THE SERVER before
-// training on them - a mismatch here means you train on a different game than
-// the one you compete in.
+// Rule parameters, taken from amoeba-reference.md, which mirrors the server.
 // ---------------------------------------------------------------------------
 
-// Occurrences of the same position (same pieces, same side to move) that make
-// a draw. The original rules say three. Game Arena only says "draw by repeated
-// position", which might mean two.
+// Occurrences of the same position - same stacks, same side to move - that draw.
 inline constexpr int kRepetitionLimit = 3;
 
-// Plies after which the game is adjudicated by stack control. The original has
-// no cap - players agree to stop. Game Arena mentions a move cap but not its
-// value. Self-play needs *some* cap or early random games never terminate.
-inline constexpr int kMoveCap = 400;
+// Moves without a landing capture after which the game is adjudicated.
+inline constexpr int kStalenessLimit = 80;
+
+// Total moves after which the game is adjudicated.
+inline constexpr int kMoveCap = 250;
 
 // ---------------------------------------------------------------------------
 // Geometry
