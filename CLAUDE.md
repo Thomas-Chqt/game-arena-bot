@@ -29,6 +29,7 @@ games/amoeba/
   test/random_test.cpp          live server parity harness
 amoeba_bot_1/
   mcts.hpp / mcts.cpp           PUCT search + rollout evaluator
+  network.hpp / network.cpp     parameters, forward pass, NetworkEvaluator; no training
   main.cpp                      arena client
 ```
 
@@ -116,13 +117,19 @@ the enum value *is* the one-hot index — 1/2 are always "mine", 3/4 always "the
 
 `Board` stays in absolute colours. The flip lives only in `encode()`.
 
-**The policy comes back in flipped space.** Map it back before naming a move: hex via `kFlipped`,
-direction via `opposite()`. That is a fixed 444-entry permutation table, built once — needed both for
-the move you send and for training targets.
+**The policy comes back in flipped space.** `policyToAbsolute(whiteToMove)` in `encode.hpp` is the
+444-entry permutation that maps it back — identity for White, `kPolicyUnflip` for Black. Needed both
+for the move you send and for training targets. `kFlipped` and `opposite()` are both involutions, so
+the permutation is its own inverse; a `static_assert` holds that.
 
-`encode_test.cpp` exists for exactly this: it asserts `encode(position) == encode(mirrored position)`
-bit for bit. Verified to have teeth — dropping the coordinate rotation, the colour swap, or the
-direction remap each fails on the first position.
+`encode_test.cpp` covers all of this: `encode(position) == encode(mirrored position)` bit for bit,
+plus `policyToAbsolute()` against the legality bits `encode()` wrote, on every position of 200 random
+games. Verified to have teeth — dropping the coordinate rotation, the colour swap, or the direction
+remap each fails on the first position, and so does breaking the policy permutation three ways.
+
+**This is the failure mode to fear.** With the unflip disabled, the network's policy still sums to
+exactly 1.0 over the legal moves with zero mass on illegal ones. It looks perfect and plays the board
+rotated.
 
 ## Search (MCTS)
 
@@ -225,18 +232,56 @@ any more.
   ranges, `std::span`. No `--flag` parsing in tools; env vars are enough.
 - **No README.** This file is the documentation.
 
-## Network — not written yet
+## Network
+
+`amoeba_bot_1/network.hpp` / `network.cpp`. `Network` holds the parameters, `forward()` is the
+prediction, `NetworkEvaluator` is the `bot::Evaluator` the search talks to. No training yet.
+
+- **Parameters are one flat `std::vector<mlx::core::array>`**, because that is what
+  `mlx::core::value_and_grad` consumes and the shape it returns gradients in. `Network::layout()` is
+  the single definition of which tensors exist and in what order; `forward()` walks that order
+  positionally, so each tensor needs its own named local — the order in which C++ evaluates two
+  cursor reads inside one expression is unspecified.
+- **6 blocks at width 128 with 8 heads is 1,219,965 parameters.** Reproducible from the seed alone;
+  checkpoints round-trip exactly through safetensors, with the shape in the metadata so a checkpoint
+  from a different architecture is rejected at load rather than at the first matmul.
+- **`forward()` returns raw logits.** Masking is the caller's job, because inference wants
+  probabilities over legal moves and training wants the logits.
+- **`NetworkEvaluator` must hand back probabilities, not logits.** The search sums the priors of the
+  legal moves and divides (`mcts.cpp:78-79`), so raw logits would give it negative priors.
+- **Mask with a large finite penalty, not −∞.** A terminal position has no legal moves, `addNode`
+  evaluates it anyway, and softmax over an all-−∞ row is NaN, which would spread into every parameter
+  that touched it. −1e9 leaves a harmless uniform row that nothing reads.
+
+### Measured latency, and what it means for the search
+
+One position, 6 blocks at width 128, `-O2`:
+
+| batch | GPU | CPU |
+|---|---|---|
+| 1 | 1.70 ms | **0.95 ms** |
+| 8 | 0.25 ms/pos | 0.47 ms/pos |
+| 64 | **0.16 ms/pos** | 0.44 ms/pos |
+| 256 | 0.15 ms/pos | 0.45 ms/pos |
+
+At 1.2M parameters over 37 tokens this is dispatch-bound, not compute-bound, so **CPU beats Metal at
+batch 1** and Metal wins from batch 8 up. The search asks one position at a time, so 2000 simulations
+would cost 3.4 s on GPU against a 5 s turn limit — the fixed simulation count in `main.cpp` is no
+longer safe. Leaf batching with virtual loss is worth ~10× per position and is now the thing standing
+between the network and a usable bot.
 
 - **Attention over the 37 hex tokens, not convolution.** Amoeba's interactions are long-range by
   construction: a stack jumps over everything and lands at exactly its height. The neighbouring cell
   is nearly irrelevant; the cell 5 away on your line is what kills you. Conv nets need depth just to
   see distance 6. With 37 tokens, all-pairs attention is 1369 pairs — free.
-- **Relative-position bias.** Precompute a `constexpr bucket[37][37]`: 0 if the two hexes share no
-  line, else `1 + dir*6 + (dist-1)`. Learn one bias per bucket per head. That table *is* the attack
-  relation from §6.1 of the reference — hand it over instead of making the net discover it.
-- **Policy head:** 12 logits per token (6 directions × move/sow) → 444, which is already exactly
-  `Move::id`. Mask with `Board::legal` (set illegal logits to −∞ before softmax).
-- **Value head:** mean-pool → MLP → tanh. ~1-2M params total.
+- **Relative-position bias.** `kBucket[37][37]` in `network.hpp`: 0 if the two hexes share no line,
+  else `1 + dir * kMovableMax + (dist - 1)`. One learned bias per bucket per head, 37 buckets. That
+  table *is* the attack relation from §6.1 of the reference — handed over instead of discovered. The
+  stride for direction is the number of *distance* buckets; both are 6, which makes the mistake
+  invisible.
+- **Policy head:** 12 logits per token → `[batch, 37, 12]`, which reshapes straight onto `Move::id`
+  because the 12 run direction-major and splitting-minor.
+- **Value head:** mean-pool over the 37 tokens → MLP → tanh.
 
 ## Training — not written yet
 
@@ -255,7 +300,7 @@ any more.
 - **Thread the repetition history through search.** `apply` only detects repetition when given the
   hash history; without it MCTS walks into draws it cannot see.
 - **MLX is lazy** — nothing computes until `mx::eval()`. Easy to build a huge graph by accident, and
-  it makes naive timing meaningless. Homebrew has `mlx` 0.31.2 (`/opt/homebrew/include/mlx`) plus the
+  it makes naive timing meaningless. Homebrew has `mlx` 0.32.0 (`/opt/homebrew/include/mlx`) plus the
   Python bindings.
 - The MLX C++ API has no real optimizer or layer library, so Adam and the attention blocks are
   hand-written. If that becomes a time sink, training in Python + MLX while keeping engine, encoder
@@ -265,10 +310,18 @@ any more.
 
 1. **Run `amoeba_random_test` against the server**, and play `amoeba_bot_1` in a practice room.
    Neither has ever touched the live server, and everything downstream assumes they would pass.
-2. **Network** in MLX, behind the existing `bot::Evaluator` interface. The search does not change.
-3. **Self-play → training loop.** Needs Dirichlet root noise, temperature sampling and a real search
+2. **Loss, Adam and the overfit-one-batch test.** Nothing downstream is trustworthy until 32
+   positions trained in isolation drive the loss to nearly zero — that is what proves the gradient
+   path is connected. MLX has `value_and_grad`, so only the optimiser is hand-written.
+3. **Leaf batching with virtual loss** in the search. The latency table above makes this a
+   correctness issue for the 5 s turn limit, not an optimisation.
+4. **Self-play → training loop.** Needs Dirichlet root noise, temperature sampling and a real search
    deadline added first — see Search above for why none of them exist yet.
-4. **Head-to-head harness**, generation 2 vs generation 1.
+5. **Head-to-head harness**, generation 2 vs generation 1.
+
+There is still **no entry point** for any of this: `amoeba_bot_1`'s `main` plays one arena match and
+needs credentials, so the forward-pass benchmark and the overfit test above were run from throwaway
+programs outside the repo. Somewhere to run offline network checks is the next structural decision.
 
 Run the whole pipeline end to end at a deliberately tiny scale first — 2 attention blocks, 50 sims,
 200 games. "It runs and the loss goes down" proves almost nothing; AlphaZero bugs produce clean
@@ -295,12 +348,19 @@ Game Arena ships a **C SDK, `arena` 0.6**, installed at `~/.local` (`include/are
 
 ## Build
 
-CMake + Ninja, multi-config, build tree in `build.nosync/`.
+CMake + Ninja, multi-config, build tree in `build.nosync/`. The generator is not the default, so
+pass it when configuring from scratch — the `Debug/` and `Release/` path components below depend on
+it.
 
 ```
-cmake -S . -B build.nosync
-cmake --build build.nosync
+cmake -S . -B build.nosync -G "Ninja Multi-Config"
+cmake --build build.nosync                     # Debug
+cmake --build build.nosync --config Release
 ```
+
+`find_package(MLX 0.32 CONFIG REQUIRED)` has to sit *after* `project()`: MLX imports itself as a
+shared library, and before `project()` CMake has not yet established that the platform can link
+one. The `arena` call above it predates that and only works because its import is static.
 
 ```
 BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot_1/Release/amoeba_bot_1        # one ranked match

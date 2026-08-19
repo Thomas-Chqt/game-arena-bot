@@ -69,4 +69,55 @@ inline constexpr int kGlobalInCheck        = 7;
 // fromString() both do it.
 void encode(const Board& b, std::span<float, kEncodedSize> out);
 
+// ---------------------------------------------------------------------------
+// Policy space -> absolute move ids
+//
+// encode() writes the slot for (token, dir) from the absolute move
+// (kFlipped[token], opposite(dir)) when Black is to move, so a policy coming
+// back from the network is indexed in that same flipped space. It has to be
+// permuted before any of it names a move, and before a search's visit counts
+// become a training target.
+//
+// This is the one mapping whose failure is silent: a wrong permutation still
+// gives a valid distribution over legal moves, the loss still falls, and the bot
+// simply plays as though the board were rotated.
+//
+// kFlipped and opposite() are both involutions, so the permutation is its own
+// inverse and the same table maps a target back the other way.
+// ---------------------------------------------------------------------------
+
+inline constexpr auto kPolicyIdentity = [] -> std::array<uint16_t, kNumMoveIds> {
+    std::array<uint16_t, kNumMoveIds> table{};
+    for (int i = 0; i < kNumMoveIds; ++i)
+        table[i] = static_cast<uint16_t>(i);
+    return table;
+}();
+
+inline constexpr auto kPolicyUnflip = [] -> std::array<uint16_t, kNumMoveIds> {
+    std::array<uint16_t, kNumMoveIds> table{};
+    for (int token = 0; token < kNumHexes; ++token) {
+        for (uint8_t dir = 0; dir < kNumDirs; ++dir) {
+            for (int splitting = 0; splitting < 2; ++splitting) {
+                table[(token * kNumDirs + dir) * 2 + splitting] = static_cast<uint16_t>((kFlipped[token] * kNumDirs + opposite(dir)) * 2 + splitting);
+            }
+        }
+    }
+    return table;
+}();
+
+static_assert([] {
+    for (int i = 0; i < kNumMoveIds; ++i) {
+        if (kPolicyUnflip[kPolicyUnflip[i]] != i)
+            return false;
+    }
+    return true;
+}(), "the policy flip must be its own inverse");
+
+// Identity for White, because encode() does not flip then.
+constexpr std::span<const uint16_t, kNumMoveIds> policyToAbsolute(bool whiteToMove)
+{
+    return whiteToMove ? std::span<const uint16_t, kNumMoveIds>{kPolicyIdentity}
+                       : std::span<const uint16_t, kNumMoveIds>{kPolicyUnflip};
+}
+
 } // namespace amoeba

@@ -5,6 +5,9 @@
 //
 // Also asserts the structural properties encode() promises: every value in
 // [0, 1], and every one-hot block summing to exactly 1.
+//
+// And it checks policyToAbsolute() against the legality bits encode() wrote,
+// because that permutation is the one whose failure is otherwise silent.
 
 #include <amoeba/amoeba.hpp>
 #include <amoeba/encode.hpp>
@@ -14,6 +17,7 @@
 #include <numeric>
 #include <print>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -92,6 +96,33 @@ bool checkStructure(const Features& f, const Board& b)
     return true;
 }
 
+// Ties policyToAbsolute() to the legality bits encode() actually wrote. Slot i of
+// the network's policy describes the same move as legality feature i, so the two
+// must agree on every position - which is what makes a permutation error loud
+// instead of silent.
+bool checkPolicyMap(const Features& f, const Board& b)
+{
+    const std::span<const uint16_t, kNumMoveIds> toAbsolute = policyToAbsolute(b.whiteToMove);
+
+    for (int i = 0; i < kNumMoveIds; ++i)
+    {
+        const int token     = i / (kNumDirs * 2);
+        const int dir       = (i / 2) % kNumDirs;
+        const int splitting = i % 2;
+
+        const float feature = f[token * kHexFeatures + kOffLegal + dir * 2 + splitting];
+        const float actual  = b.isLegal(toAbsolute[i]) ? 1.0f : 0.0f;
+
+        if (feature != actual)
+        {
+            std::println(stderr, "[encode] policy slot {} (hex {} dir {}{}) maps to move {}: {} vs {}, on {}",
+                         i, token, dir, splitting ? " sow" : "", toAbsolute[i], feature, actual, toString(b));
+            return false;
+        }
+    }
+    return true;
+}
+
 bool check(const Board& b)
 {
     Features direct{}, flipped{};
@@ -99,6 +130,7 @@ bool check(const Board& b)
     encode(mirrored(b), flipped);
 
     if (!checkStructure(direct, b)) return false;
+    if (!checkPolicyMap(direct, b)) return false;
 
     for (int i = 0; i < kEncodedSize; ++i)
         if (direct[i] != flipped[i])
