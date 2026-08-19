@@ -1,2 +1,5 @@
 .DS_Store
 .cache/
+
+# Checkpoints - training output, not source.
+*.safetensors
