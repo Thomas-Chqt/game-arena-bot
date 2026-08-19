@@ -177,25 +177,78 @@ bytes. Splitting hot (~24 B) from cold would fix it, and is not worth doing whil
 
 ### Deliberately absent
 
-- **Dirichlet root noise** — self-play variety only, ~6 lines at the root. Without it every self-play
-  game from a given network is identical and training stalls.
-- **Temperature sampling** — same. Competition wants the argmax; self-play must sample, `T = 1` for
-  the first ~15 plies then `T → 0`.
+- **Temperature sampling** — lives in `main.cpp`'s `chooseMove()` rather than in the search.
 - **Tree reuse between moves** — the subtree under the played move stays valid, and re-rooting is
   roughly 20-40% more effective simulations for free. `m_nodes` / `m_edges` are members so
   allocations are reused, but the tree is cleared on every `run()`.
 - **A search deadline** — 2000 fixed simulations measure **351 ms** worst case over the first 24
   plies, against a 5 s turn limit. Safe only while an evaluation is a rollout.
-- **Leaf batching with virtual loss** — see Training below. Cheaper to build before the network than
-  to retrofit after.
 
-### Verification gap
+### Dirichlet root noise
 
-A `strength_check` binary existed: rollout MCTS against uniformly random legal play, alternating
-colours, seed `20260819`. It scored **97.5%** (39-0-1) at 200 simulations and **100%** (20-0-0) at
-800. Both numbers mattered — the second showed strength rising with simulation count, which is the
-property a broken tree does not have. It was deleted on request, so nothing offline checks the search
-any more.
+`Config::rootNoise` / `noiseAlpha` / `noiseSeed`, **off by default** so competition keeps the
+network's own priors. `prior = (1 - rootNoise) * network + rootNoise * Dirichlet(alpha)`, at the root
+only, because the root is the position that becomes a training example — noise deeper in the tree just
+spoils the search's judgement. A Dirichlet draw is independent `std::gamma_distribution` samples
+normalised; `alpha < 1` makes each draw spiky, so a different random handful of moves is promoted each
+game. AlphaZero scaled `alpha` as 10 / average legal moves, and Amoeba averages 27.
+
+Verified on the failure it exists to prevent — a network and `selectEdge` are both deterministic:
+
+```
+no noise      : 1 distinct best move over 8 searches
+Dirichlet 0.25: 8 distinct best moves over 8 searches
+```
+
+Without it, self-play from a given network replays one game forever, the network never sees a position
+it does not already understand, and training stalls with every loss curve looking healthy.
+
+### Leaf batching with virtual loss
+
+`Search::run` is three phases: `collect()` descends `Config::batchSize` times, one batched
+`evaluate()`, then `backUp()`. `addNode` split into `expand()` — build a node and its edges from an
+`Evaluation` already in hand — and a single-board path used only for the root.
+
+**Virtual loss** is what makes the descents diverge: on the way down, each edge is provisionally
+recorded as having come back a loss (`valueSum -= 1`, `++visits`), which `backUp()` removes before
+applying the real result. Without it all N descents follow one path and return the same leaf N times.
+
+Measured, 200 simulations, 2 blocks at width 64, Metal:
+
+| leaves per batch | ms/search |
+|---|---|
+| 1 | 336.4 |
+| 4 | 105.8 |
+| 16 | 42.2 |
+| 64 | **21.5** |
+
+**15.6×**, which puts the network *below* the rollout teacher's ~33 ms per search. Leaf batching is
+what makes a network search cheaper than a rollout search, not merely competitive.
+
+- **Duplicate leaves are kept, not deduplicated.** Two descents can still choose the same unexpanded
+  edge; both are evaluated, one node ends up unreachable, and both back up the same correct value.
+  Sharing one evaluation would need the backup to know about the pairing.
+- **Terminal leaves stay in the batch** but take their value from the rules, not the network. Keeping
+  the two arrays parallel is worth more than the handful of wasted evaluations — and it is why the
+  policy mask is −1e9 rather than −∞.
+
+### Verification
+
+`MODE=match` in `main.cpp` is the strength check (see Training driver). Over 20 games at 200
+simulations, alternating colours:
+
+```
+rollout vs random             : 100.0% +/- 0.0%   (20-0-0)
+network, 1 leaf   vs random   :  97.5% +/- 3.5%   (19-0-1)
+network, 64 leaves vs random  : 100.0% +/- 0.0%   (20-0-0)
+network, 64 leaves vs rollout :  40.0% +/- 11.0%  (6-10-4)
+```
+
+**Before refactoring `run()` for batching, fingerprint its visit counts.** At `batchSize = 1` the
+batched code reproduces the pre-refactor fingerprints bit for bit — virtual loss adds and removes
+exactly 1.0 at magnitudes float32 represents exactly — which pins the restructure independently of
+whether batching helps. Do this again before touching the descent; the search has no other offline
+test, and ±11% over 20 games cannot resolve a small regression.
 
 ## Training driver
 

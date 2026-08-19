@@ -69,6 +69,29 @@ struct Config
 {
     int   simulations = 800;
     float cPuct       = 1.5f;
+
+    // Self-play only, and off by default so competition keeps the network's own
+    // opinion. A network is deterministic and so is edge selection, so without
+    // noise every self-play game from a given network is the same game: the network
+    // only ever sees positions it already understands, and training stalls while
+    // every loss curve stays healthy.
+    //
+    // The mix is prior = (1 - rootNoise) * network + rootNoise * Dirichlet(alpha).
+    // Applied at the root only, because the root is the position that becomes a
+    // training example - noise deeper in the tree would just spoil the search's
+    // judgement. alpha below 1 makes each draw spiky, so a different random handful
+    // of moves gets promoted each game; AlphaZero scaled it as 10 / average legal
+    // moves, and Amoeba averages 27.
+    float    rootNoise  = 0.0f;
+    float    noiseAlpha = 0.35f;
+    uint64_t noiseSeed  = 0;
+
+    // How many leaves to gather before asking the evaluator. A rollout gains
+    // nothing from this, but the network costs 1.70 ms for one position and
+    // 0.16 ms each for 64, so leave it at 1 for RolloutEvaluator and raise it for
+    // NetworkEvaluator. Descents inside a batch see slightly stale statistics, so
+    // each simulation is a little less well directed - worth it about tenfold.
+    int batchSize = 1;
 };
 
 // Simulations spent on each move id. The argmax is the move to play; normalised
@@ -78,7 +101,10 @@ using VisitCounts = std::array<uint32_t, amoeba::kNumMoveIds>;
 class Search
 {
 public:
-    explicit Search(Evaluator& evaluator, Config config = {}) : m_evaluator(evaluator), m_config(config) {}
+    explicit Search(Evaluator& evaluator, Config config = {})
+        : m_evaluator(evaluator), m_config(config), m_rng(config.noiseSeed)
+    {
+    }
 
     // `history` is the hash of every position the real game has passed through,
     // ending with `root`'s own. amoeba::apply() needs it to see repetitions that
@@ -105,16 +131,39 @@ private:
 
     // Appends the node and its outgoing edges, and returns its index alongside
     // the value of the position for the side to move there.
+    // Where one descent ended, and everything needed to back it up once its leaf
+    // has been evaluated.
+    struct Descent
+    {
+        uint32_t trailStart;
+        uint32_t trailLength;
+        int32_t  edge;    // the edge whose child this descent is creating, -1 if it hit a terminal node
+        int32_t  leaf;    // index into m_leaves, -1 if it hit a terminal node
+        float    value;   // the terminal value, when there is no leaf to evaluate
+    };
+
     std::pair<uint32_t, float> addNode(const amoeba::Board&);
+    uint32_t expand(const amoeba::Board&, const Evaluation&);
     uint32_t selectEdge(uint32_t node) const;
+    void addRootNoise();
+    void collect(size_t baseLength, int wanted);
+    void backUp();
 
     Evaluator& m_evaluator;
     Config     m_config;
 
     std::vector<Node>     m_nodes;
     std::vector<Edge>     m_edges;
-    std::vector<uint64_t> m_path;    // hashes down the current descent
-    std::vector<uint32_t> m_trail;   // edges down the current descent
+    std::vector<uint64_t> m_path;    // hashes down the descent being collected
+
+    std::mt19937_64    m_rng;
+    std::vector<float> m_noise;
+
+    std::vector<Descent>              m_descents;
+    std::vector<uint32_t>             m_trailStore;   // every trail in the batch, concatenated
+    std::vector<amoeba::Board>        m_leaves;
+    std::vector<const amoeba::Board*> m_leafPointers;
+    std::vector<Evaluation>           m_evaluations;
 };
 
 uint16_t randomLegalMove(const amoeba::Board&, std::mt19937_64&);

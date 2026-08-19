@@ -17,8 +17,8 @@
 //   OUT                                       where the checkpoint goes
 //
 // MODE=match instead loads CHECKPOINT and plays PLAYER against OPPONENT over GAMES
-// games, each being one of random, rollout or network. Nothing is generated or
-// trained. This is the honest test: rollout MCTS beat random play 97.5% of the time
+// games, each being one of random, rollout or network, with LEAVES collected per
+// batched evaluation. Nothing is generated or trained. This is the honest test: rollout MCTS beat random play 97.5% of the time
 // at 200 simulations, so a network that has learned anything should be in that
 // region, and a network that has learned a better leaf evaluation should beat
 // rollout MCTS head to head.
@@ -258,7 +258,10 @@ private:
 class SearchPlayer final : public Player
 {
 public:
-    SearchPlayer(Evaluator& evaluator, int simulations) : m_search(evaluator, {.simulations = simulations}) {}
+    SearchPlayer(Evaluator& evaluator, int simulations, int leaves)
+        : m_search(evaluator, {.simulations = simulations, .batchSize = leaves})
+    {
+    }
 
     uint16_t pick(const amoeba::Board& board, std::span<const uint64_t> history) override
     {
@@ -287,7 +290,7 @@ int playMatch(Player& white, Player& black, int& plies)
 
 // A player named by a string, so a match can be spelled out with two env vars.
 // Returns nothing for "random"; the caller owns whatever the network needs.
-std::unique_ptr<Player> makePlayer(const std::string& kind, int simulations, uint64_t seed,
+std::unique_ptr<Player> makePlayer(const std::string& kind, int simulations, int leaves, uint64_t seed,
                                    std::vector<std::unique_ptr<Evaluator>>& owned, const Network& net)
 {
     if (kind == "random")
@@ -300,16 +303,17 @@ std::unique_ptr<Player> makePlayer(const std::string& kind, int simulations, uin
     else
         throw std::runtime_error(std::format("PLAYER/OPPONENT must be random, rollout or network, not {}", kind));
 
-    return std::make_unique<SearchPlayer>(*owned.back(), simulations);
+    // A rollout gains nothing from batching, so only the network asks for leaves.
+    return std::make_unique<SearchPlayer>(*owned.back(), simulations, kind == "network" ? leaves : 1);
 }
 
 // Alternates colours so the first-move advantage cancels out rather than being
 // handed to whichever side happens to be listed first.
 void runMatch(const std::string& playerKind, const std::string& opponentKind, int games, int simulations,
-              uint64_t seed, const Network& net)
+              int leaves, uint64_t seed, const Network& net)
 {
-    report("[match] {} vs {} over {} games at {} simulations, alternating colours",
-           playerKind, opponentKind, games, simulations);
+    report("[match] {} vs {} over {} games at {} simulations, {} leaves per batch, alternating colours",
+           playerKind, opponentKind, games, simulations, leaves);
 
     int wins = 0, losses = 0, draws = 0, plies = 0;
     const auto start = std::chrono::steady_clock::now();
@@ -318,9 +322,9 @@ void runMatch(const std::string& playerKind, const std::string& opponentKind, in
     {
         std::vector<std::unique_ptr<Evaluator>> owned;
         const std::unique_ptr<Player> player =
-            makePlayer(playerKind, simulations, seed + static_cast<uint64_t>(game), owned, net);
+            makePlayer(playerKind, simulations, leaves, seed + static_cast<uint64_t>(game), owned, net);
         const std::unique_ptr<Player> opponent =
-            makePlayer(opponentKind, simulations, seed + 0xabcdef + static_cast<uint64_t>(game), owned, net);
+            makePlayer(opponentKind, simulations, leaves, seed + 0xabcdef + static_cast<uint64_t>(game), owned, net);
 
         const bool playerIsWhite = game % 2 == 0;
         const int result = playerIsWhite ? playMatch(*player, *opponent, plies)
@@ -375,7 +379,7 @@ int main()
                     net.shape().blocks, net.shape().width, net.shape().heads, net.parameterCount());
 
         bot::runMatch(bot::envText("PLAYER", "network"), bot::envText("OPPONENT", "random"),
-                      bot::envInt("GAMES", 20), simulations, seed, net);
+                      bot::envInt("GAMES", 20), simulations, bot::envInt("LEAVES", 16), seed, net);
         return 0;
     }
 
