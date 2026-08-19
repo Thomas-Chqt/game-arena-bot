@@ -29,7 +29,8 @@ games/amoeba/
   test/random_test.cpp          live server parity harness
 amoeba_bot_1/
   mcts.hpp / mcts.cpp           PUCT search + rollout evaluator
-  network.hpp / network.cpp     parameters, forward pass, NetworkEvaluator; no training
+  network.hpp / network.cpp     parameters, forward pass, NetworkEvaluator
+  training.hpp / training.cpp   Batch, the loss and Adam; no self-play yet
   main.cpp                      arena client
 ```
 
@@ -283,7 +284,76 @@ between the network and a usable bot.
   because the 12 run direction-major and splitting-minor.
 - **Value head:** mean-pool over the 37 tokens → MLP → tanh.
 
-## Training — not written yet
+## Training
+
+`amoeba_bot_1/training.hpp` / `training.cpp` has `Batch`, `makeBatch()`, `loss()` and `Adam`. What is
+missing is self-play — there is no data, so no weight has ever been adjusted by anything but a test.
+
+- **`loss()` returns `{ total, policy, value }`.** `mlx::core::value_and_grad` differentiates the
+  first element and hands the rest back for free, so the components cost nothing and are worth
+  keeping: a value loss sitting flat while the policy loss falls means the value head is not learning,
+  and one averaged number would hide that.
+- **`makeBatch()` is where the policy target crosses into flipped space.** The search counts visits in
+  absolute `Move::id` and `forward()` answers in the space `encode()` used, so the target is permuted
+  with `policyToAbsolute` — the same table as inference, since it is its own inverse. Skip it and you
+  train on scrambled labels, and the loss still falls.
+- **`outcomes` reaches `makeBatch()` already signed** from the mover's point of view. Only self-play
+  knows the game result, so that is deliberately the caller's business and `makeBatch()` does not
+  second-guess it. See the value-sign note below.
+- **Pass `weightDecay = 0` when overfitting one batch on purpose**, or the penalty holds the loss off
+  zero and hides whether the gradients connect at all.
+- **A sample with no visits throws.** That is a terminal position in the training set, i.e. a
+  self-play bug, and dividing by zero visits would otherwise put NaN into every parameter.
+- **`Adam::step` takes the rate as an argument**, not from its config, because it is expected to fall
+  on a schedule. It returns new parameters rather than mutating: an `mlx::core::array` is a handle onto
+  a graph, not a buffer. The caller must `mlx::core::eval()` the result every step or the graph grows
+  until memory runs out; evaluating the parameters is enough, since they depend on both moment
+  estimates.
+- **Adam's moment estimates are not checkpointed.** Only `Network` persists. Between generations that
+  is fine — the optimiser restarts anyway — but interrupting a run mid-generation loses its momentum
+  and costs a few hundred wasted steps. Decide before the first long run, not after.
+
+Measured on 8 positions with a uniform target, untrained network:
+
+```
+policy loss 5.1620   value loss 1.7809   total 6.9429
+floor for a uniform target = mean log(legal moves) = 3.9174   -> above it, as it must be
+gradients: 87 tensors, 0 of them all-zero
+largest gradient magnitude 2.553e+00, smallest 1.521e-03   (1678x spread)
+```
+
+The floor is the check worth keeping: cross-entropy of *any* prediction against a uniform target over
+N legal moves cannot go below `log(N)`, so a policy loss under that means the mask or the
+normalisation is wrong. The 1678× gradient spread across tensors is exactly why plain
+`w -= rate * gradient` will not do and Adam divides by `sqrt(variance)`.
+
+### The overfit-one-batch check
+
+32 distinct positions with invented one-hot targets, 2 blocks at width 64, no weight decay,
+rate 1e-3:
+
+```
+  step       total      policy       value
+     1    5.774683    4.062842    1.711841
+   300    0.000365    0.000351    0.000014
+   600    0.000115    0.000110    0.000005
+```
+
+A 50,000× reduction, so the gradients reach every one of the 87 tensors and Adam moves them. Run this
+before trusting anything downstream; a broken gradient path plateaus instead of converging, and no
+later measurement would isolate it. Step time stayed flat at 5.6 ms across 600 steps, which is also
+the check that nothing is leaking graph.
+
+**Duplicate positions floor the loss, and that is correct.** The first attempt plateaued at exactly
+0.04332 no matter the learning rate. Two of the 32 samples were the same position — the harness
+restarted from the opening after a game ended — carrying contradictory one-hot targets. The best
+possible answer is 50/50, so each contributes `-log(0.5)`, and `2 x 0.693 / 32 = 0.04332` to four
+decimals. Nothing was wrong with the loss or the optimiser.
+
+This matters beyond the test: in real self-play the same position *will* recur with different visit
+distributions, and the network correctly learns their average. **So the training loss will never
+approach zero, and chasing that would be chasing a bug that does not exist.** The floor is the
+entropy of the search's own disagreement with itself.
 
 - **Value sign.** The value means "good for the side to move", not "good for White". Negate it for
   every position where the mover lost. Getting this backwards trains a bot that reliably plays badly
