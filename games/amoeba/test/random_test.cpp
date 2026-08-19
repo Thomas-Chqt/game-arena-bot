@@ -6,540 +6,310 @@
 
 #include <arena/arena.h>
 
-#include <array>
+#include <algorithm>
+#include <bitset>
 #include <charconv>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
-#include <exception>
+#include <format>
+#include <numeric>
 #include <optional>
+#include <print>
 #include <random>
-#include <stdexcept>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+using namespace amoeba;
+
 namespace {
 
-namespace game = amoeba;
-
-using Mask = std::array<std::uint64_t, game::kMaskWords>;
-
-struct ServerAction {
-    std::uint16_t id;
-    const arena_piece_moves_t* piece;
-    const char* destination;
-};
-
-struct ServerMoves {
-    Mask mask{};
-    std::vector<ServerAction> actions;
-};
-
-struct Context {
-    Context(const char* id, std::uint64_t random_seed)
-        : bot_id(id)
-        , random(random_seed)
-        , seed(random_seed)
-    {
-    }
-
-    const char* bot_id;
-    std::mt19937_64 random;
-    std::uint64_t seed;
-    game::Board board;
-    std::vector<std::uint64_t> history;
-    bool started{};
-    bool white{true};
-    std::size_t compared_turns{};
-    std::size_t inferred_opponent_moves{};
-    std::size_t normalised_splits{};
-    bool completed{};
-    bool disconnected{};
-};
-
-[[noreturn]] void fail(const Context& context, const std::string& message)
+struct ServerMove
 {
-    std::fprintf(stderr, "[test %.8s] FAILED: %s\n", context.bot_id, message.c_str());
-    std::fflush(stderr);
+    Move                       move;
+    const arena_piece_moves_t* piece;
+    const char*                destination;
+};
+
+struct Context
+{
+    std::mt19937_64       random{std::random_device{}()};
+    Board                 board;
+    std::vector<uint64_t> history;
+    bool                  completed{};
+};
+
+template <typename... Args>
+[[noreturn]] void fail(std::format_string<Args...> format, Args&&... args)
+{
+    std::println(stderr, "[test] FAILED: {}", std::format(format, std::forward<Args>(args)...));
     std::exit(EXIT_FAILURE);
 }
 
-[[nodiscard]] bool is_white(arena_side_t side) noexcept
-{
-    return side == ARENA_SIDE_WHITE;
-}
-
 // ---------------------------------------------------------------------------
-// Coordinates and rays
+// Coordinates
 // ---------------------------------------------------------------------------
 
-[[nodiscard]] std::int8_t parse_coord(const char* text)
+[[nodiscard]] int8_t parseHex(std::string_view text)
 {
-    if (text == nullptr) {
+    const size_t comma = text.find(',');
+    if (comma == std::string_view::npos)
         return -1;
-    }
-    const std::string_view view(text);
-    const std::size_t comma = view.find(',');
-    if (comma == std::string_view::npos) {
-        return -1;
-    }
 
-    int q = 0;
-    int r = 0;
-    const auto q_result = std::from_chars(view.data(), view.data() + comma, q);
-    const auto r_result =
-        std::from_chars(view.data() + comma + 1, view.data() + view.size(), r);
-    if (q_result.ec != std::errc{} || r_result.ec != std::errc{}) {
+    int q{};
+    int r{};
+    if (std::from_chars(text.data(), text.data() + comma, q).ec != std::errc{})
         return -1;
-    }
-    return game::hexIndex(q, r);
+    if (std::from_chars(text.data() + comma + 1, text.data() + text.size(), r).ec != std::errc{})
+        return -1;
+    return hexIndex(q, r);
 }
 
-[[nodiscard]] std::string encode_coord(std::uint8_t hex)
+[[nodiscard]] std::string hexName(uint8_t hex)
 {
-    const game::Coordinate coordinate = game::kCoordinates[hex];
-    return std::to_string(coordinate.q) + ',' + std::to_string(coordinate.r);
+    const Coordinate coordinate = kCoordinates[hex];
+    return std::format("{},{}", coordinate.q, coordinate.r);
 }
 
-struct Ray {
-    std::uint8_t dir;
-    std::uint8_t steps;
-};
-
-[[nodiscard]] std::optional<Ray> find_ray(std::uint8_t from, std::uint8_t to)
+// The engine indexes a move by direction, the server names its destination.
+[[nodiscard]] std::optional<uint8_t> findDirection(uint8_t from, uint8_t to, uint8_t steps)
 {
-    for (std::uint8_t dir = 0; dir < game::kNumDirs; ++dir) {
-        for (std::uint8_t steps = 1; steps <= game::kMovableMax; ++steps) {
-            if (game::ray(from, dir, steps) == static_cast<std::int8_t>(to)) {
-                return Ray{dir, steps};
-            }
-        }
-    }
+    for (uint8_t dir = 0; dir < kNumDirs; ++dir)
+        if (ray(from, dir, steps) == static_cast<int8_t>(to))
+            return dir;
     return std::nullopt;
 }
 
-[[nodiscard]] std::string describe(const game::Board& board, game::Move move)
+[[nodiscard]] std::string describe(const Board& board, Move move)
 {
-    const std::int8_t to = game::ray(move.from, move.dir, board.hexes[move.from].height());
-    std::string text = encode_coord(move.from) + " -> ";
-    text += to >= 0 ? encode_coord(static_cast<std::uint8_t>(to)) : std::string("off-board");
-    text += move.splitting ? " (sow)" : " (whole)";
-    return text;
+    const int8_t to = ray(move.from, move.dir, board.hexes[move.from].height());
+    return std::format("{} -> {} ({})",
+                       hexName(move.from),
+                       to < 0 ? std::string{"off-board"} : hexName(static_cast<uint8_t>(to)),
+                       move.splitting ? "sow" : "whole");
 }
 
 // ---------------------------------------------------------------------------
 // Positions
 // ---------------------------------------------------------------------------
 
-[[nodiscard]] std::string board_text(const char* board)
+[[nodiscard]] bool samePosition(const Board& left, const Board& right)
 {
-    return board == nullptr ? std::string{} : std::string(board);
-}
-
-[[nodiscard]] bool same_position(const game::Board& left, const game::Board& right)
-{
-    if (left.whiteToMove != right.whiteToMove) {
-        return false;
-    }
-    for (std::uint8_t hex = 0; hex < game::kNumHexes; ++hex) {
-        if (left.hexes[hex] != right.hexes[hex]) {
-            return false;
-        }
-    }
-    return true;
-}
-
-[[nodiscard]] int piece_count(const game::Board& board)
-{
-    int total = 0;
-    for (std::uint8_t hex = 0; hex < game::kNumHexes; ++hex) {
-        total += board.hexes[hex].height();
-    }
-    return total;
+    return left.whiteToMove == right.whiteToMove && std::ranges::equal(left.hexes, right.hexes);
 }
 
 // fromString ignores anything it cannot parse, so a format we misread shows up
 // as pieces going missing rather than as an error.
-[[nodiscard]] game::Board parse_position(const char* board, bool white, const Context& context)
+[[nodiscard]] Board parsePosition(const char* board, bool whiteToMove)
 {
-    const game::Board parsed = game::fromString(board_text(board), white);
-    if (piece_count(parsed) != game::kMaxHeight) {
-        fail(
-            context,
-            "parsed " + std::to_string(piece_count(parsed)) + " pieces, expected "
-                + std::to_string(game::kMaxHeight) + "\n  server: " + board_text(board)
-                + "\n  local:  " + game::toString(parsed));
-    }
+    const Board parsed = fromString(board, whiteToMove);
+    const int   pieces = std::accumulate(std::begin(parsed.hexes),
+                                       std::end(parsed.hexes),
+                                       0,
+                                       [](int sum, const Hex& hex) { return sum + hex.height(); });
+    if (pieces != kMaxHeight)
+        fail("parsed {} pieces, expected {}\n  server: {}\n  local:  {}", pieces, kMaxHeight, board, toString(parsed));
     return parsed;
 }
 
 // Between two of our turns the opponent plays exactly one move. Replaying it
 // locally is what checks that apply() lands split pieces where the server does.
-void advance_to(Context& context, const char* board, arena_side_t current_turn)
+void replayOpponent(Context& context, const char* board, arena_side_t currentTurn)
 {
-    const game::Board remote = parse_position(board, is_white(current_turn), context);
-    if (same_position(context.board, remote)) {
+    const Board remote = parsePosition(board, currentTurn == ARENA_SIDE_WHITE);
+    if (samePosition(context.board, remote))
         return;
-    }
 
-    std::optional<game::Move> matched;
-    game::Board successor;
-    context.board.forEachLegal([&](std::uint16_t id) {
-        if (matched.has_value()) {
+    context.history.push_back(context.board.hash);
+
+    Move                 played{};
+    std::optional<Board> successor;
+    context.board.forEachLegal([&](uint16_t id) {
+        if (successor.has_value())
             return;
-        }
-        const game::Move move = game::Move::fromId(id);
-        const game::Board candidate = game::apply(context.board, move, context.history);
-        if (same_position(candidate, remote)) {
-            matched = move;
+        const Move  move      = Move::fromId(id);
+        const Board candidate = apply(context.board, move, context.history);
+        if (samePosition(candidate, remote))
+        {
+            played    = move;
             successor = candidate;
         }
     });
 
-    if (!matched.has_value()) {
-        fail(
-            context,
-            "server position is not reachable by any legal local move\n  server: "
-                + board_text(board) + "\n  local:  " + game::toString(context.board));
-    }
+    if (!successor.has_value())
+        fail("server position is not reachable by any legal local move\n  server: {}\n  local:  {}",
+             board,
+             toString(context.board));
 
-    std::printf(
-        "[test %.8s] Opponent move replayed: %s\n",
-        context.bot_id,
-        describe(context.board, *matched).c_str());
-    context.history.push_back(context.board.hash);
-    context.board = successor;
-    ++context.inferred_opponent_moves;
+    std::println("[test] opponent played {}", describe(context.board, played));
+    context.board = *successor;
 }
 
 // ---------------------------------------------------------------------------
 // Move sets
 // ---------------------------------------------------------------------------
 
-void set_bit(Mask& mask, std::uint16_t id)
+[[nodiscard]] std::vector<ServerMove> collectServerMoves(const arena_game_state_t& state, const Board& board)
 {
-    mask[id >> 6] |= 1ULL << (id & 63);
-}
+    std::vector<ServerMove> moves;
+    for (const arena_piece_moves_t& piece : std::span(state.legal_moves, state.legal_moves_count))
+    {
+        if (!piece.has_splitting)
+            fail("server move is missing its splitting field");
 
-[[nodiscard]] bool test_bit(const Mask& mask, std::uint16_t id)
-{
-    return ((mask[id >> 6] >> (id & 63)) & 1ULL) != 0;
-}
+        const int8_t from = parseHex(piece.pos);
+        if (from < 0)
+            fail("server sent an unparseable position: {}", piece.pos);
 
-[[nodiscard]] ServerMoves collect_server_moves(
-    const arena_game_state_t& state,
-    const game::Board& board,
-    Context& context)
-{
-    ServerMoves moves;
-    for (std::size_t piece_index = 0; piece_index < state.legal_moves_count; ++piece_index) {
-        const arena_piece_moves_t& piece = state.legal_moves[piece_index];
-        if (!piece.has_splitting) {
-            fail(context, "server Amoeba move is missing its splitting field");
-        }
-
-        const std::int8_t from = parse_coord(piece.pos);
-        if (from < 0) {
-            fail(context, "server sent an unparseable position: " + board_text(piece.pos));
-        }
-        const std::uint8_t height = board.hexes[from].height();
-        if (height == 0) {
-            fail(context, "server can move an empty hex: " + board_text(piece.pos));
-        }
+        const uint8_t height = board.hexes[from].height();
+        if (height == 0)
+            fail("server can move an empty hex: {}", piece.pos);
 
         // A one-piece stack sows and moves identically, so the engine only ever
         // emits the whole-stack form of it.
-        bool splitting = piece.splitting;
-        if (splitting && height < 2) {
-            splitting = false;
-            ++context.normalised_splits;
-        }
+        const bool splitting = piece.splitting && height >= 2;
 
-        for (std::size_t index = 0; index < piece.valid_moves_count; ++index) {
-            const char* destination = piece.valid_moves[index];
-            const std::int8_t to = parse_coord(destination);
-            if (to < 0) {
-                fail(context, "server sent an unparseable destination: " + board_text(destination));
-            }
+        for (const char* destination : std::span(piece.valid_moves, piece.valid_moves_count))
+        {
+            const int8_t                 to  = parseHex(destination);
+            const std::optional<uint8_t> dir = to < 0
+                ? std::nullopt
+                : findDirection(static_cast<uint8_t>(from), static_cast<uint8_t>(to), height);
+            if (!dir.has_value())
+                fail("server move is not a {}-step ray: {} -> {}", height, piece.pos, destination);
 
-            const std::optional<Ray> ray =
-                find_ray(static_cast<std::uint8_t>(from), static_cast<std::uint8_t>(to));
-            if (!ray.has_value()) {
-                fail(
-                    context,
-                    "server move is not a straight line: " + board_text(piece.pos) + " -> "
-                        + board_text(destination));
-            }
-            if (ray->steps != height) {
-                fail(
-                    context,
-                    "server move distance " + std::to_string(ray->steps) + " does not match stack height "
-                        + std::to_string(height) + ": " + board_text(piece.pos) + " -> "
-                        + board_text(destination));
-            }
-
-            const game::Move move{static_cast<std::uint8_t>(from), ray->dir, splitting};
-            moves.actions.push_back({move.id(), &piece, destination});
-            set_bit(moves.mask, move.id());
+            moves.push_back({Move{static_cast<uint8_t>(from), *dir, splitting}, &piece, destination});
         }
     }
     return moves;
 }
 
-void compare_move_sets(const game::Board& board, const ServerMoves& server, const Context& context)
+void compareMoveSets(const Board& board, const std::vector<ServerMove>& server)
 {
-    std::string differences;
-    for (std::uint16_t id = 0; id < game::kNumMoveIds; ++id) {
-        const bool local = board.isLegal(id);
-        const bool remote = test_bit(server.mask, id);
-        if (local == remote) {
-            continue;
-        }
-        differences += std::string("\n  ") + (local ? "local only:  " : "server only: ")
-            + describe(board, game::Move::fromId(id));
-    }
+    std::bitset<kNumMoveIds> remote;
+    for (const ServerMove& move : server)
+        remote.set(move.move.id());
 
-    if (!differences.empty()) {
-        fail(
-            context,
-            "legal-move mismatch\n  position: " + game::toString(board) + "\n  side: "
-                + (board.whiteToMove ? "white" : "black") + differences);
-    }
+    std::string differences;
+    for (uint16_t id = 0; id < kNumMoveIds; ++id)
+        if (board.isLegal(id) != remote.test(id))
+            differences += std::format("\n  {:<13}{}",
+                                       board.isLegal(id) ? "local only:" : "server only:",
+                                       describe(board, Move::fromId(id)));
+
+    if (!differences.empty())
+        fail("legal-move mismatch\n  position: {}\n  side: {}{}",
+             toString(board),
+             board.whiteToMove ? "white" : "black",
+             differences);
 }
 
 // ---------------------------------------------------------------------------
 // Callbacks
 // ---------------------------------------------------------------------------
 
-void on_ready(void* user_data)
+void onGameStart(const arena_game_state_t* state, void* userData)
 {
-    const auto& context = *static_cast<Context*>(user_data);
-    std::printf("[test %.8s] Connected and ready.\n", context.bot_id);
-}
-
-void on_room_joined(const char* room_id, void* user_data)
-{
-    const auto& context = *static_cast<Context*>(user_data);
-    std::printf("[test %.8s] Joined practice room: %.8s...\n", context.bot_id, room_id);
-}
-
-void on_game_start(const arena_game_state_t* state, void* user_data)
-{
-    auto& context = *static_cast<Context*>(user_data);
-    if (state == nullptr) {
-        fail(context, "SDK passed a null game-start state");
-    }
-
-    context.white = is_white(state->my_side);
-    context.board = parse_position(state->board, is_white(state->current_turn), context);
+    Context& context = *static_cast<Context*>(userData);
+    context.board    = parsePosition(state->board, state->current_turn == ARENA_SIDE_WHITE);
     context.history.clear();
-    context.started = true;
 
-    // Game start reports this bot's moves even when the opponent is to move.
-    const game::Board view = is_white(state->current_turn) == context.white
-        ? context.board
-        : parse_position(state->board, context.white, context);
-    compare_move_sets(view, collect_server_moves(*state, view, context), context);
-
-    std::printf(
-        "[test %.8s] Start position matched: %s\n[test %.8s] I am %s; %s moves first.\n",
-        context.bot_id,
-        game::toString(context.board).c_str(),
-        context.bot_id,
-        arena_side_str(state->my_side),
-        arena_side_str(state->current_turn));
+    std::println("[test] start: {}, I am {}", toString(context.board), arena_side_str(state->my_side));
 }
 
-void on_move(const arena_game_state_t* state, arena_move_t* output, void* user_data)
+void onMove(const arena_game_state_t* state, arena_move_t* output, void* userData)
 {
-    auto& context = *static_cast<Context*>(user_data);
-    if (state == nullptr || output == nullptr) {
-        fail(context, "SDK passed a null move callback argument");
-    }
-    if (!context.started) {
-        fail(context, "SDK requested a move before game start");
-    }
-    if (is_white(state->current_turn) != context.white) {
-        fail(context, "SDK requested a move for the wrong side");
-    }
+    Context& context = *static_cast<Context*>(userData);
+    replayOpponent(context, state->board, state->current_turn);
+    if (context.board.state != State::Ongoing)
+        fail("server continued a game the engine considers finished");
 
-    advance_to(context, state->board, state->current_turn);
-    if (context.board.state != game::State::Ongoing) {
-        fail(context, "server continued a game the engine considers finished");
-    }
+    const std::vector<ServerMove> server = collectServerMoves(*state, context.board);
+    compareMoveSets(context.board, server);
+    if (server.empty())
+        fail("server asked for a move with no legal actions");
 
-    const ServerMoves server = collect_server_moves(*state, context.board, context);
-    compare_move_sets(context.board, server, context);
-    if (server.actions.empty()) {
-        fail(context, "SDK requested a move with no legal actions");
-    }
-    ++context.compared_turns;
-
-    std::uniform_int_distribution<std::size_t> distribution(0, server.actions.size() - 1);
-    const ServerAction& action = server.actions[distribution(context.random)];
-    const game::Move move = game::Move::fromId(action.id);
+    const ServerMove& chosen = server[std::uniform_int_distribution<size_t>(0, server.size() - 1)(context.random)];
+    std::println("[test] ply {}: {} moves matched, playing {}",
+                 context.board.ply,
+                 server.size(),
+                 describe(context.board, chosen.move));
 
     // The SDK owns these strings for the duration of the callback, and they
     // carry the server's own spelling of the move.
-    output->from_pos = action.piece->pos;
-    output->to_pos = action.destination;
-    output->side = nullptr;
-    output->splitting = action.piece->splitting;
-
-    std::printf(
-        "[test %.8s] Ply %u: %zu moves matched; sending %s\n",
-        context.bot_id,
-        context.board.ply,
-        server.actions.size(),
-        describe(context.board, move).c_str());
+    output->from_pos  = chosen.piece->pos;
+    output->to_pos    = chosen.destination;
+    output->side      = nullptr;
+    output->splitting = chosen.piece->splitting;
 
     context.history.push_back(context.board.hash);
-    context.board = game::apply(context.board, move, context.history);
+    context.board = apply(context.board, chosen.move, context.history);
 }
 
-void on_game_end(const arena_game_end_t* state, void* user_data)
+void onGameEnd(const arena_game_end_t* state, void* userData)
 {
-    auto& context = *static_cast<Context*>(user_data);
-    if (state == nullptr) {
-        fail(context, "SDK passed a null game-end state");
-    }
-    if (!context.started) {
-        fail(context, "SDK ended the game before game start");
-    }
-
-    advance_to(context, state->board, state->current_turn);
+    Context& context = *static_cast<Context*>(userData);
+    replayOpponent(context, state->board, state->current_turn);
 
     // The engine's move cap and repetition limit are guesses; the ply the server
     // stops at is the evidence for what they really are.
-    if (context.board.state == game::State::Ongoing) {
-        int repeats = 0;
-        for (std::uint64_t past : context.history) {
-            if (past == context.board.hash) {
-                ++repeats;
-            }
-        }
-        fail(
-            context,
-            "server ended the game at ply " + std::to_string(context.board.ply)
-                + " while the engine considers it ongoing (position seen "
-                + std::to_string(repeats + 1) + " times; kMoveCap=" + std::to_string(game::kMoveCap)
-                + ", kRepetitionLimit=" + std::to_string(game::kRepetitionLimit) + ")");
-    }
+    if (context.board.state == State::Ongoing)
+        fail("server ended the game at ply {} while the engine considers it ongoing "
+             "(position seen {} times; kMoveCap={}, kRepetitionLimit={})",
+             context.board.ply,
+             std::ranges::count(context.history, context.board.hash) + 1,
+             kMoveCap,
+             kRepetitionLimit);
 
-    const bool local_draw = context.board.state == game::State::Draw;
-    if (state->has_winner == local_draw) {
-        fail(context, "winner mismatch: one implementation reports a draw");
-    }
-    if (state->has_winner) {
-        const bool local_white_wins = context.board.state == game::State::WhiteWins;
-        if (is_white(state->winner) != local_white_wins) {
-            fail(
-                context,
-                "winner mismatch: server=" + std::string(arena_side_str(state->winner))
-                    + ", local=" + (local_white_wins ? "white" : "black"));
-        }
-    }
+    const bool draw = context.board.state == State::Draw;
+    if (state->has_winner == draw)
+        fail("result mismatch: one implementation reports a draw");
+
+    const bool whiteWins = context.board.state == State::WhiteWins;
+    if (state->has_winner && (state->winner == ARENA_SIDE_WHITE) != whiteWins)
+        fail("winner mismatch: server={}, local={}", arena_side_str(state->winner), whiteWins ? "white" : "black");
 
     context.completed = true;
-    std::printf(
-        "[test %.8s] PASSED after %u plies: %zu turns compared, %zu opponent moves replayed",
-        context.bot_id,
-        context.board.ply,
-        context.compared_turns,
-        context.inferred_opponent_moves);
-    if (context.normalised_splits > 0) {
-        std::printf(", %zu height-1 sows normalised", context.normalised_splits);
-    }
-    std::printf(".\n");
+    std::println("[test] PASSED after {} plies", context.board.ply);
 }
 
-void on_disconnect(const char* reason, void* user_data)
+void onDisconnect(const char* reason, void*)
 {
-    auto& context = *static_cast<Context*>(user_data);
-    context.disconnected = true;
-    std::fprintf(
-        stderr,
-        "[test %.8s] Disconnected before a verified result: %s\n",
-        context.bot_id,
-        reason == nullptr ? "unknown reason" : reason);
-}
-
-[[nodiscard]] std::uint64_t parse_seed(std::string_view value)
-{
-    std::uint64_t parsed{};
-    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), parsed);
-    if (error != std::errc{} || end != value.data() + value.size()) {
-        throw std::invalid_argument("invalid --seed value");
-    }
-    return parsed;
-}
-
-[[nodiscard]] std::uint64_t parse_options(int argc, char** argv)
-{
-    std::uint64_t seed = 1;
-    for (int index = 1; index < argc; ++index) {
-        const std::string_view argument = argv[index];
-        if (argument == "--seed" && index + 1 < argc) {
-            seed = parse_seed(argv[++index]);
-        } else if (argument == "--help") {
-            std::printf(
-                "Usage: amoeba_random_test [--seed N]\n"
-                "Requires BOT1_ID, BOT1_KEY, and ROOM_ID. Runs in practice mode only.\n");
-            std::exit(EXIT_SUCCESS);
-        } else {
-            throw std::invalid_argument("unknown or incomplete option: " + std::string(argument));
-        }
-    }
-    return seed;
+    std::println(stderr, "[test] disconnected: {}", reason == nullptr ? "unknown reason" : reason);
 }
 
 } // namespace
 
-int main(int argc, char** argv)
-try {
-    const std::uint64_t seed = parse_options(argc, argv);
-    const char* bot_id = std::getenv("BOT1_ID");
-    const char* api_key = std::getenv("BOT1_KEY");
-    if (bot_id == nullptr || api_key == nullptr || std::getenv("ROOM_ID") == nullptr) {
-        std::fprintf(stderr, "Error: set BOT1_ID, BOT1_KEY, and ROOM_ID.\n");
+int main()
+{
+    const char* botId  = std::getenv("BOT1_ID");
+    const char* apiKey = std::getenv("BOT1_KEY");
+    if (botId == nullptr || apiKey == nullptr || std::getenv("ROOM_ID") == nullptr)
+    {
+        std::println(stderr, "set BOT1_ID, BOT1_KEY and ROOM_ID");
         return EXIT_FAILURE;
     }
 
-    Context context(bot_id, seed);
+    Context context;
     const arena_bot_config_t config{
-        .bot_id = bot_id,
-        .api_key = api_key,
+        .bot_id   = botId,
+        .api_key  = apiKey,
         .callbacks = {
-            .on_move = on_move,
-            .on_ready = on_ready,
-            .on_queue_entry = nullptr,
-            .on_queue_exit = nullptr,
-            .on_match_found = nullptr,
-            .on_room_joined = on_room_joined,
-            .on_game_start = on_game_start,
-            .on_game_end = on_game_end,
-            .on_disconnect = on_disconnect,
+            .on_move       = onMove,
+            .on_game_start = onGameStart,
+            .on_game_end   = onGameEnd,
+            .on_disconnect = onDisconnect,
         },
         .user_data = &context,
     };
 
-    std::printf(
-        "[test %.8s] Starting Amoeba practice comparison with seed %llu.\n",
-        bot_id,
-        static_cast<unsigned long long>(context.seed));
-
-    const int result = arena_start_practice(&config, nullptr);
-    if (result != 0) {
-        std::fprintf(stderr, "[test %.8s] SDK exited with error code %d.\n", bot_id, result);
+    if (const int result = arena_start_practice(&config, nullptr); result != 0)
         return result;
-    }
-    if (context.disconnected || !context.completed) {
-        std::fprintf(stderr, "[test %.8s] No verified complete game.\n", bot_id);
+    if (!context.completed)
+    {
+        std::println(stderr, "[test] no verified complete game");
         return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
-} catch (const std::exception& error) {
-    std::fprintf(stderr, "Error: %s\n", error.what());
-    return EXIT_FAILURE;
 }
