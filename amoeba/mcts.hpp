@@ -15,7 +15,7 @@
 // that owns it, which is why the backup flips sign once per level.
 // ---------------------------------------------------------------------------
 
-#include <amoeba/amoeba.hpp>
+#include "amoeba.hpp"
 
 #include <array>
 #include <chrono>
@@ -68,22 +68,39 @@ private:
 
 struct Config
 {
-    // The search stops at whichever of these two comes first. The count is what
-    // keeps self-play reproducible; the deadline is what keeps a match turn
-    // inside the server's clock when the trainer is competing for the machine.
-    int                       simulations = 800;
-    std::chrono::milliseconds deadline    = std::chrono::seconds{4};
+    int   simulations = 800;
+    float cPuct       = 1.5f;
 
-    float cPuct = 1.5f;
+    // The search stops at the simulation count or the deadline, whichever comes
+    // first, and always runs one batch so the visit counts can never be empty.
+    // Match play sets the count high and lets the clock bind: a turn that arrives
+    // late is a forfeit, while a turn that only managed 300 simulations is merely
+    // a weaker move. Self-play does the reverse, so its data does not depend on
+    // how busy the machine was.
+    std::chrono::milliseconds deadline = std::chrono::hours{1};
 
-    // Self-play only. Mixing Dirichlet noise into the root priors is the only
-    // reason two self-play games from one network differ: at weight 0 the search
-    // is deterministic, every game is the same game, and training stalls. Match
-    // play wants 0 - the noise is deliberately playing slightly worse moves.
-    float rootNoiseWeight = 0.0f;
-    float rootNoiseAlpha  = 0.3f;
+    // Self-play only, and off by default so competition keeps the network's own
+    // opinion. A network is deterministic and so is edge selection, so without
+    // noise every self-play game from a given network is the same game: the network
+    // only ever sees positions it already understands, and training stalls while
+    // every loss curve stays healthy.
+    //
+    // The mix is prior = (1 - rootNoise) * network + rootNoise * Dirichlet(alpha).
+    // Applied at the root only, because the root is the position that becomes a
+    // training example - noise deeper in the tree would just spoil the search's
+    // judgement. alpha below 1 makes each draw spiky, so a different random handful
+    // of moves gets promoted each game; AlphaZero scaled it as 10 / average legal
+    // moves, and Amoeba averages 27.
+    float    rootNoise  = 0.0f;
+    float    noiseAlpha = 0.35f;
+    uint64_t noiseSeed  = 0;
 
-    uint64_t seed = 0;
+    // How many leaves to gather before asking the evaluator. A rollout gains
+    // nothing from this, but the network costs 1.70 ms for one position and
+    // 0.16 ms each for 64, so leave it at 1 for RolloutEvaluator and raise it for
+    // NetworkEvaluator. Descents inside a batch see slightly stale statistics, so
+    // each simulation is a little less well directed - worth it about tenfold.
+    int batchSize = 1;
 };
 
 // Simulations spent on each move id. The argmax is the move to play; normalised
@@ -94,8 +111,9 @@ class Search
 {
 public:
     explicit Search(Evaluator& evaluator, Config config = {})
-        : m_evaluator(evaluator), m_config(config), m_rng(config.seed)
-    {}
+        : m_evaluator(evaluator), m_config(config), m_rng(config.noiseSeed)
+    {
+    }
 
     // `history` is the hash of every position the real game has passed through,
     // ending with `root`'s own. amoeba::apply() needs it to see repetitions that
@@ -122,36 +140,47 @@ private:
 
     // Appends the node and its outgoing edges, and returns its index alongside
     // the value of the position for the side to move there.
-    std::pair<uint32_t, float> addNode(const amoeba::Board&);
-    uint32_t selectEdge(uint32_t node) const;
-    void     addRootNoise();
+    // Where one descent ended, and everything needed to back it up once its leaf
+    // has been evaluated.
+    struct Descent
+    {
+        uint32_t trailStart;
+        uint32_t trailLength;
+        int32_t  edge;    // the edge whose child this descent is creating, -1 if it hit a terminal node
+        int32_t  leaf;    // index into m_leaves, -1 if it hit a terminal node
+        float    value;   // the terminal value, when there is no leaf to evaluate
+    };
 
-    Evaluator&      m_evaluator;
-    Config          m_config;
-    std::mt19937_64 m_rng;
+    std::pair<uint32_t, float> addNode(const amoeba::Board&);
+    uint32_t expand(const amoeba::Board&, const Evaluation&);
+    uint32_t selectEdge(uint32_t node) const;
+    void addRootNoise();
+    void collect(size_t baseLength, int wanted);
+    void backUp();
+
+    Evaluator& m_evaluator;
+    Config     m_config;
 
     std::vector<Node>     m_nodes;
     std::vector<Edge>     m_edges;
-    std::vector<uint64_t> m_path;    // hashes down the current descent
-    std::vector<uint32_t> m_trail;   // edges down the current descent
-    std::vector<float>    m_noise;   // one Dirichlet sample per root edge
+    std::vector<uint64_t> m_path;    // hashes down the descent being collected
+
+    std::mt19937_64    m_rng;
+    std::vector<float> m_noise;
+
+    std::vector<Descent>              m_descents;
+    std::vector<uint32_t>             m_trailStore;   // every trail in the batch, concatenated
+    std::vector<amoeba::Board>        m_leaves;
+    std::vector<const amoeba::Board*> m_leafPointers;
+    std::vector<Evaluation>           m_evaluations;
 };
 
 uint16_t randomLegalMove(const amoeba::Board&, std::mt19937_64&);
-
-// The move the search settled on. What match play wants, and what self-play
-// wants once the opening is over.
 uint16_t bestMove(const VisitCounts&);
-
-// Picks a move with probability proportional to visits^(1/temperature), which
-// at 1 is the visit distribution itself and sharpens towards bestMove as it
-// falls. Self-play plays the opening this way so that games diverge; call
-// bestMove for the greedy phase rather than passing a temperature of 0.
-uint16_t sampleMove(const VisitCounts&, float temperature, std::mt19937_64&);
 
 // What a finished game is worth to a given side. Every value in the search and
 // every training target is signed this way - from the point of view of the side
-// to move - and getting it backwards trains a bot that plays badly while every
+// to move - and inverting it trains a bot that reliably plays badly while every
 // loss curve looks healthy.
 float outcomeFor(amoeba::State, bool whiteToMove);
 

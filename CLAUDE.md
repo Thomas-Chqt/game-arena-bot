@@ -14,34 +14,28 @@ plain terms without assuming vocabulary; don't explain C++.
 
 ## Game rules
 
-`games/amoeba/amoeba-reference.md`
+`amoeba/amoeba-reference.md`
 
 ## Layout
 
+Everything lives in one flat directory and builds two executables. There is no library, no
+per-feature subdirectory, and no test binary.
+
 ```
-games/amoeba/
-  amoeba-reference.md           the rules, mirrored from the server engine
-  include/amoeba/amoeba.hpp     rules engine
-  include/amoeba/encode.hpp     Board -> network input
-  src/amoeba.cpp
-  src/encode.cpp
-  test/encode_test.cpp          offline
-  test/random_test.cpp          live server parity harness
-amoeba_bot_1/
-  mcts.hpp / mcts.cpp           PUCT search + rollout evaluator
-  checkpoints.hpp / .cpp        the model directory and the `best` link
-  network.hpp                   the seam with the network branch - declarations only
-  play.cpp                      arena client        -> amoeba_bot_1
-  train.cpp                     self-play + training -> amoeba_bot_1_train
+amoeba/
+  amoeba-reference.md    the rules, mirrored from the server engine
+  amoeba.hpp / .cpp      rules engine, startPosition(), and encode() with its policy permutation
+  mcts.hpp / .cpp        PUCT search, rollout evaluator, leaf batching
+  network.hpp / .cpp     parameters, forward pass, NetworkEvaluator, Batch, loss(), Adam
+  bot.cpp                arena client        -> amoeba_bot
+  train.cpp              self-play + training -> amoeba_train
 ```
 
-**Two programs, on purpose.** `amoeba_bot_1` plays and never trains;
-`amoeba_bot_1_train` trains and never talks to the server — it does not even link the arena SDK.
-They share a checkpoint directory and nothing else, so both can run at once on the same machine and
-either can be killed and restarted without the other noticing. A match costs almost nothing next to
-self-play (one game is ~4 minutes of thinking, most of it waiting on the opponent's clock), so
-continuous ranked play takes a couple of percent off training throughput. Coordinating them in one
-process would buy the ability to pause training during a turn, which is not worth the coupling.
+**Two programs, on purpose.** `amoeba_bot` plays and never trains; `amoeba_train` trains and never
+talks to the server — it does not even link the arena SDK, which is what keeps that true. They share
+one `.safetensors` file and nothing else, so both can run at once and either can be killed and
+restarted without the other noticing. `amoeba_train` writes the file whenever a generation passes the
+gate; `amoeba_bot` re-reads it at the start of each game.
 
 ## Current state
 
@@ -53,19 +47,20 @@ The rules engine works. ~296k plies/sec, ~3.7k full random games/sec, single-thr
 - `generateLegal`, `kernelAttacked`, `applyRaw` / `apply`, `fromString` / `toString`.
 - Terminal conditions agree with `amoeba-reference.md`: repetition on the 3rd occurrence, staleness
   80, move cap 250, adjudication by controlled stacks then by enemy pieces held inside them.
-- `encode()`, its test, and `kFlippedMove` — the 444-entry permutation that maps a policy out of
-  the mover's frame. `static_assert`ed to be its own inverse.
-- `openingBoard()`, the position self-play starts every game from.
-- PUCT search with a deadline, Dirichlet root noise and temperature sampling; a rollout evaluator.
-- `amoeba_bot_1` (continuous arena play) and `amoeba_bot_1_train` (self-play, training, gating),
-  both complete except for the network. `network.hpp` declares the eight symbols the model branch
-  owes them; there is no `network.cpp`, so **both targets compile and fail to link**, which is the
-  intended state until the model lands.
+- `encode()`, plus `policyToAbsolute()` — the 444-entry permutation that maps a policy out of the
+  mover's frame, `static_assert`ed to be its own inverse.
+- PUCT search with leaf batching, Dirichlet root noise and a deadline; a rollout evaluator.
+- The network: attention over 37 hex tokens with a relative-position bias, `loss()` and `Adam`.
+- `amoeba_bot` and `amoeba_train`, both built and both run. The full generation loop — self-play,
+  training, gate, promotion, write back to the same file — has been run end to end at toy scale and
+  works; `amoeba_bot` loads a checkpoint and reaches the server connect.
 
-**`random_test` has still never been run against the server.** `amoeba-reference.md` is a document,
-and the reference *Python* implementation is what was differentially tested — our C++ engine has not
-been. 200 random games do land within noise of the reference's own outcome distribution (§7.3), which
-is reassuring but is not the same thing. Run the harness before trusting a long training run.
+**Nothing has ever been run against the live server**, and there is no longer a parity harness: the
+engine was checked against `amoeba-reference.md` as a document, not against the server that enforces
+it. The reference *Python* implementation is what was differentially tested; our C++ engine has not
+been. 200 random games land within noise of the reference's own outcome distribution (§7.3), which is
+reassuring but is not the same thing. `syncToServer()`'s resync fallback in `bot.cpp` will paper over
+a rules disagreement rather than reporting it, so a bad rating and a bad network look identical.
 
 ## Encoder
 
@@ -133,17 +128,26 @@ the enum value *is* the one-hot index — 1/2 are always "mine", 3/4 always "the
 
 `Board` stays in absolute colours. The flip lives only in `encode()`.
 
-**The policy comes back in flipped space.** Map it back before naming a move: hex via `kFlipped`,
-direction via `opposite()`. That is a fixed 444-entry permutation table, built once — needed both for
-the move you send and for training targets.
+**The policy comes back in flipped space.** `policyToAbsolute(whiteToMove)` in `amoeba.hpp` is the
+444-entry permutation that maps it back — identity for White, `kPolicyUnflip` for Black. Needed both
+for the move you send and for training targets. `kFlipped` and `opposite()` are both involutions, so
+the permutation is its own inverse; a `static_assert` holds that.
 
-`encode_test.cpp` exists for exactly this: it asserts `encode(position) == encode(mirrored position)`
-bit for bit. Verified to have teeth — dropping the coordinate rotation, the colour swap, or the
-direction remap each fails on the first position.
+`encode_test.cpp` used to cover all of this — `encode(position) == encode(mirrored position)` bit for
+bit, plus `policyToAbsolute()` against the legality bits `encode()` wrote, on every position of 200
+random games — and was verified to have teeth: dropping the coordinate rotation, the colour swap or
+the direction remap each failed on the first position, and so did breaking the policy permutation
+three ways. **It was deleted on request**, so nothing checks the flip any more. This is the one
+mapping whose failure is silent: a wrong permutation still gives a valid distribution over legal
+moves, the loss still falls, and the bot simply plays as though the board were rotated.
+
+**This is the failure mode to fear.** With the unflip disabled, the network's policy still sums to
+exactly 1.0 over the legal moves with zero mass on illegal ones. It looks perfect and plays the board
+rotated.
 
 ## Search (MCTS)
 
-`amoeba_bot_1/mcts.hpp` / `mcts.cpp`. PUCT, the AlphaZero variant — no rollouts *inside* the search;
+`amoeba/mcts.hpp` / `mcts.cpp`. PUCT, the AlphaZero variant — no rollouts *inside* the search;
 a new position's value comes from a `bot::Evaluator`.
 
 ### The pieces
@@ -184,39 +188,151 @@ The cost is cache: the descent reads only `visits`, `edgeCount` and `board.hash`
 bytes. Splitting hot (~24 B) from cold would fix it, and is not worth doing while the evaluator is
 ~99% of the time.
 
-### Self-play knobs, now present
+### The deadline
 
-- **`Config::deadline`** — the search stops at the simulation count *or* the clock, whichever comes
-  first, and always runs at least one simulation so the visit counts can never be all zero. Match
-  play sets the count high and lets the deadline bind: the trainer may be holding the GPU, and a
-  late turn is a forfeit while a short search is only a weaker move. Self-play does the reverse, so
-  its data does not depend on how busy the machine was.
-- **`Config::rootNoiseWeight`** — Dirichlet noise mixed into the root priors, 0.25 in self-play and
-  0 everywhere else. Without it every self-play game from one network is the same game.
-- **`sampleMove(counts, temperature, rng)`** — picks in proportion to `visits^(1/T)`. Self-play and
-  the gate use it for the first 15 plies, then `bestMove`. It deliberately does not accept `T = 0`;
-  call `bestMove` for the greedy phase.
+`Config::deadline` stops the search on the clock as well as on the simulation count, whichever comes
+first, and always runs one batch so the visit counts can never be empty. `bot.cpp` sets the count
+high (20000) and lets the clock bind at 4 s against the server's 5 s; `train.cpp` leaves the deadline
+at its hour default so its data does not depend on how busy the machine was. Leaf batching brought a
+200-simulation network search to 21.5 ms, so the limit is comfortable — the deadline is what makes
+that safe rather than merely likely.
 
-### Still deliberately absent
+### Deliberately absent
 
+- **Temperature sampling** — lives in `train.cpp`'s `chooseMove()` rather than in the search.
 - **Tree reuse between moves** — the subtree under the played move stays valid, and re-rooting is
   roughly 20-40% more effective simulations for free. `m_nodes` / `m_edges` are members so
   allocations are reused, but the tree is cleared on every `run()`.
-- **Leaf batching with virtual loss** — see Trainer below. Cheaper to build before the network than
-  to retrofit after, and it is what unlocks concurrent self-play games.
 
-### Verification gap
+### Dirichlet root noise
 
-A `strength_check` binary existed: rollout MCTS against uniformly random legal play, alternating
-colours, seed `20260819`. It scored **97.5%** (39-0-1) at 200 simulations and **100%** (20-0-0) at
-800. Both numbers mattered — the second showed strength rising with simulation count, which is the
-property a broken tree does not have. It was deleted on request, so nothing offline checks the search
-any more.
+`Config::rootNoise` / `noiseAlpha` / `noiseSeed`, **off by default** so competition keeps the
+network's own priors. `prior = (1 - rootNoise) * network + rootNoise * Dirichlet(alpha)`, at the root
+only, because the root is the position that becomes a training example — noise deeper in the tree just
+spoils the search's judgement. A Dirichlet draw is independent `std::gamma_distribution` samples
+normalised; `alpha < 1` makes each draw spiky, so a different random handful of moves is promoted each
+game. AlphaZero scaled `alpha` as 10 / average legal moves, and Amoeba averages 27.
+
+Verified on the failure it exists to prevent — a network and `selectEdge` are both deterministic:
+
+```
+no noise      : 1 distinct best move over 8 searches
+Dirichlet 0.25: 8 distinct best moves over 8 searches
+```
+
+Without it, self-play from a given network replays one game forever, the network never sees a position
+it does not already understand, and training stalls with every loss curve looking healthy.
+
+### Leaf batching with virtual loss
+
+`Search::run` is three phases: `collect()` descends `Config::batchSize` times, one batched
+`evaluate()`, then `backUp()`. `addNode` split into `expand()` — build a node and its edges from an
+`Evaluation` already in hand — and a single-board path used only for the root.
+
+**Virtual loss** is what makes the descents diverge: on the way down, each edge is provisionally
+recorded as having come back a loss (`valueSum -= 1`, `++visits`), which `backUp()` removes before
+applying the real result. Without it all N descents follow one path and return the same leaf N times.
+
+Measured, 200 simulations, 2 blocks at width 64, Metal:
+
+| leaves per batch | ms/search |
+|---|---|
+| 1 | 336.4 |
+| 4 | 105.8 |
+| 16 | 42.2 |
+| 64 | **21.5** |
+
+**15.6×**, which puts the network *below* the rollout teacher's ~33 ms per search. Leaf batching is
+what makes a network search cheaper than a rollout search, not merely competitive.
+
+- **Duplicate leaves are kept, not deduplicated.** Two descents can still choose the same unexpanded
+  edge; both are evaluated, one node ends up unreachable, and both back up the same correct value.
+  Sharing one evaluation would need the backup to know about the pairing.
+- **Terminal leaves stay in the batch** but take their value from the rules, not the network. Keeping
+  the two arrays parallel is worth more than the handful of wasted evaluations — and it is why the
+  policy mask is −1e9 rather than −∞.
+
+### Verification
+
+These numbers came from a `MODE=match` driver that no longer exists — the gate in `train.cpp` only
+plays network against network. Over 20 games at 200 simulations, alternating colours:
+
+```
+rollout vs random             : 100.0% +/- 0.0%   (20-0-0)
+network, 1 leaf   vs random   :  97.5% +/- 3.5%   (19-0-1)
+network, 64 leaves vs random  : 100.0% +/- 0.0%   (20-0-0)
+network, 64 leaves vs rollout :  40.0% +/- 11.0%  (6-10-4)
+```
+
+Over **200** games, network at 64 leaves against rollout scores **44.0% ± 3.5%** (64-88-48). That is
+1.7 standard errors below parity — suggestive that the network is slightly weaker than its teacher, not
+conclusive. Whether leaf batching is responsible needs the same match at 1 leaf, which is 15× slower
+to run.
+
+**Before refactoring `run()` again, fingerprint its visit counts.** At `batchSize = 1` the batched
+code reproduced the pre-refactor fingerprints bit for bit — virtual loss adds and removes exactly 1.0
+at magnitudes float32 represents exactly — which pinned that restructure independently of whether
+batching helped. Do it again before touching the descent: the search has no offline test at all now,
+and ±11% over 20 games cannot resolve a small regression.
+
+## Trainer
+
+`amoeba/train.cpp` -> `amoeba_train`. Takes an optional `.safetensors` path; with no argument it uses
+the first one in the working directory, and starts from random weights if there are none. It loops
+forever, and **writes back over that same file whenever a generation passes the gate** — which is the
+file `amoeba_bot` reads, so a bot running alongside picks the improvement up at its next game.
+
+One generation is three steps: play `GAMES` games of the current best against itself into a replay
+buffer, train a candidate on batches from that buffer, then play the candidate against the current
+best and promote only if it wins.
+
+Env vars, all optional: `BLOCKS WIDTH HEADS` (read only when starting from scratch — otherwise the
+shape comes out of the checkpoint), `SEED GAMES SIMULATIONS LEAVES SAMPLING_PLIES NOISE`,
+`STEPS BATCH RATE DECAY BUFFER`, `GATE_GAMES GATE`.
+
+### Things it gets right that are easy to get wrong
+
+- **The gate is the point.** A training loss can fall while the player gets worse, and AlphaZero bugs
+  produce clean loss curves. Nothing is promoted on a curve, only on games won.
+- **Gate games must not be deterministic.** Both sides take the argmax past `SAMPLING_PLIES`, so the
+  early sampling in `chooseMove()` is the only thing making game N differ from game N-1. Without it
+  the whole match is one game replayed `GATE_GAMES` times and the score is 0% or 100%. Colours
+  alternate, because White moving first is worth something.
+- **Game ids stay unique across generations.** The replay buffer spans generations and
+  `splitByGame()` holds out whole games — if ids restarted each generation it would hold out one
+  generation's game and train on a different game with the same id.
+- **Hold out whole games, never positions.** Positions within a game are near-copies carrying the
+  same outcome label, so a by-position split leaves a held-out position's own game in training and
+  the value head scores by recognising the game. The symptom is a held-out loss that *improves* as
+  you generate fewer games.
+- **Training keeps the best step's weights**, not the last. Held-out loss turns back up well before
+  training ends; at 300 games the value loss at step 600 is 43% worse than at step 100.
+- **The candidate starts from the best weights**, not from scratch: each generation refines rather
+  than relearns.
+- **Root noise is self-play only.** The gate forces `rootNoise = 0` so a match takes the network's
+  own opinion.
+- **Progress output is flushed.** `std::println` block-buffers when stdout is not a terminal, so a
+  redirected run showed an empty log for 100 s. Short runs hide this because exiting flushes.
+- **Concurrent MLX evaluation was tested** — 24 searches across 8 threads agreed with the
+  single-threaded result — so both self-play and the gate run one game per thread. That is evidence,
+  not a guarantee; if it ever misbehaves like a race, try one thread first.
+
+### Deliberate gaps
+
+- **Games are never written to disk**, so a restart loses the replay buffer and has to regenerate it.
+  Only the weights survive.
+- **Adam's moment estimates are not checkpointed**, so a generation cannot be resumed part way.
+- **The gate needs hundreds of games.** At the default 40 its error bar is ±8%, which cannot separate
+  55% from a coin flip. It prints the error bar rather than pretending otherwise.
+- **Leaves are batched within one game.** Batching across many concurrent games is the real
+  throughput win and is a much larger change.
 
 ## Arena client
 
-`amoeba_bot_1/play.cpp`. Four callbacks, same shape as the reference's random bot. With no
-`ROOM_ID` it runs `arena_start_continuous`, which queues game after game and only returns on error.
+`amoeba/bot.cpp` -> `amoeba_bot`. Takes an optional `.safetensors` path, defaulting to the first one
+in the working directory. Credentials are `BOT1_ID` and `BOT1_KEY`, the same as the reference random
+bot; `ROOM_ID` picks a practice room, and without it the bot runs `arena_start_continuous`, which
+queues game after game and only returns on error. Four callbacks, same shape as the random bot.
 
 - **Translation.** The engine names a move `(from, dir, splitting)`; the server names it
   `(pos, destination, splitting)`. `collectServerMoves()` turns the server's list into engine move
@@ -228,89 +344,160 @@ any more.
   `staleness` to zero every ply, and would leave no hash history for the search to detect repetition
   with.
 - **Two fallbacks, because forfeiting is worse than wrong bookkeeping.** If no legal move reaches the
-  server's position, adopt that position and carry `ply` forward — that is a rules bug, and
-  `amoeba_random_test` should have caught it first. If the search picks a move the server did not
-  offer, play the server's first move.
-- **The model is loaded once per game**, in `on_game_start`, from the `best` link. Between games is
-  the only safe moment: one tree scoring its positions with two different networks is incoherent and
-  would not show up in any log.
+  server's position, adopt that position and carry `ply` forward — that is a rules bug. If the search
+  picks a move the server did not offer, play the server's first move.
+- **The model is loaded once per game**, in `on_game_start`. Between games is the only safe moment:
+  one tree scoring its positions with two different networks is incoherent and would not show up in
+  any log. It is also how a promotion by a trainer running alongside gets picked up.
+- **The search is deadline-bound, not count-bound.** `kSimulations` is 20000 and `kTurnBudget` is 4 s
+  against the server's 5 s. The trainer may be holding the GPU, and a turn that arrives late is a
+  forfeit while a turn that only managed 300 simulations is merely a weaker move.
 - **Every callback is wrapped in `guarded()`.** A C++ exception unwinding through the SDK's C frames
   is undefined behaviour. An unanswered turn times out and loses one game; a crash loses every game
   that would have followed.
-- **Never run against the live server.** The credential check and both fallbacks are exercised;
-  actual match play is not.
-
-## Trainer
-
-`amoeba_bot_1/train.cpp`. One generation is three steps: self-play with the champion into a replay
-buffer, gradient steps on batches from that buffer, then a match against the champion. Everything is
-tunable by env var (`AMOEBA_SELFPLAY_GAMES`, `AMOEBA_TRAIN_STEPS`, `AMOEBA_GATE_GAMES`, …).
-
-- **The gate is the point of the file.** Training does not improve monotonically, so "newest model"
-  and "strongest model" are different things, and AlphaZero bugs produce clean loss curves. A
-  generation is promoted only if it scores ≥ 55% over 100 games against the incumbent. `play.cpp`
-  reads only `best`; pointing it at the newest file instead would make its rating a random walk over
-  checkpoint noise.
-- **Gate games must not be deterministic.** Both sides play the argmax, so without the sampled
-  opening the whole match is one game replayed 100 times and the score is 0% or 100%. Colours
-  alternate, because White moving first is worth something.
-- **The learner is carried across generations**, and is *not* reset to the champion after a failed
-  gate — that would throw away a generation of training and make a two-generation plateau
-  impossible to cross. Self-play uses the champion (the AlphaGo Zero arrangement), the learner is
-  what gets gated.
-- **`Sample` holds a `Board`, not its encoding.** Six times smaller in the buffer, and the 12×
-  symmetry augmentation has to permute hexes and directions, which it cannot do to a flat array of
-  floats. Its `policy` is in absolute move ids; flipping it into the mover's frame is the trainer's
-  job, next to the `encode()` it has to agree with — one place, so the two flips cannot drift apart.
-- **The replay buffer is a ring over the last 500k positions**, persisted to `replay.bin` beside the
-  checkpoints so a crash does not cost a day of self-play. Written staging-then-rename, like the
-  `best` link.
-- **Self-play is one game at a time.** The first thing to fix once the network exists: `Evaluator`
-  already takes a span of boards, so the shape to move to is many concurrent games collecting leaves
-  into one batched forward pass.
+- **Never run against the live server.** The credential check, the checkpoint lookup and both
+  fallbacks are exercised; actual match play is not.
 
 ## Code conventions
 
 - **Never `using namespace`** — not in headers, not in `.cpp` files, not inside `main`. Qualify
-  everything (`amoeba::Board`). No `namespace game = amoeba;` aliases either. `games/amoeba/test/*`
-  predates this rule and still has `using namespace amoeba;`.
-- **One short namespace per target**, named after it: `amoeba_bot_1/` is `namespace bot`. Everything
-  in the target goes in it, including a file's internal helpers (anonymous namespace nested inside);
-  `main` stays at global scope and just calls in. No per-feature namespace (`mcts`) beside it.
+  everything (`amoeba::Board`). No `namespace game = amoeba;` aliases either.
+- **Two namespaces, and only two.** `amoeba` is the rules engine and the encoder; `bot` is the search,
+  the network and the two programs. Everything in `bot` goes in it, including a file's internal
+  helpers (anonymous namespace nested inside); `main` stays at global scope and just calls in. No
+  per-feature namespace (`mcts`, `training`) beside them.
 - **Private members are `m_`-prefixed**, not underscore-suffixed: `m_nodes`, not `nodes_`.
-- **No new targets or modules without asking.** The search lives inside `amoeba_bot_1`, not in a
-  `search/` library. Only `games/amoeba` earns its own module, because keeping it MLX-free is a real
-  constraint.
+- **No new targets, directories or modules without asking.** Everything is one flat `amoeba/`
+  directory building two executables. New code goes in an existing file unless asked otherwise.
 - Comments explain *why*, never *what*. Newest standard-library facility that fits — `std::print`,
   ranges, `std::span`. No `--flag` parsing in tools; env vars are enough.
 - **No README.** This file is the documentation.
 
-## Network — not written yet
+## Network
+
+`amoeba/network.hpp` / `network.cpp`. `Network` holds the parameters, `forward()` is the
+prediction, `NetworkEvaluator` is the `bot::Evaluator` the search talks to. No training yet.
+
+- **Parameters are one flat `std::vector<mlx::core::array>`**, because that is what
+  `mlx::core::value_and_grad` consumes and the shape it returns gradients in. `Network::layout()` is
+  the single definition of which tensors exist and in what order; `forward()` walks that order
+  positionally, so each tensor needs its own named local — the order in which C++ evaluates two
+  cursor reads inside one expression is unspecified.
+- **6 blocks at width 128 with 8 heads is 1,219,965 parameters.** Reproducible from the seed alone;
+  checkpoints round-trip exactly through safetensors, with the shape in the metadata so a checkpoint
+  from a different architecture is rejected at load rather than at the first matmul.
+- **`forward()` returns raw logits.** Masking is the caller's job, because inference wants
+  probabilities over legal moves and training wants the logits.
+- **`NetworkEvaluator` must hand back probabilities, not logits.** The search sums the priors of the
+  legal moves and divides (`mcts.cpp:78-79`), so raw logits would give it negative priors.
+- **Mask with a large finite penalty, not −∞.** A terminal position has no legal moves, `addNode`
+  evaluates it anyway, and softmax over an all-−∞ row is NaN, which would spread into every parameter
+  that touched it. −1e9 leaves a harmless uniform row that nothing reads.
+
+### Measured latency, and what it means for the search
+
+One position, 6 blocks at width 128, `-O2`:
+
+| batch | GPU | CPU |
+|---|---|---|
+| 1 | 1.70 ms | **0.95 ms** |
+| 8 | 0.25 ms/pos | 0.47 ms/pos |
+| 64 | **0.16 ms/pos** | 0.44 ms/pos |
+| 256 | 0.15 ms/pos | 0.45 ms/pos |
+
+At 1.2M parameters over 37 tokens this is dispatch-bound, not compute-bound, so **CPU beats Metal at
+batch 1** and Metal wins from batch 8 up. The search asks one position at a time, so 2000 simulations
+would cost 3.4 s on GPU against a 5 s turn limit — the fixed simulation count in `bot.cpp` is no
+longer safe. Leaf batching with virtual loss is worth ~10× per position and is now the thing standing
+between the network and a usable bot.
 
 - **Attention over the 37 hex tokens, not convolution.** Amoeba's interactions are long-range by
   construction: a stack jumps over everything and lands at exactly its height. The neighbouring cell
   is nearly irrelevant; the cell 5 away on your line is what kills you. Conv nets need depth just to
   see distance 6. With 37 tokens, all-pairs attention is 1369 pairs — free.
-- **Relative-position bias.** Precompute a `constexpr bucket[37][37]`: 0 if the two hexes share no
-  line, else `1 + dir*6 + (dist-1)`. Learn one bias per bucket per head. That table *is* the attack
-  relation from §6.1 of the reference — hand it over instead of making the net discover it.
-- **Policy head:** 12 logits per token (6 directions × move/sow) → 444, which is already exactly
-  `Move::id`. Mask with `Board::legal` (set illegal logits to −∞ before softmax).
-- **Value head:** mean-pool → MLP → tanh. ~1-2M params total.
+- **Relative-position bias.** `kBucket[37][37]` in `network.hpp`: 0 if the two hexes share no line,
+  else `1 + dir * kMovableMax + (dist - 1)`. One learned bias per bucket per head, 37 buckets. That
+  table *is* the attack relation from §6.1 of the reference — handed over instead of discovered. The
+  stride for direction is the number of *distance* buckets; both are 6, which makes the mistake
+  invisible.
+- **Policy head:** 12 logits per token → `[batch, 37, 12]`, which reshapes straight onto `Move::id`
+  because the 12 run direction-major and splitting-minor.
+- **Value head:** mean-pool over the 37 tokens → MLP → tanh.
 
-## Training — what is left
+## Training
 
-The orchestration in `train.cpp` is done; the gradient step is not. What the network branch owes it
-is the eight symbols in `network.hpp`: `loadNetwork`, `newNetwork`, `~Network`, `Network::evaluate`,
-`Network::save`, `Trainer::Trainer`, `Trainer::~Trainer`, `Trainer::step`. That header is where the
-two branches are expected to meet and disagree exactly once.
+`amoeba/network.hpp` / `network.cpp` also carry `Batch`, `makeBatch()`, `loss()` and `Adam`. What is
+missing is self-play — there is no data, so no weight has ever been adjusted by anything but a test.
 
-- **Value sign.** Handled by `outcomeFor()`, and `train.cpp` signs every target with it. The value
-  means "good for the side to move", not "good for White". Getting this backwards trains a bot that
-  reliably plays badly while every loss curve looks healthy.
-- **`Trainer::step` owns both flips.** It gets `Sample`s holding a `Board` and an absolute-move-id
-  policy, and has to call `encode()` and permute the policy through `kFlippedMove` itself. Keeping
-  the encode and the policy flip in one function is what stops them drifting apart.
+- **`loss()` returns `{ total, policy, value }`.** `mlx::core::value_and_grad` differentiates the
+  first element and hands the rest back for free, so the components cost nothing and are worth
+  keeping: a value loss sitting flat while the policy loss falls means the value head is not learning,
+  and one averaged number would hide that.
+- **`makeBatch()` is where the policy target crosses into flipped space.** The search counts visits in
+  absolute `Move::id` and `forward()` answers in the space `encode()` used, so the target is permuted
+  with `policyToAbsolute` — the same table as inference, since it is its own inverse. Skip it and you
+  train on scrambled labels, and the loss still falls.
+- **`outcomes` reaches `makeBatch()` already signed** from the mover's point of view. Only self-play
+  knows the game result, so that is deliberately the caller's business and `makeBatch()` does not
+  second-guess it. See the value-sign note below.
+- **Pass `weightDecay = 0` when overfitting one batch on purpose**, or the penalty holds the loss off
+  zero and hides whether the gradients connect at all.
+- **A sample with no visits throws.** That is a terminal position in the training set, i.e. a
+  self-play bug, and dividing by zero visits would otherwise put NaN into every parameter.
+- **`Adam::step` takes the rate as an argument**, not from its config, because it is expected to fall
+  on a schedule. It returns new parameters rather than mutating: an `mlx::core::array` is a handle onto
+  a graph, not a buffer. The caller must `mlx::core::eval()` the result every step or the graph grows
+  until memory runs out; evaluating the parameters is enough, since they depend on both moment
+  estimates.
+- **Adam's moment estimates are not checkpointed.** Only `Network` persists. Between generations that
+  is fine — the optimiser restarts anyway — but interrupting a run mid-generation loses its momentum
+  and costs a few hundred wasted steps. Decide before the first long run, not after.
+
+Measured on 8 positions with a uniform target, untrained network:
+
+```
+policy loss 5.1620   value loss 1.7809   total 6.9429
+floor for a uniform target = mean log(legal moves) = 3.9174   -> above it, as it must be
+gradients: 87 tensors, 0 of them all-zero
+largest gradient magnitude 2.553e+00, smallest 1.521e-03   (1678x spread)
+```
+
+The floor is the check worth keeping: cross-entropy of *any* prediction against a uniform target over
+N legal moves cannot go below `log(N)`, so a policy loss under that means the mask or the
+normalisation is wrong. The 1678× gradient spread across tensors is exactly why plain
+`w -= rate * gradient` will not do and Adam divides by `sqrt(variance)`.
+
+### The overfit-one-batch check
+
+32 distinct positions with invented one-hot targets, 2 blocks at width 64, no weight decay,
+rate 1e-3:
+
+```
+  step       total      policy       value
+     1    5.774683    4.062842    1.711841
+   300    0.000365    0.000351    0.000014
+   600    0.000115    0.000110    0.000005
+```
+
+A 50,000× reduction, so the gradients reach every one of the 87 tensors and Adam moves them. Run this
+before trusting anything downstream; a broken gradient path plateaus instead of converging, and no
+later measurement would isolate it. Step time stayed flat at 5.6 ms across 600 steps, which is also
+the check that nothing is leaking graph.
+
+**Duplicate positions floor the loss, and that is correct.** The first attempt plateaued at exactly
+0.04332 no matter the learning rate. Two of the 32 samples were the same position — the harness
+restarted from the opening after a game ended — carrying contradictory one-hot targets. The best
+possible answer is 50/50, so each contributes `-log(0.5)`, and `2 x 0.693 / 32 = 0.04332` to four
+decimals. Nothing was wrong with the loss or the optimiser.
+
+This matters beyond the test: in real self-play the same position *will* recur with different visit
+distributions, and the network correctly learns their average. **So the training loss will never
+approach zero, and chasing that would be chasing a bug that does not exist.** The floor is the
+entropy of the search's own disagreement with itself.
+
+- **Value sign.** The value means "good for the side to move", not "good for White". Negate it for
+  every position where the mover lost. Getting this backwards trains a bot that reliably plays badly
+  while every loss curve looks healthy.
 - **Symmetry augmentation is 12×, not 24×.** The hex board's symmetry group is D6 — 6 rotations × a
   reflection — and the rules are direction-agnostic, so evaluation is invariant under all 12. Colour
   swap is *not* an extra factor: once positions are canonicalised to the mover's view, swapping
@@ -323,7 +510,7 @@ two branches are expected to meet and disagree exactly once.
 - **Thread the repetition history through search.** `apply` only detects repetition when given the
   hash history; without it MCTS walks into draws it cannot see.
 - **MLX is lazy** — nothing computes until `mx::eval()`. Easy to build a huge graph by accident, and
-  it makes naive timing meaningless. Homebrew has `mlx` 0.31.2 (`/opt/homebrew/include/mlx`) plus the
+  it makes naive timing meaningless. Homebrew has `mlx` 0.32.0 (`/opt/homebrew/include/mlx`) plus the
   Python bindings.
 - The MLX C++ API has no real optimizer or layer library, so Adam and the attention blocks are
   hand-written. If that becomes a time sink, training in Python + MLX while keeping engine, encoder
@@ -331,18 +518,22 @@ two branches are expected to meet and disagree exactly once.
 
 ## Next steps
 
-1. **Run `amoeba_random_test` against the server**, and play in a practice room. Neither has ever
-   touched the live server, and everything downstream assumes they would pass. Worth doing before
-   the model lands: if the engine and the server disagree about the rules, a bad rating later cannot
-   be told apart from a bad network, and `syncToServer`'s resync fallback hides it.
-2. **Network** in MLX, filling in `network.hpp`. Nothing else has to change.
-3. **Concurrent self-play with batched leaf evaluation.** One game at a time wastes the device.
-4. **Tree reuse between moves**, worth 20-40% more effective simulations.
+1. **Play a practice game against the live server.** Nothing here has ever touched it, and the parity
+   harness that would have caught a rules disagreement is gone. If the engine and the server disagree,
+   `syncToServer()` silently resyncs and a bad rating cannot be told apart from a bad network. Do this
+   before spending days of compute.
+2. **Run the loop at a scale where the gate means something** — hundreds of gate games, not 40.
+   Everything it needs exists; what is missing is compute and patience.
+3. **Persist the replay buffer.** A restart currently throws away every game played and regenerates
+   them, which is by far the most expensive thing the trainer does.
+4. **Batch leaves across concurrent games**, not just within one. That is the real throughput win.
+5. **Checkpoint Adam's moment estimates** so a generation can resume part way.
 
-Run the whole pipeline end to end at a deliberately tiny scale first — 2 attention blocks, 50 sims,
-20 games a generation. "It runs and the loss goes down" proves almost nothing; AlphaZero bugs
-produce clean training curves. **The real first milestone is generation 1 beating generation 0** —
-that is what the gate in `train.cpp` reports, and it is the only honest signal.
+Run the whole pipeline end to end at a deliberately tiny scale first — that has been done once, at
+1 block / width 32 / 4 games, and the loop promoted a generation. "It runs and the loss goes down"
+proves almost nothing; AlphaZero bugs produce clean training curves. **The real milestone is a
+generation beating the one before it over a few hundred gate games**, which is the only honest signal
+in the whole system.
 
 ## Game Arena SDK
 
@@ -364,41 +555,32 @@ Game Arena ships a **C SDK, `arena` 0.6**, installed at `~/.local` (`include/are
 
 ## Build
 
-CMake + Ninja, multi-config, build tree in `build.nosync/`.
+CMake + Ninja, build tree in `build.nosync/`.
 
 ```
-cmake -S . -B build.nosync
+cmake -S . -B build.nosync -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build.nosync
 ```
 
-`amoeba_bot_1_core` (search + checkpoints) is shared; `play.cpp` and `train.cpp` each build one
-executable on top of it. Only the player links the arena SDK. **Both fail to link** until
-`network.cpp` arrives — the eight undefined symbols are the whole of the model branch's contract.
+`find_package(MLX 0.32 CONFIG REQUIRED)` has to sit *after* `project()`: MLX imports itself as a
+shared library, and before `project()` CMake has not yet established that the platform can link
+one. The `arena` call above it predates that and only works because its import is static.
+
+Both programs take an optional `.safetensors` path and otherwise use the first one in the working
+directory. Run them side by side in the same directory and the bot picks up each promotion at its
+next game.
 
 ```
+# train forever, starting from random weights if the file does not exist
+./build.nosync/amoeba_train                       # ./amoeba.safetensors
+./build.nosync/amoeba_train run7.safetensors
+
 # ranked games back to back, for as long as the process lives
-BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot_1/Release/amoeba_bot_1
+BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot
 
 # one practice game
-ROOM_ID=… BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot_1/Release/amoeba_bot_1
-
-# self-play and training, forever; no credentials, never touches the network
-./build.nosync/amoeba_bot_1/Release/amoeba_bot_1_train
+ROOM_ID=… BOT1_ID=… BOT1_KEY=… ARENA_DOMAIN=staging-game-arena.irvine.jp ./build.nosync/amoeba_bot
 ```
 
-Both read `AMOEBA_CHECKPOINTS` (default `./checkpoints`). Run them side by side and the player picks
-up each promoted generation at its next game start. The trainer writes `gen-NNNN.safetensors` per
-generation plus `replay.bin`, and moves the `best` symlink only when a generation passes the gate.
-
-Everything else the trainer takes is an env var with a default: `AMOEBA_SELFPLAY_GAMES` (200),
-`AMOEBA_SELFPLAY_SIMULATIONS` (400), `AMOEBA_TRAIN_STEPS` (1000), `AMOEBA_BATCH` (512),
-`AMOEBA_GATE_GAMES` (100), `AMOEBA_GATE_SIMULATIONS` (400), `AMOEBA_GATE_THRESHOLD` (0.55),
-`AMOEBA_OPENING_PLIES` (15), `AMOEBA_BUFFER` (500000), `AMOEBA_SEED`.
-
-Two test binaries, neither using a test framework:
-
-- `amoeba_encode_test` — offline. Plays random games and checks `encode()` on every position.
-  Just run it: `./build.nosync/games/amoeba/test/Debug/amoeba_encode_test`
-- `amoeba_random_test` — needs a live server. Plays random legal moves against Game Arena and
-  compares the legal-move set every ply.
-  `ARENA_DOMAIN=staging-game-arena.irvine.jp BOT1_ID=… BOT1_KEY=… ROOM_ID=… ./build.nosync/games/amoeba/test/Debug/amoeba_random_test`
+There are **no tests**. `amoeba_encode_test` and `amoeba_random_test` both existed and were both
+deleted on request; git has them at `29dcd5e` if they are ever wanted back.

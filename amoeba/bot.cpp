@@ -1,7 +1,14 @@
-// amoeba_bot_1: plays Amoeba on Game Arena, and does nothing else. Training
-// lives in amoeba_bot_1_train; the two programs only ever meet in the checkpoint
-// directory, so either one can be killed and restarted without the other
-// noticing.
+// amoeba_bot: plays Amoeba on Game Arena with a trained network, and does
+// nothing else. Training lives in amoeba_train; the two programs only ever meet
+// in a .safetensors file, so either can be killed and restarted without the
+// other noticing.
+//
+//   amoeba_bot [weights.safetensors]
+//
+// With no argument it takes the first .safetensors file in the working
+// directory - the same one amoeba_train writes to. Credentials come from
+// BOT1_ID and BOT1_KEY; ROOM_ID picks a practice room, and without it the bot
+// queues for ranked games back to back.
 //
 // The SDK side is the same shape as the random bot in the reference: fill
 // arena_move_t with the strings the server sent, and copy the piece's splitting
@@ -12,7 +19,6 @@
 // what keeps ply, staleness and the repetition history right, and the search
 // needs all three to see draws and adjudications coming.
 
-#include "checkpoints.hpp"
 #include "mcts.hpp"
 #include "network.hpp"
 
@@ -42,7 +48,12 @@ namespace
 // is what actually ends the search: the trainer may be running on the same
 // machine and holding the GPU, and a turn that arrives late is a forfeit, while
 // a turn that ran only 300 simulations is merely a weaker move.
+//
+// Leaves are batched 16 at a time because the network costs 1.70 ms for a single
+// position and 0.16 ms each for 64 - one position per forward pass would spend
+// the whole turn on overhead.
 constexpr int                       kSimulations = 20000;
+constexpr int                       kLeaves      = 16;
 constexpr std::chrono::milliseconds kTurnBudget{4000};
 
 // A C++ exception unwinding through the SDK's C frames is undefined behaviour,
@@ -73,16 +84,19 @@ struct ServerMove
     bool         splitting;   // the server's own per-piece flag, echoed verbatim
 };
 
-// The model is loaded once per game and held for the whole of it. Swapping it
+// The model is loaded once per game and held for the whole of it. Reloading it
 // mid-game would mean one tree scoring its positions with two different
-// networks, which is incoherent and would not show up in any log.
+// networks, which is incoherent and would not show up in any log; between games
+// is the only safe moment, and it is how a promotion by a trainer running
+// alongside gets picked up.
 struct Context
 {
-    Checkpoints                    checkpoints = Checkpoints::fromEnvironment();
-    std::unique_ptr<Network>       network;
-    std::optional<Search>          search;
-    amoeba::Board                  board;
-    std::vector<uint64_t>          history;
+    std::filesystem::path             weights;
+    std::unique_ptr<Network>          network;
+    std::unique_ptr<NetworkEvaluator> evaluator;
+    std::optional<Search>             search;
+    amoeba::Board                     board;
+    std::vector<uint64_t>             history;
 };
 
 // ---------------------------------------------------------------------------
@@ -224,25 +238,25 @@ const ServerMove& chooseMove(Context& context, const std::vector<ServerMove>& mo
     return *found;
 }
 
-// Between games, and only between games: whatever the trainer has promoted
-// since the last one.
-void loadBestNetwork(Context& context)
+void loadNetwork(Context& context)
 {
-    const std::optional<std::filesystem::path> best = context.checkpoints.best();
-    if (!best.has_value())
-        throw std::runtime_error("no promoted model in the checkpoint directory - run amoeba_bot_1_train first");
+    context.network = std::make_unique<Network>(context.weights);
+    context.evaluator = std::make_unique<NetworkEvaluator>(*context.network);
+    context.search.emplace(*context.evaluator, Config{.simulations = kSimulations,
+                                                           .deadline    = kTurnBudget,
+                                                           .batchSize   = kLeaves});
 
-    context.network = loadNetwork(*best);
-    context.search.emplace(*context.network,
-                           Config{.simulations = kSimulations, .deadline = kTurnBudget});
-    std::println("[bot] playing with {}", best->filename().string());
+    std::println("[bot] {}: {} blocks, width {}, {} heads, {} parameters",
+                 context.weights.filename().string(), context.network->shape().blocks,
+                 context.network->shape().width, context.network->shape().heads,
+                 context.network->parameterCount());
 }
 
 void onGameStart(const arena_game_state_t* state, void* userData)
 {
     guarded("on_game_start", [&] {
         Context& context = *static_cast<Context*>(userData);
-        loadBestNetwork(context);
+        loadNetwork(context);
 
         context.board = amoeba::fromString(state->board, state->current_turn == ARENA_SIDE_WHITE);
         context.history.assign(1, context.board.hash);
@@ -297,11 +311,27 @@ void onDisconnect(const char* reason, void*)
     std::println(stderr, "[bot] disconnected: {}", reason == nullptr ? "unknown reason" : reason);
 }
 
+// The trainer writes one file and keeps writing to it, so with no argument
+// there is normally exactly one candidate in the directory.
+std::filesystem::path firstCheckpointHere()
+{
+    std::vector<std::filesystem::path> found;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator("."))
+        if (entry.path().extension() == ".safetensors")
+            found.push_back(entry.path());
+
+    if (found.empty())
+        throw std::runtime_error("no .safetensors file here - name one, or run amoeba_train first");
+
+    std::ranges::sort(found);
+    return found.front();
+}
+
 } // namespace
 
 } // namespace bot
 
-int main()
+int main(int argc, char** argv)
 {
     const char* botId  = std::getenv("BOT1_ID");
     const char* apiKey = std::getenv("BOT1_KEY");
@@ -312,9 +342,14 @@ int main()
     }
 
     bot::Context context;
-    if (!context.checkpoints.best().has_value())
+    try
     {
-        std::println(stderr, "no promoted model yet - run amoeba_bot_1_train until it promotes a generation");
+        context.weights = argc > 1 ? std::filesystem::path{argv[1]} : bot::firstCheckpointHere();
+        bot::loadNetwork(context);
+    }
+    catch (const std::exception& error)
+    {
+        std::println(stderr, "[bot] {}", error.what());
         return EXIT_FAILURE;
     }
 
@@ -330,9 +365,8 @@ int main()
         .user_data = &context,
     };
 
-    // A practice room when one is named, otherwise ranked games back to back
-    // for as long as the process lives. arena_start_continuous only returns on
-    // error, so reaching the println below always means something went wrong.
+    // A practice room when one is named, otherwise ranked games back to back for
+    // as long as the process lives. arena_start_continuous only returns on error.
     if (const char* roomId = std::getenv("ROOM_ID"))
         return arena_start_practice(&config, roomId);
 

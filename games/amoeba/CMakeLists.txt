@@ -1,5 +1,0 @@
-add_library(amoeba STATIC src/amoeba.cpp src/encode.cpp)
-add_library(games::amoeba ALIAS amoeba)
-target_compile_features(amoeba PUBLIC cxx_std_23)
-target_include_directories(amoeba PUBLIC include)
-add_subdirectory(test)
