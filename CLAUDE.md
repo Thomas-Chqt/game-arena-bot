@@ -244,44 +244,68 @@ network, 64 leaves vs random  : 100.0% +/- 0.0%   (20-0-0)
 network, 64 leaves vs rollout :  40.0% +/- 11.0%  (6-10-4)
 ```
 
+Over **200** games, network at 64 leaves against rollout scores **44.0% ± 3.5%** (64-88-48). That is
+1.7 standard errors below parity — suggestive that the network is slightly weaker than its teacher, not
+conclusive. Whether leaf batching is responsible needs the same match at 1 leaf, which is 15× slower
+to run.
+
 **Before refactoring `run()` for batching, fingerprint its visit counts.** At `batchSize = 1` the
 batched code reproduces the pre-refactor fingerprints bit for bit — virtual loss adds and removes
 exactly 1.0 at magnitudes float32 represents exactly — which pins the restructure independently of
 whether batching helps. Do this again before touching the descent; the search has no other offline
 test, and ±11% over 20 games cannot resolve a small regression.
 
-## Training driver
+## main.cpp — the proof of concept
 
-`amoeba_bot_1/main.cpp`. **This replaced the arena client**, which is intact in git at `ba8cceb` and
-will need somewhere to live again. `CMakeLists.txt` still links `arena::arena` even though nothing
-uses it now.
+**This replaced the arena client**, which is intact in git at `ba8cceb` and needs somewhere to live
+again; `CMakeLists.txt` still links `arena::arena` for nothing. It is a working skeleton meant as a
+base for the real entry point, not the finished program — everything it calls is tested, and what is
+new is only the wiring.
 
-It trains the network to **imitate rollout MCTS** — not self-play. The teacher is `RolloutEvaluator`,
-which never changes, so games are generated once and the only moving part is the network. That
-ordering is deliberate: in a bootstrapping loop, a broken network, bad data and an unstable loop all
-look identical, whereas here there is exactly one thing that can be wrong.
+Three modes, `MODE=selfplay|train|match`:
 
-- **The policy target inherits the teacher's ceiling; the value target does not.** Move preferences
-  come from the teacher's visit counts, but the value target is who actually won the game, which is
-  ground truth however weak the teacher is.
-- **Generation is threaded, one game per slot.** `std::jthread` in an inner scope so the destructors
-  join before results are read, one `std::atomic<int>` handing out game indices so a thread finishing
-  a short game picks up another, and no mutex on the data because each game writes its own slot.
-  Measured **5.7×** on a 10-core M-series (6 of those are efficiency cores): 100 games at 200
-  simulations in 21 s, 940% CPU. 1000 games is ~3.6 minutes for ~85k positions.
-- **Seeded per game, not per thread**, which is what keeps a run reproducible from `SEED` regardless
-  of how the threads interleave, and keeps samples in game order.
-- **Held out by position after a shuffle**, and the held-out loss is reported beside the training loss.
-  Worth it: on a 703-position smoke run the training policy loss fell 3.76 → 2.76 while the held-out
-  loss got *worse* after step 100. Without that column it looked like learning.
-- **Progress output must be flushed.** `std::println` leaves stdout block-buffered when it is not a
-  terminal, so a redirected run showed an empty log for 100 s while the buffer filled. Everything goes
-  through `report()`, which flushes. The smoke test missed this because a short run flushes on exit.
-- **Games are not saved to disk**, so every hyperparameter experiment re-generates them. Worth fixing
-  before doing much tuning.
+- **`selfplay`** — the AlphaZero loop. Generation 0 is random weights. Each generation plays itself
+  with Dirichlet noise, pushes games into a replay buffer, trains a candidate *starting from the best
+  weights* rather than from scratch, and promotes it only if it beats the current best in a match.
+  **The gate is what makes it honest**: a training loss can fall while the player gets worse, so
+  nothing is promoted on a loss curve, only on games won.
+- **`train`** — imitation learning from `RolloutEvaluator`. A fixed teacher, so the network is the only
+  moving part. Worth keeping beside the loop: if self-play misbehaves, this isolates whether the
+  network or the loop is at fault.
+- **`match`** — `PLAYER` against `OPPONENT`, each `random`, `rollout` or `network`, colours alternating,
+  reporting a standard error. A checkpoint is only loaded if a side needs one.
 
-Env vars, all optional: `GAMES SIMULATIONS SAMPLING_PLIES SEED BLOCKS WIDTH HEADS STEPS BATCH RATE
-DECAY OUT`.
+Env vars: `SEED BLOCKS WIDTH HEADS SIMULATIONS LEAVES` common; `GAMES SAMPLING_PLIES NOISE` for
+generating; `STEPS BATCH RATE DECAY` for training; `GENERATIONS BUFFER GATE_GAMES GATE OUT_DIR` for
+self-play; `OUT` for train; `CHECKPOINT PLAYER OPPONENT` for match.
+
+### Things it gets right that are easy to get wrong
+
+- **Game ids stay unique across generations.** The replay buffer spans generations, and
+  `splitByGame()` holds out whole games — if ids restarted each generation it would hold out one
+  generation's game and train on a different game with the same id.
+- **Hold out whole games, never positions.** Positions within a game are near-copies carrying the same
+  outcome label, so a by-position split leaves a held-out position's own game in training and the value
+  head scores by recognising the game. The symptom is a held-out loss that *improves* as you generate
+  fewer games.
+- **Training keeps the best step's weights**, not the last. Held-out loss turns back up well before
+  training ends; at 300 games the value loss at step 600 is 43% worse than at step 100.
+- **Root noise is generation-only.** `makePlayer()` forces `rootNoise = 0` so a match always takes the
+  network's own opinion.
+- **Progress output is flushed.** `std::println` block-buffers when stdout is not a terminal, so a
+  redirected run showed an empty log for 100 s. Short runs hide this because exiting flushes.
+- **Concurrent MLX evaluation was tested** — 24 searches across 8 threads agreed with the
+  single-threaded result — so generation threads with `NetworkEvaluator`. That is evidence, not a
+  guarantee; if self-play misbehaves like a race, try one thread first.
+
+### Deliberate gaps for whoever builds the real thing
+
+- **Games are never written to disk**, so nothing can be re-trained without being re-generated.
+- **Adam's moment estimates are not checkpointed**, so a generation cannot be resumed part way.
+- **The gate needs hundreds of games.** At the default 20 its error bar is ±11%, which cannot separate
+  55% from a coin flip. The PoC prints this rather than pretending otherwise.
+- **Leaves are batched within one game.** Batching across many concurrent games is the real throughput
+  win and is a much larger change.
 
 ## Arena client — replaced, see above
 
@@ -469,15 +493,14 @@ entropy of the search's own disagreement with itself.
 2. **Loss, Adam and the overfit-one-batch test.** Nothing downstream is trustworthy until 32
    positions trained in isolation drive the loss to nearly zero — that is what proves the gradient
    path is connected. MLX has `value_and_grad`, so only the optimiser is hand-written.
-3. **Does the student beat the teacher?** Put the trained network in MCTS against rollout MCTS. Search
-   with a learned prior should beat search without one — rollout MCTS puts only 40 of 200 visits on its
-   best move, so most of its thinking goes into moves that do not matter. This is the honest test of
-   whether the architecture learns Amoeba, and it gates whether self-play is worth starting.
-4. **Leaf batching with virtual loss** in the search. The latency table above makes this a
-   correctness issue for the 5 s turn limit, not an optimisation.
-5. **Self-play → training loop.** Needs Dirichlet root noise and a real search deadline added first —
-   see Search above. Temperature sampling now exists in `main.cpp` rather than in the search.
-6. **Head-to-head harness**, generation 2 vs generation 1.
+3. **Run the self-play loop at a scale where the gate means something** — hundreds of gate games, not
+   20. Everything it needs exists; what is missing is compute and patience.
+4. **A real search deadline.** `SIMULATIONS` is a fixed count. Leaf batching brought a 200-simulation
+   network search to 21.5 ms, so the 5 s limit is comfortable now, but a deadline is what makes it safe
+   rather than merely likely.
+5. **Put the search's fingerprint test in the repo.** It was generated by hand in `/tmp` and thrown
+   away. `Search` has no other offline test, and it is the code where a silent error costs most.
+6. **Somewhere for the arena client to live again**, restored from `ba8cceb`.
 
 There is still **no entry point** for any of this: `amoeba_bot_1`'s `main` plays one arena match and
 needs credentials, so the forward-pass benchmark and the overfit test above were run from throwaway
