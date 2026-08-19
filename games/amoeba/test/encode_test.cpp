@@ -28,10 +28,6 @@ namespace {
 constexpr int kGames = 200;
 constexpr uint64_t kSeed = 20260819;
 
-constexpr const char* kOpening =
-    "-3,1:W;-3,3:W;-2,-1:B;-2,1:W;-2,3:W;-1,-1:B;-1,1:W;-1,2:WK;-1,3:W;0,-3:B;0,-1:B;0,1:W;0,3:W;"
-    "1,-3:B;1,-2:BK;1,-1:B;1,1:W;2,-3:B;2,-1:B;2,1:W;3,-3:B;3,-1:B";
-
 using Features = std::array<float, kEncodedSize>;
 
 std::string describe(int index)
@@ -165,7 +161,7 @@ int main()
 
     for (int game = 0; game < kGames; ++game)
     {
-        Board board = fromString(kOpening);
+        Board board = startPosition();
         std::vector<uint64_t> history{board.hash};
 
         while (board.state == State::Ongoing)

@@ -7,12 +7,10 @@
 namespace bot
 {
 
-Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const VisitCounts> visits,
-                std::span<const float> outcomes)
+Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const VisitCounts> visits, std::span<const float> outcomes)
 {
     if (boards.size() != visits.size() || boards.size() != outcomes.size())
-        throw std::runtime_error(std::format("makeBatch got {} boards, {} visit sets and {} outcomes",
-                                             boards.size(), visits.size(), outcomes.size()));
+        throw std::runtime_error(std::format("makeBatch got {} boards, {} visit sets and {} outcomes", boards.size(), visits.size(), outcomes.size()));
 
     const int batch = static_cast<int>(boards.size());
 
@@ -35,8 +33,7 @@ Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const Vi
         // The search counts moves in absolute ids and forward() answers in the
         // flipped space encode() used, so the target has to cross over. Same table
         // in both directions - it is its own inverse.
-        const std::span<const uint16_t, amoeba::kNumMoveIds> toAbsolute =
-            amoeba::policyToAbsolute(boards[i]->whiteToMove);
+        const std::span<const uint16_t, amoeba::kNumMoveIds> toAbsolute = amoeba::policyToAbsolute(boards[i]->whiteToMove);
         const size_t base = static_cast<size_t>(i) * amoeba::kNumMoveIds;
 
         for (int slot = 0; slot < amoeba::kNumMoveIds; ++slot)
@@ -55,8 +52,7 @@ Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const Vi
     };
 }
 
-std::vector<mlx::core::array> loss(const std::vector<mlx::core::array>& params, NetworkShape shape,
-                                   const Batch& batch, float weightDecay)
+std::vector<mlx::core::array> loss(const std::vector<mlx::core::array>& params, NetworkShape shape, const Batch& batch, float weightDecay)
 {
     const Prediction prediction = forward(params, shape, batch.input);
 
@@ -91,7 +87,8 @@ std::vector<mlx::core::array> loss(const std::vector<mlx::core::array>& params, 
     return {total, policyLoss, valueLoss};
 }
 
-Adam::Adam(const std::vector<mlx::core::array>& params, AdamConfig config) : m_config(config)
+Adam::Adam(const std::vector<mlx::core::array>& params, AdamConfig config)
+    : m_config(config)
 {
     for (const mlx::core::array& tensor : params) {
         m_mean.push_back(mlx::core::zeros(tensor.shape(), tensor.dtype()));
@@ -99,12 +96,10 @@ Adam::Adam(const std::vector<mlx::core::array>& params, AdamConfig config) : m_c
     }
 }
 
-std::vector<mlx::core::array> Adam::step(const std::vector<mlx::core::array>& params,
-                                         const std::vector<mlx::core::array>& gradients, float rate)
+std::vector<mlx::core::array> Adam::step(const std::vector<mlx::core::array>& params, const std::vector<mlx::core::array>& gradients, float rate)
 {
     if (params.size() != m_mean.size() || params.size() != gradients.size())
-        throw std::runtime_error(std::format("Adam was built for {} tensors but got {} parameters and {} gradients",
-                                             m_mean.size(), params.size(), gradients.size()));
+        throw std::runtime_error(std::format("Adam was built for {} tensors but got {} parameters and {} gradients", m_mean.size(), params.size(), gradients.size()));
     ++m_steps;
 
     // Both averages start at zero, so for the first few hundred steps they read

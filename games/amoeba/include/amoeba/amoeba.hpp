@@ -379,6 +379,11 @@ Board apply(const Board&, Move, std::span<const uint64_t> history = {});
 // ---------------------------------------------------------------------------
 
 Board fromString(const std::string&, bool whiteToMove = true);
+
+// The opening from section 3 of amoeba-reference.md, White to move. Self-play and
+// the encoder test both need it, and two copies of a 22-piece board string would
+// eventually disagree.
+Board startPosition();
 std::string toString(const Board&);
 
 } // namespace amoeba

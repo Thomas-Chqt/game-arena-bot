@@ -33,8 +33,7 @@ struct Batch
 // that sign wrong trains a bot that prefers losing while the loss curve stays
 // healthy, so it is deliberately the caller's business - only self-play knows the
 // result - and this function will not second-guess it.
-Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const VisitCounts> visits,
-                std::span<const float> outcomes);
+Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const VisitCounts> visits, std::span<const float> outcomes);
 
 // Returns { total, policy, value }. The total is the scalar to differentiate; the
 // two components come back alongside because they say different things - a value
@@ -49,8 +48,7 @@ Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const Vi
 // biases as well; separating those out is not worth it at this size. Pass 0 when
 // overfitting a single batch on purpose, since the penalty otherwise keeps the
 // loss off zero and hides whether the gradients actually connect.
-std::vector<mlx::core::array> loss(const std::vector<mlx::core::array>& params, NetworkShape shape,
-                                   const Batch& batch, float weightDecay);
+std::vector<mlx::core::array> loss(const std::vector<mlx::core::array>& params, NetworkShape shape, const Batch& batch, float weightDecay);
 
 // The decay rates are the conventional beta1 and beta2, named for what they do.
 // 0.9 averages roughly the last ten gradients, 0.999 the last thousand. epsilon

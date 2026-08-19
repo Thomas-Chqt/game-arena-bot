@@ -21,7 +21,7 @@ plain terms without assuming vocabulary; don't explain C++.
 ```
 games/amoeba/
   amoeba-reference.md           the rules, mirrored from the server engine
-  include/amoeba/amoeba.hpp     rules engine
+  include/amoeba/amoeba.hpp     rules engine, incl. startPosition()
   include/amoeba/encode.hpp     Board -> network input
   src/amoeba.cpp
   src/encode.cpp
@@ -31,7 +31,7 @@ amoeba_bot_1/
   mcts.hpp / mcts.cpp           PUCT search + rollout evaluator
   network.hpp / network.cpp     parameters, forward pass, NetworkEvaluator
   training.hpp / training.cpp   Batch, the loss and Adam; no self-play yet
-  main.cpp                      arena client
+  main.cpp                      imitation-training driver (was the arena client)
 ```
 
 ## Current state
@@ -197,7 +197,40 @@ colours, seed `20260819`. It scored **97.5%** (39-0-1) at 200 simulations and **
 property a broken tree does not have. It was deleted on request, so nothing offline checks the search
 any more.
 
-## Arena client
+## Training driver
+
+`amoeba_bot_1/main.cpp`. **This replaced the arena client**, which is intact in git at `ba8cceb` and
+will need somewhere to live again. `CMakeLists.txt` still links `arena::arena` even though nothing
+uses it now.
+
+It trains the network to **imitate rollout MCTS** — not self-play. The teacher is `RolloutEvaluator`,
+which never changes, so games are generated once and the only moving part is the network. That
+ordering is deliberate: in a bootstrapping loop, a broken network, bad data and an unstable loop all
+look identical, whereas here there is exactly one thing that can be wrong.
+
+- **The policy target inherits the teacher's ceiling; the value target does not.** Move preferences
+  come from the teacher's visit counts, but the value target is who actually won the game, which is
+  ground truth however weak the teacher is.
+- **Generation is threaded, one game per slot.** `std::jthread` in an inner scope so the destructors
+  join before results are read, one `std::atomic<int>` handing out game indices so a thread finishing
+  a short game picks up another, and no mutex on the data because each game writes its own slot.
+  Measured **5.7×** on a 10-core M-series (6 of those are efficiency cores): 100 games at 200
+  simulations in 21 s, 940% CPU. 1000 games is ~3.6 minutes for ~85k positions.
+- **Seeded per game, not per thread**, which is what keeps a run reproducible from `SEED` regardless
+  of how the threads interleave, and keeps samples in game order.
+- **Held out by position after a shuffle**, and the held-out loss is reported beside the training loss.
+  Worth it: on a 703-position smoke run the training policy loss fell 3.76 → 2.76 while the held-out
+  loss got *worse* after step 100. Without that column it looked like learning.
+- **Progress output must be flushed.** `std::println` leaves stdout block-buffered when it is not a
+  terminal, so a redirected run showed an empty log for 100 s while the buffer filled. Everything goes
+  through `report()`, which flushes. The smoke test missed this because a short run flushes on exit.
+- **Games are not saved to disk**, so every hyperparameter experiment re-generates them. Worth fixing
+  before doing much tuning.
+
+Env vars, all optional: `GAMES SIMULATIONS SAMPLING_PLIES SEED BLOCKS WIDTH HEADS STEPS BATCH RATE
+DECAY OUT`.
+
+## Arena client — replaced, see above
 
 `amoeba_bot_1/main.cpp`. Four callbacks, same shape as the reference's random bot.
 
@@ -383,11 +416,15 @@ entropy of the search's own disagreement with itself.
 2. **Loss, Adam and the overfit-one-batch test.** Nothing downstream is trustworthy until 32
    positions trained in isolation drive the loss to nearly zero — that is what proves the gradient
    path is connected. MLX has `value_and_grad`, so only the optimiser is hand-written.
-3. **Leaf batching with virtual loss** in the search. The latency table above makes this a
+3. **Does the student beat the teacher?** Put the trained network in MCTS against rollout MCTS. Search
+   with a learned prior should beat search without one — rollout MCTS puts only 40 of 200 visits on its
+   best move, so most of its thinking goes into moves that do not matter. This is the honest test of
+   whether the architecture learns Amoeba, and it gates whether self-play is worth starting.
+4. **Leaf batching with virtual loss** in the search. The latency table above makes this a
    correctness issue for the 5 s turn limit, not an optimisation.
-4. **Self-play → training loop.** Needs Dirichlet root noise, temperature sampling and a real search
-   deadline added first — see Search above for why none of them exist yet.
-5. **Head-to-head harness**, generation 2 vs generation 1.
+5. **Self-play → training loop.** Needs Dirichlet root noise and a real search deadline added first —
+   see Search above. Temperature sampling now exists in `main.cpp` rather than in the search.
+6. **Head-to-head harness**, generation 2 vs generation 1.
 
 There is still **no entry point** for any of this: `amoeba_bot_1`'s `main` plays one arena match and
 needs credentials, so the forward-pass benchmark and the overfit test above were run from throwaway

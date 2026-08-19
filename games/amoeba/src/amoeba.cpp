@@ -315,6 +315,12 @@ Board apply(const Board& b, Move m, std::span<const uint64_t> history)
 
 // ---------------------------------------------------------------------------
 
+Board startPosition()
+{
+    return fromString("-3,1:W;-3,3:W;-2,-1:B;-2,1:W;-2,3:W;-1,-1:B;-1,1:W;-1,2:WK;-1,3:W;0,-3:B;0,-1:B;0,1:W;"
+                      "0,3:W;1,-3:B;1,-2:BK;1,-1:B;1,1:W;2,-3:B;2,-1:B;2,1:W;3,-3:B;3,-1:B");
+}
+
 Board fromString(const std::string& s, bool whiteToMove)
 {
     Board b{};
