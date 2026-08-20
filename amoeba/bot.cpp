@@ -61,7 +61,7 @@ namespace
 // position and 0.16 ms each for 64 - one position per forward pass would spend
 // the whole turn on overhead. Self-play fills its batch from the other games in
 // flight and needs none of this; a match has one game and no such option.
-constexpr int kSimulations = 800;
+constexpr int kSimulations = 1000;
 constexpr int kLeaves      = 16;
 
 // A C++ exception unwinding through the SDK's C frames is undefined behaviour,
