@@ -1,6 +1,9 @@
-#pragma once
+#ifndef AMOEBA_HPP
+#define AMOEBA_HPP
 
 #include <array>
+#include <cassert>
+#include <compare>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -13,14 +16,14 @@ namespace amoeba
 // Valid iff |q| <= 3, |r| <= 3, |q + r| <= 3.
 // ---------------------------------------------------------------------------
 
-inline constexpr int kRadius     = 3;
-inline constexpr int kNumHexes   = 37;
-inline constexpr int kNumDirs    = 6;
-inline constexpr int kMaxHeight  = 22;                        // total pieces on the board
-inline constexpr int kPiecesPerSide = 11;                     // 10 standard + 1 kernel, each side
-inline constexpr int kMovableMax = 6;                         // stacks taller than this can never move
-inline constexpr int kNumMoveIds = kNumHexes * kNumDirs * 2;  // 444, policy size
-inline constexpr int kMaskWords  = (kNumMoveIds + 63) / 64;   // 7, one bit per move id
+inline constexpr int boardRadius = 3;
+inline constexpr int hexCount = 37;
+inline constexpr int directionCount = 6;
+inline constexpr int maximumStackHeight = 22;
+inline constexpr int piecesPerPlayer = 11;
+inline constexpr int maximumMovableStackHeight = 6;
+inline constexpr int moveIdCount = hexCount * directionCount * 2;
+inline constexpr int legalMoveWordCount = (moveIdCount + 63) / 64;
 
 struct Coordinate
 {
@@ -36,66 +39,84 @@ struct Direction
     constexpr auto operator<=>(const Direction&) const = default;
 };
 
-// Ordered so that opposite(d) == (d + 3) % 6, and so the 180-degree perspective flip is just that same mapping.
-inline constexpr auto kDirections = [] -> std::array<Direction, kNumDirs> {
+// Opposite directions are three positions apart. The same mapping is used when
+// rotating a position into Black's perspective.
+inline constexpr auto directions = [] -> std::array<Direction, directionCount>
+{
     return {{
-        { 1,  0},   // 0 east
-        { 1, -1},   // 1 northeast
-        { 0, -1},   // 2 northwest
-        {-1,  0},   // 3 west
-        {-1,  1},   // 4 southwest
-        { 0,  1},   // 5 southeast
+        {1, 0},  // 0 east
+        {1, -1}, // 1 northeast
+        {0, -1}, // 2 northwest
+        {-1, 0}, // 3 west
+        {-1, 1}, // 4 southwest
+        {0, 1},  // 5 southeast
     }};
 }();
 
-constexpr uint8_t opposite(uint8_t dir) { return static_cast<uint8_t>((dir + 3) % 6); }
+constexpr uint8_t oppositeDirection(uint8_t direction)
+{
+    assert(direction < directionCount);
+    return static_cast<uint8_t>((direction + directionCount / 2) % directionCount);
+}
 
-inline constexpr auto kCoordinates = [] -> std::array<Coordinate, kNumHexes> {
-    std::array<Coordinate, kNumHexes> coords{};
-    int n = 0;
-    for (int q = -kRadius; q <= kRadius; ++q)
-        for (int r = -kRadius; r <= kRadius; ++r)
-            if (q + r >= -kRadius && q + r <= kRadius)
-                coords[n++] = Coordinate{static_cast<int8_t>(q), static_cast<int8_t>(r)};
-    return coords;
+inline constexpr auto coordinates = [] -> std::array<Coordinate, hexCount>
+{
+    std::array<Coordinate, hexCount> result{};
+    int index = 0;
+    for (int q = -boardRadius; q <= boardRadius; ++q)
+    {
+        for (int r = -boardRadius; r <= boardRadius; ++r)
+        {
+            if (q + r >= -boardRadius && q + r <= boardRadius)
+                result[index++] = Coordinate{static_cast<int8_t>(q), static_cast<int8_t>(r)};
+        }
+    }
+    return result;
 }();
 
 // Reverse lookup: (q + 3) * 7 + (r + 3) -> hex index, or -1 if off board.
-inline constexpr auto kIndexOf = [] -> std::array<int8_t, 49> {
+inline constexpr auto coordinateIndices = [] -> std::array<int8_t, 49>
+{
     std::array<int8_t, 49> table{};
-    for (auto& e : table)
-        e = -1;
-    for (int i = 0; i < kNumHexes; ++i)
+    for (int8_t& index : table)
+        index = -1;
+
+    for (int hex = 0; hex < hexCount; ++hex)
     {
-        const auto c = kCoordinates[i];
-        table[(c.q + kRadius) * 7 + (c.r + kRadius)] = static_cast<int8_t>(i);
+        const Coordinate coordinate = coordinates[hex];
+        table[(coordinate.q + boardRadius) * 7 + (coordinate.r + boardRadius)] = static_cast<int8_t>(hex);
     }
     return table;
 }();
 
 constexpr int8_t hexIndex(int q, int r)
 {
-    if (q < -kRadius || q > kRadius || r < -kRadius || r > kRadius)
+    if (q < -boardRadius || q > boardRadius || r < -boardRadius || r > boardRadius)
         return -1;
-    return kIndexOf[(q + kRadius) * 7 + (r + kRadius)];
+    return coordinateIndices[(q + boardRadius) * 7 + (r + boardRadius)];
 }
 
-// Step one hex from `from` in direction `dir`. Returns -1 if that leaves the board.
-inline constexpr auto kNeighbour = [] -> std::array<std::array<int8_t, kNumDirs>, kNumHexes>
+// Step one hex from a source in a direction. A negative entry leaves the board.
+inline constexpr auto neighboringHexes = [] -> std::array<std::array<int8_t, directionCount>, hexCount>
 {
-    std::array<std::array<int8_t, kNumDirs>, kNumHexes> table{};
-    for (int i = 0; i < kNumHexes; ++i)
-        for (int d = 0; d < kNumDirs; ++d)
-            table[i][d] = hexIndex(kCoordinates[i].q + kDirections[d].q, kCoordinates[i].r + kDirections[d].r);
+    std::array<std::array<int8_t, directionCount>, hexCount> table{};
+    for (int hex = 0; hex < hexCount; ++hex)
+    {
+        for (int direction = 0; direction < directionCount; ++direction)
+        {
+            table[hex][direction] =
+                hexIndex(coordinates[hex].q + directions[direction].q, coordinates[hex].r + directions[direction].r);
+        }
+    }
     return table;
 }();
 
-// 180-degree rotation: (q, r) -> (-q, -r). Used by the perspective flip in encode(). Directions flip with opposite().
-inline constexpr auto kFlipped = [] -> std::array<uint8_t, kNumHexes>
+// 180-degree rotation: (q, r) -> (-q, -r).
+inline constexpr auto rotatedHexes = [] -> std::array<uint8_t, hexCount>
 {
-    std::array<uint8_t, kNumHexes> table{};
-    for (int i = 0; i < kNumHexes; ++i)
-        table[i] = static_cast<uint8_t>(hexIndex(-kCoordinates[i].q, -kCoordinates[i].r));
+    std::array<uint8_t, hexCount> table{};
+    for (int hex = 0; hex < hexCount; ++hex)
+        table[hex] = static_cast<uint8_t>(hexIndex(-coordinates[hex].q, -coordinates[hex].r));
     return table;
 }();
 
@@ -107,18 +128,21 @@ inline constexpr auto kFlipped = [] -> std::array<uint8_t, kNumHexes>
 // a slot is empty iff its depth >= height.
 enum class Piece : uint8_t
 {
-    Empty = 0,
-    WN    = 1,   // white normal
-    WK    = 2,   // white kernel
-    BN    = 3,   // black normal
-    BK    = 4,   // black kernel
+    empty = 0,
+    white = 1,
+    whiteKernel = 2,
+    black = 3,
+    blackKernel = 4,
 };
 
-constexpr bool isWhite(Piece p)  { return p == Piece::WN || p == Piece::WK; }
-constexpr bool isKernel(Piece p) { return p == Piece::WK || p == Piece::BK; }
+constexpr bool isWhitePiece(Piece piece)
+{
+    return piece == Piece::white || piece == Piece::whiteKernel;
+}
 
-// Colour/kernel swap, for the perspective flip. Index by uint8_t(Piece).
-inline constexpr std::array<Piece, 5> kSwapColour = { Piece::Empty, Piece::BN, Piece::BK, Piece::WN, Piece::WK };
+// Indexed by Piece's underlying value.
+inline constexpr std::array<Piece, 5> swappedPieceColors = {Piece::empty, Piece::black, Piece::blackKernel,
+                                                            Piece::white, Piece::whiteKernel};
 
 // ---------------------------------------------------------------------------
 // Hex: a stack packed into a single 64-bit word.
@@ -133,60 +157,55 @@ inline constexpr std::array<Piece, 5> kSwapColour = { Piece::Empty, Piece::BN, P
 class Hex
 {
 public:
-    static constexpr int kHeightShift = 44;
-    static constexpr uint64_t kHeightMask = 0x1FULL << kHeightShift;
+    static constexpr int heightShift = 44;
+    static constexpr uint64_t heightMask = 0x1FULL << heightShift;
 
     constexpr Hex() = default;
 
-    constexpr uint8_t height() const
-    {
-        return static_cast<uint8_t>((bits_ >> kHeightShift) & 0x1F);
-    }
+    constexpr uint8_t height() const { return static_cast<uint8_t>((m_bits >> heightShift) & 0x1F); }
 
-    constexpr bool empty() const { return height() == 0; }
+    constexpr bool isEmpty() const { return height() == 0; }
 
-    // depth 0 is the bottom of the stack.
-    constexpr Piece at(uint8_t depth) const
+    // Depth zero is the bottom of the stack. Reading above the top returns empty,
+    // which lets the encoder pad short stacks without a separate branch.
+    constexpr Piece pieceAt(uint8_t depth) const
     {
-        if (depth >= height()) return Piece::Empty;
-        return static_cast<Piece>(((bits_ >> (depth * 2)) & 0x3) + 1);
+        if (depth >= height())
+            return Piece::empty;
+        return static_cast<Piece>(((m_bits >> (depth * 2)) & 0x3) + 1);
     }
 
     // The piece that controls the stack.
-    constexpr Piece top() const
+    constexpr Piece topPiece() const
     {
-        const uint8_t h = height();
-        return h == 0 ? Piece::Empty : at(static_cast<uint8_t>(h - 1));
+        const uint8_t stackHeight = height();
+        return stackHeight == 0 ? Piece::empty : pieceAt(static_cast<uint8_t>(stackHeight - 1));
     }
 
-    constexpr void push(Piece p)
+    constexpr void pushPiece(Piece piece)
     {
-        const uint8_t h = height();
-        const uint64_t v = static_cast<uint64_t>(p) - 1;
-        bits_ &= ~(0x3ULL << (h * 2));
-        bits_ |= v << (h * 2);
-        setHeight(static_cast<uint8_t>(h + 1));
+        assert(piece != Piece::empty);
+        assert(height() < maximumStackHeight);
+
+        const uint8_t stackHeight = height();
+        const uint64_t encodedPiece = static_cast<uint64_t>(piece) - 1;
+        m_bits &= ~(0x3ULL << (stackHeight * 2));
+        m_bits |= encodedPiece << (stackHeight * 2);
+        setHeight(static_cast<uint8_t>(stackHeight + 1));
     }
 
-    constexpr Piece pop()
-    {
-        const uint8_t h = height();
-        const Piece p = at(static_cast<uint8_t>(h - 1));
-        setHeight(static_cast<uint8_t>(h - 1));
-        return p;
-    }
-
-    constexpr void clear() { bits_ = 0; }
+    constexpr void clear() { m_bits = 0; }
 
     constexpr auto operator<=>(const Hex&) const = default;
 
 private:
-    constexpr void setHeight(uint8_t h)
+    constexpr void setHeight(uint8_t height)
     {
-        bits_ = (bits_ & ~kHeightMask) | (static_cast<uint64_t>(h) << kHeightShift);
+        assert(height <= maximumStackHeight);
+        m_bits = (m_bits & ~heightMask) | (static_cast<uint64_t>(height) << heightShift);
     }
 
-    uint64_t bits_{};
+    uint64_t m_bits{};
 };
 
 static_assert(sizeof(Hex) == 8);
@@ -196,24 +215,26 @@ static_assert(sizeof(Hex) == 8);
 //
 // The distance travelled is always the stack height, so it is not stored.
 // A move has a stable id in 0..443, which doubles as the policy head index:
-//     id = (from * 6 + dir) * 2 + splitting
+//     id = (sourceHex * 6 + direction) * 2 + splitsStack
 // ---------------------------------------------------------------------------
 
 struct Move
 {
-    uint8_t from{};       // hex index, 0..36
-    uint8_t dir{};        // direction index, 0..5
-    bool    splitting{};  // false = simple move, true = sow
+    uint8_t sourceHex{};
+    uint8_t direction{};
+    bool splitsStack{};
 
     constexpr uint16_t id() const
     {
-        return static_cast<uint16_t>((from * kNumDirs + dir) * 2 + (splitting ? 1 : 0));
+        assert(sourceHex < hexCount);
+        assert(direction < directionCount);
+        return static_cast<uint16_t>((sourceHex * directionCount + direction) * 2 + (splitsStack ? 1 : 0));
     }
 
     static constexpr Move fromId(uint16_t id)
     {
-        return Move{static_cast<uint8_t>(id / (kNumDirs * 2)),
-                    static_cast<uint8_t>((id / 2) % kNumDirs),
+        assert(id < moveIdCount);
+        return Move{static_cast<uint8_t>(id / (directionCount * 2)), static_cast<uint8_t>((id / 2) % directionCount),
                     (id & 1) != 0};
     }
 
@@ -226,79 +247,77 @@ struct Move
 
 enum class State : uint8_t
 {
-    Ongoing,
-    WhiteWins,
-    BlackWins,
-    Draw,
+    ongoing,
+    whiteWins,
+    blackWins,
+    draw,
 };
 
 struct Board
 {
-    Hex      hexes[kNumHexes]{};       // 296 bytes
-    uint64_t hash{};                   // Zobrist, maintained incrementally
+    Hex hexes[hexCount]{};
+    uint64_t positionHash{};
 
-    // One bit per move id, filled by apply(). Doubles as the policy mask:
+    // One bit per move id, filled by applyMove(). Doubles as the policy mask:
     // feed it straight to the network to set illegal logits to -infinity.
-    uint64_t legal[kMaskWords]{};      // 56 bytes
-    uint16_t moveCount{};
+    uint64_t legalMoveBits[legalMoveWordCount]{};
+    uint16_t legalMoveCount{};
 
-    uint8_t  whiteKernelHex{};         // cached; the kernel may be buried mid-stack
-    uint8_t  blackKernelHex{};
-    uint16_t ply{};                    // for the move cap
-    uint16_t staleness{};              // moves since the last landing capture
-    uint8_t  repeats{1};               // occurrences of this position; only apply() with a history fills it
-    bool     whiteToMove{true};
-    State    state{State::Ongoing};    // derived data - see note below
-
-    constexpr const Hex& hex(uint8_t i) const { return hexes[i]; }
-    constexpr Hex&       hex(uint8_t i)       { return hexes[i]; }
+    uint8_t whiteKernelIndex{};
+    uint8_t blackKernelIndex{};
+    uint16_t plyCount{};
+    uint16_t stalenessCount{};
+    uint8_t repetitionCount{1};
+    bool whiteToMove{true};
+    State state{State::ongoing};
 
     constexpr bool isLegal(uint16_t id) const
     {
-        return ((legal[id >> 6] >> (id & 63)) & 1ULL) != 0;
+        assert(id < moveIdCount);
+        return ((legalMoveBits[id >> 6] >> (id & 63)) & 1ULL) != 0;
     }
+
     constexpr void setLegal(uint16_t id)
     {
-        legal[id >> 6] |= 1ULL << (id & 63);
+        assert(id < moveIdCount);
+        legalMoveBits[id >> 6] |= 1ULL << (id & 63);
     }
+
     constexpr void clearLegal()
     {
-        for (auto& w : legal) w = 0;
-        moveCount = 0;
+        for (uint64_t& word : legalMoveBits)
+            word = 0;
+        legalMoveCount = 0;
     }
 
     // Visit every legal move id. fn is called as fn(uint16_t id).
     //     b.forEachLegal([&](uint16_t id) { Move m = Move::fromId(id); ... });
-    template <typename Fn>
-    constexpr void forEachLegal(Fn&& fn) const
+    template <typename Callback> constexpr void forEachLegal(Callback&& callback) const
     {
-        for (int w = 0; w < kMaskWords; ++w)
-            for (uint64_t bits = legal[w]; bits; bits &= bits - 1)
+        for (int word = 0; word < legalMoveWordCount; ++word)
+        {
+            for (uint64_t remaining = legalMoveBits[word]; remaining != 0; remaining &= remaining - 1)
             {
-                const int lsb = __builtin_ctzll(bits);
-                fn(static_cast<uint16_t>(w * 64 + lsb));
+                const int leastSignificantBit = __builtin_ctzll(remaining);
+                callback(static_cast<uint16_t>(word * 64 + leastSignificantBit));
             }
+        }
     }
 
-    constexpr uint8_t ownKernelHex() const
-    {
-        return whiteToMove ? whiteKernelHex : blackKernelHex;
-    }
-    constexpr uint8_t enemyKernelHex() const
-    {
-        return whiteToMove ? blackKernelHex : whiteKernelHex;
-    }
+    constexpr uint8_t ownKernelIndex() const { return whiteToMove ? whiteKernelIndex : blackKernelIndex; }
+    constexpr uint8_t opponentKernelIndex() const { return whiteToMove ? blackKernelIndex : whiteKernelIndex; }
 
     // True if the side to move controls this stack.
-    constexpr bool controls(uint8_t i) const
+    constexpr bool controls(uint8_t hexIndex) const
     {
-        const Piece t = hexes[i].top();
-        return t != Piece::Empty && isWhite(t) == whiteToMove;
+        assert(hexIndex < hexCount);
+        const Piece topPiece = hexes[hexIndex].topPiece();
+        return topPiece != Piece::empty && isWhitePiece(topPiece) == whiteToMove;
     }
 };
 
 // `state` is a cache of something computed from the board plus its history.
-// It is only trustworthy on a Board produced by apply(). If you build a Board
+// It is only trustworthy on a Board produced by applyMove(). If you build a Board
 // by hand - parsing a server string, writing a test - you must populate it
 // yourself before reading it.
 
@@ -307,13 +326,13 @@ struct Board
 // ---------------------------------------------------------------------------
 
 // Occurrences of the same position - same stacks, same side to move - that draw.
-inline constexpr int kRepetitionLimit = 3;
+inline constexpr int repetitionLimit = 3;
 
 // Moves without a landing capture after which the game is adjudicated.
-inline constexpr int kStalenessLimit = 80;
+inline constexpr int stalenessLimit = 80;
 
 // Total moves after which the game is adjudicated.
-inline constexpr int kMoveCap = 250;
+inline constexpr int moveLimit = 250;
 
 // ---------------------------------------------------------------------------
 // Geometry
@@ -322,15 +341,19 @@ inline constexpr int kMoveCap = 250;
 // Walk `steps` hexes from `start` in direction `dir`. Returns -1 if that leaves
 // the board. The board is convex, so if the endpoint is on the board then every
 // hex along the way is too - which is why both move types need only this check.
-constexpr int8_t ray(uint8_t start, uint8_t dir, uint8_t steps)
+constexpr int8_t destinationHex(uint8_t startHex, uint8_t direction, uint8_t distance)
 {
-    int8_t cur = static_cast<int8_t>(start);
-    for (uint8_t i = 0; i < steps; ++i)
+    assert(startHex < hexCount);
+    assert(direction < directionCount);
+
+    int8_t currentHex = static_cast<int8_t>(startHex);
+    for (uint8_t step = 0; step < distance; ++step)
     {
-        cur = kNeighbour[cur][dir];
-        if (cur < 0) return -1;
+        currentHex = neighboringHexes[currentHex][direction];
+        if (currentHex < 0)
+            return -1;
     }
-    return cur;
+    return currentHex;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,53 +361,58 @@ constexpr int8_t ray(uint8_t start, uint8_t dir, uint8_t steps)
 // ---------------------------------------------------------------------------
 
 // Recompute from scratch. Slow; use it to assert the incremental hash in tests.
-uint64_t computeHash(const Board&);
+uint64_t computeHash(const Board& board);
 
 // ---------------------------------------------------------------------------
 // Queries
 // ---------------------------------------------------------------------------
 
 // True if `white` controls the stack on `hex` (their piece is on top).
-bool controlledBy(const Board&, uint8_t hex, bool white);
+bool isControlledBy(const Board& board, uint8_t hex, bool white);
 
 // True if the side `attackerIsWhite` has a move that ends with them on top of
 // `kernelHex`. Walks the six rays out from the kernel rather than generating
 // every move, so it is cheap enough for the legality filter.
-bool kernelAttacked(const Board&, uint8_t kernelHex, bool attackerIsWhite);
+bool isKernelAttacked(const Board& board, uint8_t kernelHex, bool attackerIsWhite);
 
-// Rescan the board for both kernels and update the cache. applyRaw maintains
-// the cache itself; this is for boards built by hand.
-void refreshKernels(Board&);
+// Rescan the board for both kernels and update the cache.
+// applyMoveWithoutUpdatingState maintains the cache itself; this is for boards
+// built by hand.
+void refreshKernelPositions(Board& board);
 
 // ---------------------------------------------------------------------------
 // Moves
 // ---------------------------------------------------------------------------
 
-// Fills b.legal and b.moveCount for the side to move. Excludes moves that lose
-// your own kernel immediately or leave it capturable next ply.
-void generateLegal(Board&);
+// Fills b.legalMoveBits and b.legalMoveCount for the side to move. Excludes
+// moves that lose your own kernel immediately or leave it capturable next ply.
+void generateLegalMoves(Board& board);
 
 // Board mechanics only: move the pieces, update hash / kernel cache / ply, flip
 // the side to move. Does not generate moves and does not set `state`.
-Board applyRaw(const Board&, Move);
+// Preconditions: the source stack belongs to the side to move, the endpoint is
+// on the board, and a split moves at least two pieces.
+Board applyMoveWithoutUpdatingState(const Board& board, Move move);
 
-// Full move: applyRaw, then generate the reply moves and settle `state`.
+// Full move: applyMoveWithoutUpdatingState, then generate the reply moves and
+// settle `state`.
 // Pass the hash history - including the hash of `b` itself - to enable
 // repetition detection. Without it, repetition is not checked.
-Board apply(const Board&, Move, std::span<const uint64_t> history = {});
+// Precondition: `move` is legal on `board`.
+Board applyMove(const Board& board, Move move, std::span<const uint64_t> positionHistory = {});
 
 // ---------------------------------------------------------------------------
 // Serialization - the server's format, e.g. "-1,1:WK;0,0:WB;1,-1:BK;1,0:W"
 // Stack contents run bottom to top, so "WB" is white with black above it.
 // ---------------------------------------------------------------------------
 
-Board fromString(const std::string&, bool whiteToMove = true);
+Board parseBoard(const std::string& serializedBoard, bool whiteToMove = true);
 
 // The opening from section 3 of amoeba-reference.md, White to move. Self-play and
 // the encoder test both need it, and two copies of a 22-piece board string would
 // eventually disagree.
-Board startPosition();
-std::string toString(const Board&);
+Board createStartingBoard();
+std::string serializeBoard(const Board& board);
 
 // ===========================================================================
 // Board -> network input
@@ -393,8 +421,8 @@ std::string toString(const Board&);
 // ---------------------------------------------------------------------------
 // Board -> network input.
 //
-// kNumHexes blocks of kHexFeatures floats, one block per hex, followed by
-// kGlobalFeatures floats describing the position as a whole. Every value is in
+// hexCount blocks of featuresPerHex floats, one block per hex, followed by
+// globalFeatureCount floats describing the position as a whole. Every value is in
 // [0, 1]: the network's first layer weighs all of them against each other, so a
 // feature with a much larger range would drown out the rest.
 //
@@ -405,59 +433,60 @@ std::string toString(const Board&);
 // Everything is written from the point of view of the side to move: for Black
 // the colours are swapped and the board is rotated 180 degrees, so the network
 // learns the game once instead of once per colour. Block t therefore describes
-// what the mover sees at position t, which is absolute hex kFlipped[t] when
-// Black is to move, and direction d in a block means absolute opposite(d). A
-// policy over this input needs mapping back the same way before it names a move
+// what the mover sees at position t, which is absolute hex rotatedHexes[t] when
+// Black is to move, and direction d in a block means absolute
+// oppositeDirection(d). A policy over this input needs mapping back the same way before it names a move
 // the server will accept.
 // ---------------------------------------------------------------------------
 
-// Stacks taller than kMovableMax can never move again, so their internal order
-// can never matter again either. Six slots covers every stack still in play.
-inline constexpr int kSlotDepth     = kMovableMax;
-inline constexpr int kPieceCodes    = 5;                // empty, my normal, my kernel, their normal, their kernel
-inline constexpr int kHeightBuckets = kMovableMax + 2;  // 0..6 exactly, then 7-and-up
+// Stacks taller than maximumMovableStackHeight can never move again, so their
+// internal order can never matter again either. Six slots covers every stack
+// still in play.
+inline constexpr int encodedStackDepth = maximumMovableStackHeight;
+inline constexpr int pieceCodeCount = 5; // empty, my normal, my kernel, their normal, their kernel
+inline constexpr int heightBucketCount = maximumMovableStackHeight + 2; // 0..6 exactly, then 7-and-up
 
-inline constexpr int kHexFeatures =
-      kSlotDepth * kPieceCodes   // stack contents, bottom first: slot d is the piece a sow lands d + 1 hexes away
-    + kHeightBuckets             // height one-hot - height selects a rule, it is not a magnitude
-    + kPieceCodes                // top piece, the only thing above kSlotDepth that still matters
-    + 2                          // my kernel / their kernel buried anywhere in this stack
-    + 2                          // my pieces / their pieces in this stack
-    + kNumDirs * 2;              // legality per direction, move and sow, straight out of Board::legal
+inline constexpr int featuresPerHex =
+    encodedStackDepth * pieceCodeCount // stack contents, bottom first: slot d is the piece a sow lands d + 1 hexes away
+    + heightBucketCount                // height one-hot - height selects a rule, it is not a magnitude
+    + pieceCodeCount                   // top piece, the only thing above encodedStackDepth that still matters
+    + 2                                // my kernel / their kernel buried anywhere in this stack
+    + 2                                // my pieces / their pieces in this stack
+    + directionCount * 2;              // legality per direction, move and sow, straight out of Board::legal
 
-inline constexpr int kGlobalFeatures = 8;
-inline constexpr int kEncodedSize    = kNumHexes * kHexFeatures + kGlobalFeatures;
+inline constexpr int globalFeatureCount = 8;
+inline constexpr int encodedBoardSize = hexCount * featuresPerHex + globalFeatureCount;
 
-static_assert(kHexFeatures == 59);
+static_assert(featuresPerHex == 59);
 
 // Offsets within one hex block.
-inline constexpr int kOffSlots   = 0;
-inline constexpr int kOffHeight  = kOffSlots + kSlotDepth * kPieceCodes;
-inline constexpr int kOffTop     = kOffHeight + kHeightBuckets;
-inline constexpr int kOffKernels = kOffTop + kPieceCodes;
-inline constexpr int kOffCounts  = kOffKernels + 2;
-inline constexpr int kOffLegal   = kOffCounts + 2;
+inline constexpr int stackSlotsOffset = 0;
+inline constexpr int stackHeightOffset = stackSlotsOffset + encodedStackDepth * pieceCodeCount;
+inline constexpr int topPieceOffset = stackHeightOffset + heightBucketCount;
+inline constexpr int kernelPresenceOffset = topPieceOffset + pieceCodeCount;
+inline constexpr int pieceCountsOffset = kernelPresenceOffset + 2;
+inline constexpr int legalMovesOffset = pieceCountsOffset + 2;
 
 // The globals, in order.
-inline constexpr int kGlobalPly            = 0;
-inline constexpr int kGlobalStaleness      = 1;
-inline constexpr int kGlobalRepeats        = 2;
-inline constexpr int kGlobalMyStacks       = 3;
-inline constexpr int kGlobalTheirStacks    = 4;
-inline constexpr int kGlobalMyPrisoners    = 5;
-inline constexpr int kGlobalTheirPrisoners = 6;
-inline constexpr int kGlobalInCheck        = 7;
+inline constexpr int globalMoveNumberIndex = 0;
+inline constexpr int globalStalenessIndex = 1;
+inline constexpr int globalRepetitionIndex = 2;
+inline constexpr int globalOwnStackCountIndex = 3;
+inline constexpr int globalOpponentStackCountIndex = 4;
+inline constexpr int globalOwnPrisonerCountIndex = 5;
+inline constexpr int globalOpponentPrisonerCountIndex = 6;
+inline constexpr int globalInCheckIndex = 7;
 
-// Requires b.legal and the kernel cache to be populated - apply() and
-// fromString() both do it.
-void encode(const Board& b, std::span<float, kEncodedSize> out);
+// Requires b.legalMoveBits and the kernel cache to be populated - applyMove() and
+// parseBoard() both do it.
+void encodeBoard(const Board& board, std::span<float, encodedBoardSize> output);
 
 // ---------------------------------------------------------------------------
 // Policy space -> absolute move ids
 //
-// encode() writes the slot for (token, dir) from the absolute move
-// (kFlipped[token], opposite(dir)) when Black is to move, so a policy coming
-// back from the network is indexed in that same flipped space. It has to be
+// encodeBoard() writes the slot for (token, dir) from the absolute move
+// (rotatedHexes[token], oppositeDirection(dir)) when Black is to move, so a
+// policy coming back from the network is indexed in that same flipped space. It has to be
 // permuted before any of it names a move, and before a search's visit counts
 // become a training target.
 //
@@ -465,42 +494,54 @@ void encode(const Board& b, std::span<float, kEncodedSize> out);
 // gives a valid distribution over legal moves, the loss still falls, and the bot
 // simply plays as though the board were rotated.
 //
-// kFlipped and opposite() are both involutions, so the permutation is its own
-// inverse and the same table maps a target back the other way.
+// rotatedHexes and oppositeDirection() are both involutions, so the permutation
+// is its own inverse and the same table maps a target back the other way.
 // ---------------------------------------------------------------------------
 
-inline constexpr auto kPolicyIdentity = [] -> std::array<uint16_t, kNumMoveIds> {
-    std::array<uint16_t, kNumMoveIds> table{};
-    for (int i = 0; i < kNumMoveIds; ++i)
-        table[i] = static_cast<uint16_t>(i);
+inline constexpr auto identityPolicyMapping = [] -> std::array<uint16_t, moveIdCount>
+{
+    std::array<uint16_t, moveIdCount> table{};
+    for (int moveId = 0; moveId < moveIdCount; ++moveId)
+        table[moveId] = static_cast<uint16_t>(moveId);
     return table;
 }();
 
-inline constexpr auto kPolicyUnflip = [] -> std::array<uint16_t, kNumMoveIds> {
-    std::array<uint16_t, kNumMoveIds> table{};
-    for (int token = 0; token < kNumHexes; ++token) {
-        for (uint8_t dir = 0; dir < kNumDirs; ++dir) {
-            for (int splitting = 0; splitting < 2; ++splitting) {
-                table[(token * kNumDirs + dir) * 2 + splitting] = static_cast<uint16_t>((kFlipped[token] * kNumDirs + opposite(dir)) * 2 + splitting);
+inline constexpr auto rotatedPolicyMapping = [] -> std::array<uint16_t, moveIdCount>
+{
+    std::array<uint16_t, moveIdCount> table{};
+    for (int token = 0; token < hexCount; ++token)
+    {
+        for (uint8_t direction = 0; direction < directionCount; ++direction)
+        {
+            for (int splitsStack = 0; splitsStack < 2; ++splitsStack)
+            {
+                table[(token * directionCount + direction) * 2 + splitsStack] = static_cast<uint16_t>(
+                    (rotatedHexes[token] * directionCount + oppositeDirection(direction)) * 2 + splitsStack);
             }
         }
     }
     return table;
 }();
 
-static_assert([] {
-    for (int i = 0; i < kNumMoveIds; ++i) {
-        if (kPolicyUnflip[kPolicyUnflip[i]] != i)
-            return false;
-    }
-    return true;
-}(), "the policy flip must be its own inverse");
+static_assert(
+    []
+    {
+        for (int moveId = 0; moveId < moveIdCount; ++moveId)
+        {
+            if (rotatedPolicyMapping[rotatedPolicyMapping[moveId]] != moveId)
+                return false;
+        }
+        return true;
+    }(),
+    "the policy flip must be its own inverse");
 
-// Identity for White, because encode() does not flip then.
-constexpr std::span<const uint16_t, kNumMoveIds> policyToAbsolute(bool whiteToMove)
+// Identity for White, because encodeBoard() does not flip then.
+constexpr std::span<const uint16_t, moveIdCount> policyIndicesToMoveIds(bool whiteToMove)
 {
-    return whiteToMove ? std::span<const uint16_t, kNumMoveIds>{kPolicyIdentity}
-                       : std::span<const uint16_t, kNumMoveIds>{kPolicyUnflip};
+    return whiteToMove ? std::span<const uint16_t, moveIdCount>{identityPolicyMapping}
+                       : std::span<const uint16_t, moveIdCount>{rotatedPolicyMapping};
 }
 
 } // namespace amoeba
+
+#endif // AMOEBA_HPP

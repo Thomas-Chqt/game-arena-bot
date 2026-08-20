@@ -1,4 +1,5 @@
-#pragma once
+#ifndef MCTS_HPP
+#define MCTS_HPP
 
 // ---------------------------------------------------------------------------
 // PUCT Monte Carlo tree search, the AlphaZero variant: no random playouts in
@@ -61,23 +62,23 @@ public:
     // A call from inside a body runs serially: the outer call already has every
     // thread, so waiting for one here would deadlock. An exception from a body is
     // rethrown to the caller once the round has finished.
-    void forEach(size_t count, const std::function<void(size_t)>& body);
+    void forEach(size_t taskCount, const std::function<void(size_t)>& task);
 
 private:
-    void serve();
-    void drain();
+    void workerLoop();
+    void runAvailableTasks();
 
-    std::mutex                         m_mutex;
-    std::condition_variable            m_wake;
-    std::condition_variable            m_finished;
-    const std::function<void(size_t)>* m_body = nullptr;
-    size_t                             m_count = 0;
-    std::atomic<size_t>                m_next{0};
-    uint64_t                           m_round = 0;
-    unsigned                           m_busy  = 0;
-    bool                               m_stopping = false;
-    std::exception_ptr                 m_failure;
-    std::vector<std::thread>           m_workers;
+    std::mutex m_mutex;
+    std::condition_variable m_workAvailable;
+    std::condition_variable m_roundFinished;
+    const std::function<void(size_t)>* m_task = nullptr;
+    size_t m_taskCount = 0;
+    std::atomic<size_t> m_nextTaskIndex{0};
+    uint64_t m_roundId = 0;
+    unsigned m_activeWorkerCount = 0;
+    bool m_stopping = false;
+    std::exception_ptr m_taskFailure;
+    std::vector<std::thread> m_workers;
 };
 
 // What the search wants to know about a position it has just reached.
@@ -87,7 +88,7 @@ private:
 // read, and they are renormalised to sum to one, so the rest may be anything.
 struct Evaluation
 {
-    std::array<float, amoeba::kNumMoveIds> policy;
+    std::array<float, amoeba::moveIdCount> policy;
     float value;
 };
 
@@ -99,7 +100,7 @@ public:
     // `out` is the same length as `boards`. Plural because evaluating a single
     // position on a GPU wastes most of the device: 1.70 ms for one position
     // against 0.15 ms each for 256.
-    virtual void evaluate(std::span<const amoeba::Board* const> boards, std::span<Evaluation> out) = 0;
+    virtual void evaluate(std::span<const amoeba::Board* const> boards, std::span<Evaluation> outputs) = 0;
 };
 
 // Uniform priors, and a value read off one uniformly random playout to the end
@@ -108,22 +109,25 @@ public:
 class RolloutEvaluator final : public Evaluator
 {
 public:
-    explicit RolloutEvaluator(uint64_t seed) : m_rng(seed) {}
+    explicit RolloutEvaluator(uint64_t seed)
+        : m_randomEngine(seed)
+    {
+    }
 
-    void evaluate(std::span<const amoeba::Board* const> boards, std::span<Evaluation> out) override;
+    void evaluate(std::span<const amoeba::Board* const> boards, std::span<Evaluation> outputs) override;
 
 private:
     float playout(amoeba::Board);
 
-    std::mt19937_64 m_rng;
+    std::mt19937_64 m_randomEngine;
 };
 
 struct Config
 {
     // Simulations through the root, not new ones: a re-rooted tree arrives with
     // some of them already spent, and that is the whole point of keeping it.
-    int   simulations = 800;
-    float cPuct       = 1.5f;
+    int simulations = 800;
+    float explorationConstant = 1.5f;
 
     // The search stops at the simulation count or the deadline, whichever comes
     // first, and always runs one batch so the visit counts can never be empty.
@@ -145,9 +149,9 @@ struct Config
     // judgement. alpha below 1 makes each draw spiky, so a different random handful
     // of moves gets promoted each game; AlphaZero scaled it as 10 / average legal
     // moves, and Amoeba averages 27.
-    float    rootNoise  = 0.0f;
-    float    noiseAlpha = 0.35f;
-    uint64_t noiseSeed  = 0;
+    float rootNoise = 0.0f;
+    float noiseAlpha = 0.35f;
+    uint64_t noiseSeed = 0;
 
     // How many leaves one search offers per round. Leave it at 1 whenever there
     // are other games to batch with: descents inside a round cannot see each
@@ -160,22 +164,26 @@ struct Config
 
 // Simulations spent on each move id. The argmax is the move to play; normalised
 // it is the policy target the network trains on.
-using VisitCounts = std::array<uint32_t, amoeba::kNumMoveIds>;
+using VisitCounts = std::array<uint32_t, amoeba::moveIdCount>;
 
 class Search
 {
 public:
-    explicit Search(Config config = {}) : m_config(config), m_rng(config.noiseSeed) {}
+    explicit Search(Config config = {})
+        : m_config(config)
+        , m_randomEngine(config.noiseSeed)
+    {
+    }
 
     // Throws the tree away and starts again at `root`. `history` is the hash of
     // every position the real game has passed through, ending with `root`'s own;
-    // amoeba::apply() needs it to see repetitions that the search walks into.
+    // amoeba::applyMove() needs it to see repetitions that the search walks into.
     void restart(const amoeba::Board& root, std::span<const uint64_t> history);
 
-    // Re-roots on the child `moveId` leads to and keeps its subtree, so the
+    // Re-roots on the child node `moveId` leads to and keeps its subtree, so the
     // simulations that already went through that move are still there next turn -
     // 20-40% of the next search for free, and more when the move played was the
-    // one the search liked. Falls back to restart() when that child was never
+    // one the search liked. Falls back to restart() when that child node was never
     // expanded, which is what happens when the opponent plays something the search
     // never looked at.
     //
@@ -198,66 +206,66 @@ public:
 private:
     struct Edge
     {
-        float    prior;
-        float    valueSum;
+        float prior;
+        float valueSum;
         uint32_t visits;
-        int32_t  child;    // -1 until a simulation goes through this move
+        int32_t childNode; // -1 until a simulation goes through this move
         uint16_t moveId;
     };
 
     struct Node
     {
         amoeba::Board board;
-        uint32_t      firstEdge;
-        uint32_t      edgeCount;   // 0 at a terminal position
-        uint32_t      visits;
+        uint32_t firstEdgeIndex;
+        uint32_t edgeCount; // 0 at a terminal position
+        uint32_t visits;
     };
 
     // Where one descent ended, and everything needed to back it up once its leaf
     // has been evaluated.
     struct Descent
     {
-        uint32_t trailStart;
-        uint32_t trailLength;
-        int32_t  edge;    // the edge whose child this descent is creating, -1 if it hit a terminal node
-        int32_t  leaf;    // index into m_leaves, -1 if it hit a terminal node
-        float    value;   // the terminal value, when there is no leaf to evaluate
+        uint32_t edgeTrailStart;
+        uint32_t edgeTrailLength;
+        int32_t expandedEdgeIndex; // -1 when the descent ends at a terminal node
+        int32_t pendingBoardIndex; // -1 when no network evaluation is needed
+        float terminalValue;
     };
 
-    uint32_t expand(const amoeba::Board&, const Evaluation&);
-    uint32_t selectEdge(uint32_t node) const;
-    int32_t  childFor(uint16_t moveId) const;
-    void     keepSubtree(uint32_t node);
-    void     addRootNoise();
-    void     collect(int wanted);
-    void     backUp(std::span<const Evaluation>);
-    bool     spent() const;
+    uint32_t addNode(const amoeba::Board&, const Evaluation&);
+    uint32_t selectEdgeToExplore(uint32_t node) const;
+    int32_t findRootChild(uint16_t moveId) const;
+    void retainSubtree(uint32_t node);
+    void addExplorationNoise();
+    void collectPendingLeaves(int requestedLeafCount);
+    void backpropagate(std::span<const Evaluation>);
+    bool hasSpentBudget() const;
 
     Config m_config;
 
-    std::vector<Node>     m_nodes;      // node 0 is always the root
-    std::vector<Edge>     m_edges;
-    std::vector<Node>     m_spareNodes;   // buffers for re-rooting, swapped in
-    std::vector<Edge>     m_spareEdges;
-    std::vector<uint64_t> m_path;       // the game history, then hashes down the descent being collected
-    size_t                m_baseLength = 0;
+    std::vector<Node> m_nodes; // node 0 is always the root
+    std::vector<Edge> m_edges;
+    std::vector<Node> m_spareNodes; // buffers for re-rooting, swapped in
+    std::vector<Edge> m_spareEdges;
+    std::vector<uint64_t> m_positionHistory; // the game history, then hashes down the descent being collected
+    size_t m_gameHistoryLength = 0;
 
     amoeba::Board m_rootBoard;
-    bool          m_needsRoot = true;   // the root exists but has not been evaluated yet
+    bool m_rootNeedsEvaluation = true; // the root exists but has not been evaluated yet
 
     // The clock starts when the search does, not when the root is set: match play
     // re-roots as soon as it hears the opponent's move and only searches when it is
     // asked for one, and the wait in between is not part of its turn.
-    std::chrono::steady_clock::time_point m_expiry;
-    bool                                  m_timing = false;
+    std::chrono::steady_clock::time_point m_deadline;
+    bool m_searchStarted = false;
 
-    std::mt19937_64    m_rng;
-    std::vector<float> m_noise;
+    std::mt19937_64 m_randomEngine;
+    std::vector<float> m_rootNoiseValues;
 
-    std::vector<Descent>              m_descents;
-    std::vector<uint32_t>             m_trailStore;   // every trail in the round, concatenated
-    std::vector<amoeba::Board>        m_leaves;
-    std::vector<const amoeba::Board*> m_leafPointers;
+    std::vector<Descent> m_descents;
+    std::vector<uint32_t> m_edgeTrails; // every trail in the round, concatenated
+    std::vector<amoeba::Board> m_pendingBoards;
+    std::vector<const amoeba::Board*> m_pendingBoardPointers;
 };
 
 // Drives one search to the end against one evaluator. Match play has a single
@@ -275,3 +283,5 @@ uint16_t bestMove(const VisitCounts&);
 float outcomeFor(amoeba::State, bool whiteToMove);
 
 } // namespace bot
+
+#endif // MCTS_HPP

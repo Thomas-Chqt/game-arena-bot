@@ -1,8 +1,9 @@
-#pragma once
+#ifndef NETWORK_HPP
+#define NETWORK_HPP
 
-// The network behind bot::Evaluator. Untrained: forward() computes, nothing fits it yet.
+// The network behind bot::Evaluator. Untrained: runInference() computes, nothing fits it yet.
 //
-// encode() already produces 37 hex blocks plus 8 globals, so the natural unit is
+// encodeBoard() already produces 37 hex blocks plus 8 globals, so the natural unit is
 // a token per hex: 37 tokens, attention between all of them, a policy head of 12
 // logits per token - which is exactly amoeba::Move::id - and one scalar value.
 //
@@ -13,8 +14,6 @@
 // rediscover the attack relation from game outcomes.
 
 #include "mcts.hpp"
-
-#include "amoeba.hpp"
 
 #include <mlx/mlx.h>
 
@@ -28,29 +27,36 @@ namespace bot
 {
 
 // Bucket 0 means "these two hexes share no line"; the rest is one bucket per
-// (direction, distance) pair. kMovableMax doubles as the longest straight run on
+// (direction, distance) pair. maximumMovableStackHeight doubles as the longest straight run on
 // the board, which is why it bounds the distance. That this comes to 37, the
-// same as kNumHexes, is a coincidence.
-inline constexpr int kPositionBuckets = 1 + amoeba::kNumDirs * amoeba::kMovableMax;
+// same as hexCount, is a coincidence.
+inline constexpr int relativePositionBucketCount = 1 + amoeba::directionCount * amoeba::maximumMovableStackHeight;
 
 // 6 directions x (move, sow). Laid out dir-major so that token t's block of 12
 // lands on Move::id == (t * 6 + dir) * 2 + splitting with no permutation.
-inline constexpr int kPolicyPerHex = amoeba::kNumDirs * 2;
+inline constexpr int policyOutputsPerHex = amoeba::directionCount * 2;
 
 // Which relative-position bucket joins two hexes. Bucket 0 means no straight
 // line joins them at all; otherwise one bucket per (direction, distance) pair,
 // which is exactly the attack relation the rules are written in. The stride for
 // direction is the number of distance buckets, not the number of directions -
 // they are both 6 here, which makes the mistake invisible.
-inline constexpr auto kBucket = [] -> std::array<std::array<uint8_t, amoeba::kNumHexes>, amoeba::kNumHexes> {
-    std::array<std::array<uint8_t, amoeba::kNumHexes>, amoeba::kNumHexes> table{};
-    for (int i = 0; i < amoeba::kNumHexes; ++i) {
-        for (uint8_t dir = 0; dir < amoeba::kNumDirs; ++dir) {
-            for (uint8_t distance = 1; distance <= amoeba::kMovableMax; ++distance)
+inline constexpr auto relativePositionBuckets =
+    [] -> std::array<std::array<uint8_t, amoeba::hexCount>, amoeba::hexCount>
+{
+    std::array<std::array<uint8_t, amoeba::hexCount>, amoeba::hexCount> table{};
+    for (int sourceHex = 0; sourceHex < amoeba::hexCount; ++sourceHex)
+    {
+        for (uint8_t direction = 0; direction < amoeba::directionCount; ++direction)
+        {
+            for (uint8_t distance = 1; distance <= amoeba::maximumMovableStackHeight; ++distance)
             {
-                const int8_t reached = amoeba::ray(static_cast<uint8_t>(i), dir, distance);
-                if (reached >= 0)
-                    table[i][reached] = static_cast<uint8_t>(1 + dir * amoeba::kMovableMax + (distance - 1));
+                const int8_t destination = amoeba::destinationHex(static_cast<uint8_t>(sourceHex), direction, distance);
+                if (destination >= 0)
+                {
+                    table[sourceHex][destination] =
+                        static_cast<uint8_t>(1 + direction * amoeba::maximumMovableStackHeight + (distance - 1));
+                }
             }
         }
     }
@@ -62,9 +68,9 @@ inline constexpr auto kBucket = [] -> std::array<std::array<uint8_t, amoeba::kNu
 // its only job is to prove data flows from self-play into training and back.
 struct NetworkShape
 {
-    int blocks = 6;
-    int width  = 128;
-    int heads  = 8;
+    int blockCount = 6;
+    int embeddingWidth = 128;
+    int attentionHeadCount = 8;
 };
 
 // Parameters live in one flat vector rather than named fields because that is
@@ -81,23 +87,23 @@ public:
     NetworkShape shape() const { return m_shape; }
     size_t parameterCount() const;
 
-    const std::vector<mlx::core::array>& parameters() const { return m_params; }
+    const std::vector<mlx::core::array>& parameters() const { return m_parameters; }
 
     // The optimiser builds a whole new vector each step rather than mutating in
     // place, because an mlx::core::array is a handle onto a graph, not a buffer.
-    void replaceParameters(std::vector<mlx::core::array> params);
+    void replaceParameters(std::vector<mlx::core::array> parameters);
 
 private:
     // Which tensors exist, and in what order value_and_grad will see them. The
     // single definition of that: random init and checkpoint loading both read it.
-    static std::vector<std::pair<std::string, mlx::core::Shape>> layout(NetworkShape shape);
+    static std::vector<std::pair<std::string, mlx::core::Shape>> parameterLayout(NetworkShape shape);
 
     NetworkShape m_shape;
     std::vector<std::string> m_names;
-    std::vector<mlx::core::array> m_params;
+    std::vector<mlx::core::array> m_parameters;
 };
 
-// Raw policy logits, [batch, kNumMoveIds] and still in the flipped space encode()
+// Raw policy logits, [batch, moveIdCount] and still in the flipped space encodeBoard()
 // used, plus one value per position. Masking is the caller's job: inference wants
 // probabilities over the legal moves, training wants the logits themselves.
 struct Prediction
@@ -106,17 +112,21 @@ struct Prediction
     mlx::core::array value;
 };
 
-// `params` is walked positionally, so it must be in Network::layout() order.
-Prediction forward(const std::vector<mlx::core::array>& params, NetworkShape shape, const mlx::core::array& input);
+// `parameters` is walked positionally, so it must be in Network::parameterLayout() order.
+Prediction runInference(const std::vector<mlx::core::array>& parameters, NetworkShape shape,
+                        const mlx::core::array& input);
 
 // Encodes a batch of boards, runs one forward pass, and hands the search back
 // probabilities over legal moves in absolute move ids.
 class NetworkEvaluator final : public Evaluator
 {
 public:
-    explicit NetworkEvaluator(const Network& network) : m_network(network) {}
+    explicit NetworkEvaluator(const Network& network)
+        : m_network(network)
+    {
+    }
 
-    void evaluate(std::span<const amoeba::Board* const> boards, std::span<Evaluation> out) override;
+    void evaluate(std::span<const amoeba::Board* const> boards, std::span<Evaluation> outputs) override;
 
 private:
     const Network& m_network;
@@ -131,15 +141,15 @@ private:
 // shared trunk serve both heads.
 // ===========================================================================
 
-// One training batch, already in the network's own terms: input as encode() lays
-// it out, and the policy target permuted into the same flipped space forward()
-// answers in. makeBatch() is what puts it there.
-struct Batch
+// One training batch, already in the network's own terms: input as encodeBoard() lays
+// it out, and the policy target permuted into the same flipped space runInference()
+// answers in. makeTrainingBatch() is what puts it there.
+struct TrainingBatch
 {
-    mlx::core::array input;         // [batch, kEncodedSize]
-    mlx::core::array legal;         // [batch, kNumMoveIds], 1 or 0
-    mlx::core::array policyTarget;  // [batch, kNumMoveIds], sums to 1 over legal moves
-    mlx::core::array valueTarget;   // [batch], in [-1, 1]
+    mlx::core::array input;        // [batch, encodedBoardSize]
+    mlx::core::array legal;        // [batch, moveIdCount], 1 or 0
+    mlx::core::array policyTarget; // [batch, moveIdCount], sums to 1 over legal moves
+    mlx::core::array valueTarget;  // [batch], in [-1, 1]
 };
 
 // `visits` is indexed by absolute amoeba::Move::id, straight off Search::run.
@@ -148,7 +158,8 @@ struct Batch
 // that sign wrong trains a bot that prefers losing while the loss curve stays
 // healthy, so it is deliberately the caller's business - only self-play knows the
 // result - and this function will not second-guess it.
-Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const VisitCounts> visits, std::span<const float> outcomes);
+TrainingBatch makeTrainingBatch(std::span<const amoeba::Board* const> boards, std::span<const VisitCounts> visits,
+                                std::span<const float> outcomes);
 
 // Returns { total, policy, value }. The total is the scalar to differentiate; the
 // two components come back alongside because they say different things - a value
@@ -163,7 +174,8 @@ Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const Vi
 // biases as well; separating those out is not worth it at this size. Pass 0 when
 // overfitting a single batch on purpose, since the penalty otherwise keeps the
 // loss off zero and hides whether the gradients actually connect.
-std::vector<mlx::core::array> loss(const std::vector<mlx::core::array>& params, NetworkShape shape, const Batch& batch, float weightDecay);
+std::vector<mlx::core::array> computeLoss(const std::vector<mlx::core::array>& parameters, NetworkShape shape,
+                                          const TrainingBatch& batch, float weightDecay);
 
 // The decay rates are the conventional beta1 and beta2, named for what they do.
 // 0.9 averages roughly the last ten gradients, 0.999 the last thousand. epsilon
@@ -190,7 +202,7 @@ struct AdamConfig
 class Adam
 {
 public:
-    explicit Adam(const std::vector<mlx::core::array>& params, AdamConfig config = {});
+    explicit Adam(const std::vector<mlx::core::array>& parameters, AdamConfig config = {});
 
     // Returns the new parameters; an mlx::core::array is a handle onto a graph
     // rather than a buffer, so nothing is written in place.
@@ -202,8 +214,8 @@ public:
     //
     // `rate` is an argument rather than config because it is expected to fall on a
     // schedule as training progresses.
-    std::vector<mlx::core::array> step(const std::vector<mlx::core::array>& params,
-                                       const std::vector<mlx::core::array>& gradients, float rate);
+    std::vector<mlx::core::array> updateParameters(const std::vector<mlx::core::array>& parameters,
+                                                   const std::vector<mlx::core::array>& gradients, float rate);
 
     int steps() const { return m_steps; }
 
@@ -215,3 +227,5 @@ private:
 };
 
 } // namespace bot
+
+#endif // NETWORK_HPP

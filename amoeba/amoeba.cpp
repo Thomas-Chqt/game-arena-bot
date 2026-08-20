@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 
 namespace amoeba
 {
@@ -17,108 +18,129 @@ namespace
 // the position - a split rewrites the depths of everything it touches.
 // ---------------------------------------------------------------------------
 
-constexpr uint64_t splitmix64(uint64_t& s)
+constexpr uint64_t nextSplitmix64(uint64_t& state)
 {
-    s += 0x9E3779B97F4A7C15ULL;
-    uint64_t z = s;
-    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
-    return z ^ (z >> 31);
+    state += 0x9E3779B97F4A7C15ULL;
+    uint64_t value = state;
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBULL;
+    return value ^ (value >> 31);
 }
 
 struct ZobristTable
 {
-    uint64_t piece[kNumHexes][kMaxHeight][5]{};
+    uint64_t pieces[hexCount][maximumStackHeight][5]{};
     uint64_t blackToMove{};
 };
 
 consteval ZobristTable makeZobrist()
 {
-    ZobristTable t{};
-    uint64_t s = 0xA5A5A5A5DEADBEEFULL;
-    for (int h = 0; h < kNumHexes; ++h)
-        for (int d = 0; d < kMaxHeight; ++d)
-            for (int p = 1; p <= 4; ++p)  // index 0 (Empty) is never used
-                t.piece[h][d][p] = splitmix64(s);
-    t.blackToMove = splitmix64(s);
-    return t;
+    ZobristTable table{};
+    uint64_t randomState = 0xA5A5A5A5DEADBEEFULL;
+
+    for (int hex = 0; hex < hexCount; ++hex)
+    {
+        for (int depth = 0; depth < maximumStackHeight; ++depth)
+        {
+            // Piece::empty is never stored, so index zero remains unused.
+            for (int piece = 1; piece <= 4; ++piece)
+                table.pieces[hex][depth][piece] = nextSplitmix64(randomState);
+        }
+    }
+
+    table.blackToMove = nextSplitmix64(randomState);
+    return table;
 }
 
-constexpr ZobristTable kZobrist = makeZobrist();
+constexpr ZobristTable zobristTable = makeZobrist();
 
-constexpr uint64_t zob(uint8_t hex, uint8_t depth, Piece p)
+constexpr uint64_t zobristValue(uint8_t hex, uint8_t depth, Piece piece)
 {
-    return kZobrist.piece[hex][depth][static_cast<uint8_t>(p)];
+    return zobristTable.pieces[hex][depth][static_cast<uint8_t>(piece)];
 }
 
 } // namespace
 
 // ---------------------------------------------------------------------------
 
-uint64_t computeHash(const Board& b)
+uint64_t computeHash(const Board& board)
 {
-    uint64_t h = 0;
-    for (uint8_t i = 0; i < kNumHexes; ++i)
+    uint64_t hash = 0;
+    for (uint8_t hex = 0; hex < hexCount; ++hex)
     {
-        const Hex& hx = b.hexes[i];
-        for (uint8_t d = 0; d < hx.height(); ++d) h ^= zob(i, d, hx.at(d));
+        const Hex& stack = board.hexes[hex];
+        for (uint8_t depth = 0; depth < stack.height(); ++depth)
+            hash ^= zobristValue(hex, depth, stack.pieceAt(depth));
     }
-    if (!b.whiteToMove) h ^= kZobrist.blackToMove;
-    return h;
+
+    if (!board.whiteToMove)
+        hash ^= zobristTable.blackToMove;
+    return hash;
 }
 
-bool controlledBy(const Board& b, uint8_t hex, bool white)
+bool isControlledBy(const Board& board, uint8_t hex, bool white)
 {
-    const Piece t = b.hexes[hex].top();
-    return t != Piece::Empty && isWhite(t) == white;
+    assert(hex < hexCount);
+    const Piece topPiece = board.hexes[hex].topPiece();
+    return topPiece != Piece::empty && isWhitePiece(topPiece) == white;
 }
 
-void refreshKernels(Board& b)
+void refreshKernelPositions(Board& board)
 {
-    for (uint8_t i = 0; i < kNumHexes; ++i)
+    for (uint8_t hex = 0; hex < hexCount; ++hex)
     {
-        const Hex& hx = b.hexes[i];
-        for (uint8_t d = 0; d < hx.height(); ++d)
+        const Hex& stack = board.hexes[hex];
+        for (uint8_t depth = 0; depth < stack.height(); ++depth)
         {
-            if (hx.at(d) == Piece::WK) b.whiteKernelHex = i;
-            if (hx.at(d) == Piece::BK) b.blackKernelHex = i;
+            if (stack.pieceAt(depth) == Piece::whiteKernel)
+                board.whiteKernelIndex = hex;
+            if (stack.pieceAt(depth) == Piece::blackKernel)
+                board.blackKernelIndex = hex;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
 
-bool kernelAttacked(const Board& b, uint8_t kernelHex, bool attackerIsWhite)
+bool isKernelAttacked(const Board& board, uint8_t kernelHex, bool attackerIsWhite)
 {
-    // Walk outward from the kernel. A stack sitting k hexes away in direction d
-    // attacks the kernel by moving back along opposite(d).
-    for (uint8_t d = 0; d < kNumDirs; ++d)
+    assert(kernelHex < hexCount);
+
+    // Walk outward from the kernel. A stack `distance` hexes away attacks back
+    // along the opposite direction.
+    for (uint8_t outwardDirection = 0; outwardDirection < directionCount; ++outwardDirection)
     {
-        int8_t c = static_cast<int8_t>(kernelHex);
-        for (uint8_t k = 1; k <= kMovableMax; ++k)
+        int8_t attackerHex = static_cast<int8_t>(kernelHex);
+        for (uint8_t distance = 1; distance <= maximumMovableStackHeight; ++distance)
         {
-            c = kNeighbour[c][d];
-            if (c < 0) break;
+            attackerHex = neighboringHexes[attackerHex][outwardDirection];
+            if (attackerHex < 0)
+                break;
 
-            const Hex& hx = b.hexes[c];
-            const uint8_t h = hx.height();
-            if (h == 0) continue;
-            if (!controlledBy(b, static_cast<uint8_t>(c), attackerIsWhite)) continue;
+            const Hex& attacker = board.hexes[attackerHex];
+            const uint8_t attackerHeight = attacker.height();
+            if (attackerHeight == 0)
+                continue;
+            if (!isControlledBy(board, static_cast<uint8_t>(attackerHex), attackerIsWhite))
+                continue;
 
-            const uint8_t back = opposite(d);
+            const uint8_t attackDirection = oppositeDirection(outwardDirection);
 
-            // Simple move: travels exactly h, so it lands on the kernel iff h == k.
-            // The stack arrives intact, so its top piece - the attacker's - ends
-            // up on top.
-            if (h == k) return true;
+            // A whole-stack move lands on the kernel when height equals distance.
+            if (attackerHeight == distance)
+                return true;
 
-            // Split: drops pieces bottom-first along the path, so the piece that
-            // lands on the kernel is the one at depth k-1. It must be the
-            // attacker's, and the full path must stay on the board.
-            if (h >= 2 && h >= k && ray(static_cast<uint8_t>(c), back, h) >= 0)
+            // A split drops the piece at depth `distance - 1` onto the kernel. The
+            // entire stack still needs a valid endpoint even though the kernel is
+            // encountered earlier on its path.
+            const bool canSplitOverKernel =
+                attackerHeight >= 2 && attackerHeight >= distance &&
+                destinationHex(static_cast<uint8_t>(attackerHex), attackDirection, attackerHeight) >= 0;
+            if (canSplitOverKernel)
             {
-                const Piece lands = hx.at(static_cast<uint8_t>(k - 1));
-                if (lands != Piece::Empty && isWhite(lands) == attackerIsWhite) return true;
+                const Piece landingPiece = attacker.pieceAt(static_cast<uint8_t>(distance - 1));
+                if (isWhitePiece(landingPiece) == attackerIsWhite)
+                    return true;
             }
         }
     }
@@ -127,109 +149,116 @@ bool kernelAttacked(const Board& b, uint8_t kernelHex, bool attackerIsWhite)
 
 // ---------------------------------------------------------------------------
 
-Board applyRaw(const Board& b, Move m)
+Board applyMoveWithoutUpdatingState(const Board& board, Move move)
 {
-    Board n = b;
-    n.clearLegal();
-    n.state = State::Ongoing;
+    assert(move.sourceHex < hexCount);
+    assert(move.direction < directionCount);
+    assert(!board.hexes[move.sourceHex].isEmpty());
+    assert(board.controls(move.sourceHex));
 
-    Hex& src = n.hexes[m.from];
-    const uint8_t h = src.height();
+    const uint8_t stackHeight = board.hexes[move.sourceHex].height();
+    const int8_t destination = destinationHex(move.sourceHex, move.direction, stackHeight);
+    assert(destination >= 0);
+    assert(!move.splitsStack || stackHeight >= 2);
+
+    Board result = board;
+    result.clearLegal();
+    result.state = State::ongoing;
+    Hex& sourceStack = result.hexes[move.sourceHex];
 
     // Only the last hex of the path counts: intermediate captures made during a
     // sow do not reset the staleness counter.
-    const uint8_t dest    = static_cast<uint8_t>(ray(m.from, m.dir, h));
-    const Piece   landedOn = b.hexes[dest].top();
-    const bool    seized   = landedOn != Piece::Empty && isWhite(landedOn) != b.whiteToMove;
+    const Piece previousTopPiece = board.hexes[destination].topPiece();
+    const bool capturedStack = previousTopPiece != Piece::empty && isWhitePiece(previousTopPiece) != board.whiteToMove;
 
-    Piece buf[kMaxHeight];
-    for (uint8_t i = 0; i < h; ++i)
+    Piece movedPieces[maximumStackHeight];
+    for (uint8_t depth = 0; depth < stackHeight; ++depth)
     {
-        buf[i] = src.at(i);
-        n.hash ^= zob(m.from, i, buf[i]);   // lift the whole stack out of the hash
+        movedPieces[depth] = sourceStack.pieceAt(depth);
+        result.positionHash ^= zobristValue(move.sourceHex, depth, movedPieces[depth]);
     }
-    src.clear();
+    sourceStack.clear();
 
-    auto place = [&](uint8_t to, Piece p) {
-        Hex& dst = n.hexes[to];
-        n.hash ^= zob(to, dst.height(), p);  // new depth, so hash in at that depth
-        dst.push(p);
-        if (p == Piece::WK) n.whiteKernelHex = to;
-        if (p == Piece::BK) n.blackKernelHex = to;
+    const auto placePiece = [&](uint8_t destinationHex, Piece piece)
+    {
+        Hex& destinationStack = result.hexes[destinationHex];
+        result.positionHash ^= zobristValue(destinationHex, destinationStack.height(), piece);
+        destinationStack.pushPiece(piece);
+        if (piece == Piece::whiteKernel)
+            result.whiteKernelIndex = destinationHex;
+        if (piece == Piece::blackKernel)
+            result.blackKernelIndex = destinationHex;
     };
 
-    if (!m.splitting)
+    if (!move.splitsStack)
     {
-        for (uint8_t i = 0; i < h; ++i) place(dest, buf[i]);  // order preserved
+        for (uint8_t depth = 0; depth < stackHeight; ++depth)
+            placePiece(static_cast<uint8_t>(destination), movedPieces[depth]);
     }
     else
     {
-        int8_t cur = static_cast<int8_t>(m.from);
-        for (uint8_t i = 0; i < h; ++i)
+        int8_t currentHex = static_cast<int8_t>(move.sourceHex);
+        for (uint8_t depth = 0; depth < stackHeight; ++depth)
         {
-            cur = kNeighbour[cur][m.dir];
-            place(static_cast<uint8_t>(cur), buf[i]);  // bottom piece lands first
+            currentHex = neighboringHexes[currentHex][move.direction];
+            placePiece(static_cast<uint8_t>(currentHex), movedPieces[depth]);
         }
     }
 
-    n.whiteToMove = !n.whiteToMove;
-    n.hash ^= kZobrist.blackToMove;
-    ++n.ply;
-    n.staleness = seized ? 0 : static_cast<uint16_t>(n.staleness + 1);
-    n.repeats   = 1;
-    return n;
+    result.whiteToMove = !result.whiteToMove;
+    result.positionHash ^= zobristTable.blackToMove;
+    ++result.plyCount;
+    result.stalenessCount = capturedStack ? 0 : static_cast<uint16_t>(result.stalenessCount + 1);
+    result.repetitionCount = 1;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
 
-void generateLegal(Board& b)
+void generateLegalMoves(Board& board)
 {
-    b.clearLegal();
+    board.clearLegal();
 
-    const bool me = b.whiteToMove;
+    const bool moverIsWhite = board.whiteToMove;
 
-    for (uint8_t from = 0; from < kNumHexes; ++from)
+    for (uint8_t sourceHex = 0; sourceHex < hexCount; ++sourceHex)
     {
-        if (!b.controls(from)) continue;
-        const uint8_t h = b.hexes[from].height();
+        if (!board.controls(sourceHex))
+            continue;
 
-        for (uint8_t d = 0; d < kNumDirs; ++d)
+        const uint8_t stackHeight = board.hexes[sourceHex].height();
+
+        for (uint8_t direction = 0; direction < directionCount; ++direction)
         {
-            // Both move types span exactly h hexes, so both need this endpoint.
-            // Stacks taller than kMovableMax can never satisfy it - they are
-            // frozen for the rest of the game.
-            if (ray(from, d, h) < 0) continue;
+            // Both move types have the same endpoint. A stack taller than six can
+            // never have a valid endpoint on this board and is permanently frozen.
+            if (destinationHex(sourceHex, direction, stackHeight) < 0)
+                continue;
 
-            for (int sp = 0; sp < 2; ++sp)
+            for (bool splitsStack : {false, true})
             {
-                // For h == 1 a split is the same move as a simple move.
-                if (sp == 1 && h < 2) continue;
-
-                const Move mv{from, d, sp == 1};
-                const Board next = applyRaw(b, mv);
-
-                // Read the kernel hexes from `next`, not `b` - the move may have
-                // carried a kernel somewhere else.
-                const uint8_t myKernel    = me ? next.whiteKernelHex : next.blackKernelHex;
-                const uint8_t theirKernel = me ? next.blackKernelHex : next.whiteKernelHex;
-
-                // Splitting scatters the stack bottom-first, and the lower
-                // pieces may be the opponent's - so a move can hand them your
-                // own kernel. Check that before anything else.
-                if (controlledBy(next, myKernel, !me)) continue;
-
-                // Capturing their kernel ends the game, so our own safety is moot.
-                if (controlledBy(next, theirKernel, me))
-                {
-                    b.setLegal(mv.id());
-                    ++b.moveCount;
+                // Splitting a one-piece stack is identical to moving it intact.
+                if (splitsStack && stackHeight < 2)
                     continue;
-                }
 
-                if (kernelAttacked(next, myKernel, !me)) continue;
+                const Move move{sourceHex, direction, splitsStack};
+                const Board nextBoard = applyMoveWithoutUpdatingState(board, move);
 
-                b.setLegal(mv.id());
-                ++b.moveCount;
+                // The move may have carried the mover's kernel somewhere else.
+                const uint8_t moverKernel = moverIsWhite ? nextBoard.whiteKernelIndex : nextBoard.blackKernelIndex;
+
+                // A split can expose an opposing piece above the mover's own
+                // kernel. That is an immediate loss of control, not merely check.
+                if (isControlledBy(nextBoard, moverKernel, !moverIsWhite))
+                    continue;
+
+                // The server requires the mover's kernel to be safe even if this
+                // move also captures the opposing kernel.
+                if (isKernelAttacked(nextBoard, moverKernel, !moverIsWhite))
+                    continue;
+
+                board.setLegal(move.id());
+                ++board.legalMoveCount;
             }
         }
     }
@@ -242,157 +271,187 @@ namespace
 
 // Both adjudicated endings score the same way: most controlled stacks, then most
 // enemy pieces held inside those stacks, then a draw.
-State adjudicate(const Board& b)
+State adjudicate(const Board& board)
 {
-    int stacks[2]{};     // [0] white, [1] black
+    constexpr int white = 0;
+    constexpr int black = 1;
+    int controlledStacks[2]{};
     int prisoners[2]{};
 
-    for (uint8_t i = 0; i < kNumHexes; ++i)
+    for (uint8_t hex = 0; hex < hexCount; ++hex)
     {
-        const Hex&  hx = b.hexes[i];
-        const Piece t  = hx.top();
-        if (t == Piece::Empty) continue;
+        const Hex& stack = board.hexes[hex];
+        const Piece controllingPiece = stack.topPiece();
+        if (controllingPiece == Piece::empty)
+            continue;
 
-        const int controller = isWhite(t) ? 0 : 1;
-        ++stacks[controller];
-        for (uint8_t d = 0; d < hx.height(); ++d)
-            if (isWhite(hx.at(d)) != isWhite(t)) ++prisoners[controller];
+        const int controller = isWhitePiece(controllingPiece) ? white : black;
+        ++controlledStacks[controller];
+        for (uint8_t depth = 0; depth < stack.height(); ++depth)
+        {
+            if (isWhitePiece(stack.pieceAt(depth)) != isWhitePiece(controllingPiece))
+                ++prisoners[controller];
+        }
     }
 
-    if (stacks[0] != stacks[1])
-        return stacks[0] > stacks[1] ? State::WhiteWins : State::BlackWins;
-    if (prisoners[0] != prisoners[1])
-        return prisoners[0] > prisoners[1] ? State::WhiteWins : State::BlackWins;
-    return State::Draw;
+    if (controlledStacks[white] != controlledStacks[black])
+        return controlledStacks[white] > controlledStacks[black] ? State::whiteWins : State::blackWins;
+    if (prisoners[white] != prisoners[black])
+        return prisoners[white] > prisoners[black] ? State::whiteWins : State::blackWins;
+    return State::draw;
 }
 
 } // namespace
 
-Board apply(const Board& b, Move m, std::span<const uint64_t> history)
+Board applyMove(const Board& board, Move move, std::span<const uint64_t> positionHistory)
 {
-    const bool mover = b.whiteToMove;
-    Board n = applyRaw(b, m);
+    assert(board.isLegal(move.id()));
+
+    const bool moverIsWhite = board.whiteToMove;
+    Board result = applyMoveWithoutUpdatingState(board, move);
 
     // Kernel capture. Check both: a split can lose you your own kernel.
-    const bool theirsTaken = controlledBy(n, mover ? n.blackKernelHex : n.whiteKernelHex, mover);
-    const bool oursTaken   = controlledBy(n, mover ? n.whiteKernelHex : n.blackKernelHex, !mover);
+    const uint8_t opponentKernel = moverIsWhite ? result.blackKernelIndex : result.whiteKernelIndex;
+    const uint8_t moverKernel = moverIsWhite ? result.whiteKernelIndex : result.blackKernelIndex;
+    const bool opponentKernelCaptured = isControlledBy(result, opponentKernel, moverIsWhite);
+    const bool moverKernelCaptured = isControlledBy(result, moverKernel, !moverIsWhite);
 
-    if (theirsTaken || oursTaken)
+    if (opponentKernelCaptured || moverKernelCaptured)
     {
-        // If somehow both, the mover wins - they completed their move. This is a
-        // corner case worth confirming against the server.
-        const bool winnerIsWhite = theirsTaken ? mover : !mover;
-        n.state = winnerIsWhite ? State::WhiteWins : State::BlackWins;
-        return n;
+        // A legal move cannot leave the mover's kernel captured. Keep both checks
+        // because this function's precondition is enforced only in debug builds.
+        const bool winnerIsWhite = opponentKernelCaptured ? moverIsWhite : !moverIsWhite;
+        result.state = winnerIsWhite ? State::whiteWins : State::blackWins;
+        return result;
     }
 
-    generateLegal(n);
+    generateLegalMoves(result);
 
     // No legal moves for the side to move: they lose.
-    if (n.moveCount == 0)
+    if (result.legalMoveCount == 0)
     {
-        n.state = n.whiteToMove ? State::BlackWins : State::WhiteWins;
-        return n;
+        result.state = result.whiteToMove ? State::blackWins : State::whiteWins;
+        return result;
     }
 
-    // Repetition. Needs the path, not just the position.
-    if (!history.empty())
+    if (!positionHistory.empty())
     {
-        int seen = 1;  // n itself
-        for (uint64_t past : history)
-            if (past == n.hash) ++seen;
-        n.repeats = static_cast<uint8_t>(seen);
-        if (seen >= kRepetitionLimit)
+        int occurrenceCount = 1; // Include the newly created position.
+        for (uint64_t previousHash : positionHistory)
         {
-            n.state = State::Draw;
-            return n;
+            if (previousHash == result.positionHash)
+                ++occurrenceCount;
+        }
+
+        result.repetitionCount = static_cast<uint8_t>(occurrenceCount);
+        if (occurrenceCount >= repetitionLimit)
+        {
+            result.state = State::draw;
+            return result;
         }
     }
 
-    if (n.staleness >= kStalenessLimit || n.ply >= kMoveCap)
-        n.state = adjudicate(n);
+    if (result.stalenessCount >= stalenessLimit || result.plyCount >= moveLimit)
+        result.state = adjudicate(result);
 
-    return n;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
 
-Board startPosition()
+Board createStartingBoard()
 {
-    return fromString("-3,1:W;-3,3:W;-2,-1:B;-2,1:W;-2,3:W;-1,-1:B;-1,1:W;-1,2:WK;-1,3:W;0,-3:B;0,-1:B;0,1:W;"
+    return parseBoard("-3,1:W;-3,3:W;-2,-1:B;-2,1:W;-2,3:W;-1,-1:B;-1,1:W;-1,2:WK;-1,3:W;0,-3:B;0,-1:B;0,1:W;"
                       "0,3:W;1,-3:B;1,-2:BK;1,-1:B;1,1:W;2,-3:B;2,-1:B;2,1:W;3,-3:B;3,-1:B");
 }
 
-Board fromString(const std::string& s, bool whiteToMove)
+Board parseBoard(const std::string& serializedBoard, bool whiteToMove)
 {
-    Board b{};
-    b.whiteToMove = whiteToMove;
+    Board board{};
+    board.whiteToMove = whiteToMove;
 
-    size_t i = 0;
-    while (i < s.size())
+    size_t entryStart = 0;
+    while (entryStart < serializedBoard.size())
     {
-        size_t end = s.find(';', i);
-        if (end == std::string::npos) end = s.size();
+        size_t entryEnd = serializedBoard.find(';', entryStart);
+        if (entryEnd == std::string::npos)
+            entryEnd = serializedBoard.size();
 
-        const std::string entry = s.substr(i, end - i);
+        const std::string entry = serializedBoard.substr(entryStart, entryEnd - entryStart);
         const size_t colon = entry.find(':');
         const size_t comma = entry.find(',');
         if (colon != std::string::npos && comma != std::string::npos && comma < colon)
         {
             const int q = std::atoi(entry.substr(0, comma).c_str());
             const int r = std::atoi(entry.substr(comma + 1, colon - comma - 1).c_str());
-            const int8_t idx = hexIndex(q, r);
-            if (idx >= 0)
+            const int8_t hex = hexIndex(q, r);
+            if (hex >= 0)
             {
                 // Stack letters run bottom to top: W, B, WK, BK.
-                const std::string stack = entry.substr(colon + 1);
-                for (size_t c = 0; c < stack.size(); ++c)
+                const std::string stackText = entry.substr(colon + 1);
+                for (size_t character = 0; character < stackText.size(); ++character)
                 {
-                    const bool kernel = (c + 1 < stack.size() && stack[c + 1] == 'K');
-                    Piece p = Piece::Empty;
-                    if (stack[c] == 'W') p = kernel ? Piece::WK : Piece::WN;
-                    if (stack[c] == 'B') p = kernel ? Piece::BK : Piece::BN;
-                    if (p != Piece::Empty) b.hexes[idx].push(p);
-                    if (kernel) ++c;
+                    const bool isKernel = character + 1 < stackText.size() && stackText[character + 1] == 'K';
+                    Piece piece = Piece::empty;
+                    if (stackText[character] == 'W')
+                        piece = isKernel ? Piece::whiteKernel : Piece::white;
+                    if (stackText[character] == 'B')
+                        piece = isKernel ? Piece::blackKernel : Piece::black;
+
+                    if (piece != Piece::empty)
+                        board.hexes[hex].pushPiece(piece);
+                    if (isKernel)
+                        ++character;
                 }
             }
         }
-        i = end + 1;
+        entryStart = entryEnd + 1;
     }
 
-    refreshKernels(b);
-    b.hash = computeHash(b);
-    generateLegal(b);
-    return b;
+    refreshKernelPositions(board);
+    board.positionHash = computeHash(board);
+    generateLegalMoves(board);
+    return board;
 }
 
-std::string toString(const Board& b)
+std::string serializeBoard(const Board& board)
 {
-    std::string out;
-    for (uint8_t i = 0; i < kNumHexes; ++i)
+    std::string result;
+    for (uint8_t hex = 0; hex < hexCount; ++hex)
     {
-        const Hex& hx = b.hexes[i];
-        if (hx.empty()) continue;
-        if (!out.empty()) out += ';';
+        const Hex& stack = board.hexes[hex];
+        if (stack.isEmpty())
+            continue;
+        if (!result.empty())
+            result += ';';
 
-        char coord[16];
-        std::snprintf(coord, sizeof coord, "%d,%d", kCoordinates[i].q, kCoordinates[i].r);
-        out += coord;
-        out += ':';
+        char coordinateText[16];
+        std::snprintf(coordinateText, sizeof coordinateText, "%d,%d", coordinates[hex].q, coordinates[hex].r);
+        result += coordinateText;
+        result += ':';
 
-        for (uint8_t d = 0; d < hx.height(); ++d)
+        for (uint8_t depth = 0; depth < stack.height(); ++depth)
         {
-            switch (hx.at(d))
+            switch (stack.pieceAt(depth))
             {
-                case Piece::WN: out += "W";  break;
-                case Piece::WK: out += "WK"; break;
-                case Piece::BN: out += "B";  break;
-                case Piece::BK: out += "BK"; break;
-                default: break;
+                case Piece::white:
+                    result += "W";
+                    break;
+                case Piece::whiteKernel:
+                    result += "WK";
+                    break;
+                case Piece::black:
+                    result += "B";
+                    break;
+                case Piece::blackKernel:
+                    result += "BK";
+                    break;
+                case Piece::empty:
+                    std::unreachable();
             }
         }
     }
-    return out;
+    return result;
 }
 
 // ===========================================================================
@@ -405,87 +464,102 @@ namespace
 // Swapping colours for Black lands exactly on the Piece enum's own numbering, so
 // the perspective code is just the swapped enum value: 0 empty, 1 my normal,
 // 2 my kernel, 3 their normal, 4 their kernel.
-constexpr int perspectiveCode(Piece p, bool whiteToMove)
+constexpr int perspectiveCode(Piece piece, bool whiteToMove)
 {
-    return static_cast<int>(whiteToMove ? p : kSwapColour[static_cast<uint8_t>(p)]);
+    return static_cast<int>(whiteToMove ? piece : swappedPieceColors[static_cast<uint8_t>(piece)]);
 }
 
 } // namespace
 
-void encode(const Board& b, std::span<float, kEncodedSize> out)
+void encodeBoard(const Board& board, std::span<float, encodedBoardSize> output)
 {
-    std::ranges::fill(out, 0.0f);
+    assert(board.repetitionCount >= 1);
+    std::ranges::fill(output, 0.0f);
 
-    const bool  me    = b.whiteToMove;
-    const float scale = 1.0f / kPiecesPerSide;
+    const bool moverIsWhite = board.whiteToMove;
+    const float countScale = 1.0f / piecesPerPlayer;
 
-    int myStacks = 0, theirStacks = 0, myPrisoners = 0, theirPrisoners = 0;
+    int ownStackCount = 0;
+    int opponentStackCount = 0;
+    int ownPrisonerCount = 0;
+    int opponentPrisonerCount = 0;
 
-    for (int token = 0; token < kNumHexes; ++token)
+    for (int token = 0; token < hexCount; ++token)
     {
-        const uint8_t source = me ? static_cast<uint8_t>(token) : kFlipped[token];
-        const Hex&    hx     = b.hexes[source];
-        const uint8_t height = hx.height();
-        float* const  block  = out.data() + token * kHexFeatures;
+        const uint8_t absoluteHex = moverIsWhite ? static_cast<uint8_t>(token) : rotatedHexes[token];
+        const Hex& stack = board.hexes[absoluteHex];
+        const uint8_t stackHeight = stack.height();
+        float* const features = output.data() + token * featuresPerHex;
 
-        // Hex::at reports Empty past the top, which is code 0, so short stacks
-        // pad themselves.
-        for (uint8_t d = 0; d < kSlotDepth; ++d)
-            block[kOffSlots + d * kPieceCodes + perspectiveCode(hx.at(d), me)] = 1.0f;
-
-        block[kOffHeight + std::min<int>(height, kMovableMax + 1)] = 1.0f;
-        block[kOffTop + perspectiveCode(hx.top(), me)]             = 1.0f;
-
-        int mine = 0, theirs = 0;
-        for (uint8_t d = 0; d < height; ++d)
+        // pieceAt() reports empty past the top, so short stacks pad themselves.
+        for (uint8_t depth = 0; depth < encodedStackDepth; ++depth)
         {
-            const int code = perspectiveCode(hx.at(d), me);
-            if (code <= 2) ++mine; else ++theirs;
-            if (code == 2) block[kOffKernels] = 1.0f;
-            if (code == 4) block[kOffKernels + 1] = 1.0f;
+            const int pieceCode = perspectiveCode(stack.pieceAt(depth), moverIsWhite);
+            features[stackSlotsOffset + depth * pieceCodeCount + pieceCode] = 1.0f;
         }
-        block[kOffCounts]     = static_cast<float>(mine) * scale;
-        block[kOffCounts + 1] = static_cast<float>(theirs) * scale;
 
-        if (height > 0)
+        features[stackHeightOffset + std::min<int>(stackHeight, maximumMovableStackHeight + 1)] = 1.0f;
+        features[topPieceOffset + perspectiveCode(stack.topPiece(), moverIsWhite)] = 1.0f;
+
+        int ownPieces = 0;
+        int opponentPieces = 0;
+        for (uint8_t depth = 0; depth < stackHeight; ++depth)
         {
-            if (perspectiveCode(hx.top(), me) <= 2)
+            const int pieceCode = perspectiveCode(stack.pieceAt(depth), moverIsWhite);
+            if (pieceCode <= 2)
+                ++ownPieces;
+            else
+                ++opponentPieces;
+
+            if (pieceCode == 2)
+                features[kernelPresenceOffset] = 1.0f;
+            if (pieceCode == 4)
+                features[kernelPresenceOffset + 1] = 1.0f;
+        }
+        features[pieceCountsOffset] = static_cast<float>(ownPieces) * countScale;
+        features[pieceCountsOffset + 1] = static_cast<float>(opponentPieces) * countScale;
+
+        if (stackHeight > 0)
+        {
+            if (perspectiveCode(stack.topPiece(), moverIsWhite) <= 2)
             {
-                ++myStacks;
-                myPrisoners += theirs;
+                ++ownStackCount;
+                ownPrisonerCount += opponentPieces;
             }
             else
             {
-                ++theirStacks;
-                theirPrisoners += mine;
+                ++opponentStackCount;
+                opponentPrisonerCount += ownPieces;
             }
         }
 
-        for (uint8_t dir = 0; dir < kNumDirs; ++dir)
+        for (uint8_t relativeDirection = 0; relativeDirection < directionCount; ++relativeDirection)
         {
-            const uint8_t absolute = me ? dir : opposite(dir);
-            for (int splitting = 0; splitting < 2; ++splitting)
+            const uint8_t absoluteDirection = moverIsWhite ? relativeDirection : oppositeDirection(relativeDirection);
+            for (int splitsStack = 0; splitsStack < 2; ++splitsStack)
             {
-                const uint16_t id = static_cast<uint16_t>((source * kNumDirs + absolute) * 2 + splitting);
-                block[kOffLegal + dir * 2 + splitting] = b.isLegal(id) ? 1.0f : 0.0f;
+                const Move move{absoluteHex, absoluteDirection, splitsStack != 0};
+                features[legalMovesOffset + relativeDirection * 2 + splitsStack] =
+                    board.isLegal(move.id()) ? 1.0f : 0.0f;
             }
         }
     }
 
-    float* const globals = out.data() + kNumHexes * kHexFeatures;
+    float* const globalFeatures = output.data() + hexCount * featuresPerHex;
 
-    globals[kGlobalPly]       = std::min<float>(static_cast<float>(b.ply), kMoveCap) / kMoveCap;
-    globals[kGlobalStaleness] = std::min<float>(static_cast<float>(b.staleness), kStalenessLimit) / kStalenessLimit;
-    globals[kGlobalRepeats]   = std::min<float>(static_cast<float>(b.repeats - 1), kRepetitionLimit - 1)
-                              / (kRepetitionLimit - 1);
+    globalFeatures[globalMoveNumberIndex] = std::min<float>(static_cast<float>(board.plyCount), moveLimit) / moveLimit;
+    globalFeatures[globalStalenessIndex] =
+        std::min<float>(static_cast<float>(board.stalenessCount), stalenessLimit) / stalenessLimit;
+    globalFeatures[globalRepetitionIndex] =
+        std::min<float>(static_cast<float>(board.repetitionCount - 1), repetitionLimit - 1) / (repetitionLimit - 1);
 
-    globals[kGlobalMyStacks]       = static_cast<float>(myStacks) * scale;
-    globals[kGlobalTheirStacks]    = static_cast<float>(theirStacks) * scale;
-    globals[kGlobalMyPrisoners]    = static_cast<float>(myPrisoners) * scale;
-    globals[kGlobalTheirPrisoners] = static_cast<float>(theirPrisoners) * scale;
-    globals[kGlobalInCheck]        = kernelAttacked(b, b.ownKernelHex(), !me) ? 1.0f : 0.0f;
+    globalFeatures[globalOwnStackCountIndex] = static_cast<float>(ownStackCount) * countScale;
+    globalFeatures[globalOpponentStackCountIndex] = static_cast<float>(opponentStackCount) * countScale;
+    globalFeatures[globalOwnPrisonerCountIndex] = static_cast<float>(ownPrisonerCount) * countScale;
+    globalFeatures[globalOpponentPrisonerCountIndex] = static_cast<float>(opponentPrisonerCount) * countScale;
+    globalFeatures[globalInCheckIndex] = isKernelAttacked(board, board.ownKernelIndex(), !moverIsWhite) ? 1.0f : 0.0f;
 
-    assert(std::ranges::all_of(out, [](float v) { return v >= 0.0f && v <= 1.0f; }));
+    assert(std::ranges::all_of(output, [](float value) { return value >= 0.0f && value <= 1.0f; }));
 }
 
 } // namespace amoeba
