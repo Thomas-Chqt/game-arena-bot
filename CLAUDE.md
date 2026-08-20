@@ -197,11 +197,15 @@ bytes. Splitting hot (~24 B) from cold would fix it, and is not worth doing whil
 ### The deadline
 
 `Config::deadline` stops the search on the clock as well as on the simulation count, whichever comes
-first, and always runs one batch so the visit counts can never be empty. `bot.cpp` sets the count
-high (20000) and lets the clock bind at 4 s against the server's 5 s; `train.cpp` leaves the deadline
-at its hour default so its data does not depend on how busy the machine was. A 200-simulation search
-at 16 leaves is tens of milliseconds, so the limit is comfortable — the deadline is what makes that
-safe rather than merely likely.
+first, and always runs one batch so the visit counts can never be empty. **Nothing sets it any
+more** — both programs leave it at its hour default, so neither's play depends on how busy the machine
+was. `bot.cpp` runs to 800 simulations and reports how long that took; the server's 5 s is not
+enforced, and the elapsed time in the log is what says whether it needs to be.
+
+The mechanism stays because that is a measurement, not a guarantee, and the moment a turn does have
+to be bounded this is where the bound goes. **The clock starts when the search does**, not when the
+root is set: `bot.cpp` re-roots the moment it hears the opponent's move and only searches when it is
+asked to, and the wait in between must not count against a turn.
 
 ### Deliberately absent
 
@@ -293,9 +297,10 @@ deterministic evaluator, games played with reuse and without are the same game, 
 - **Fresh Dirichlet noise goes on each new root.** What the subtree inherited are the network's own
   priors — noise only ever went on the root above it — and the handful of moves the last search was
   told to promote should not go on being promoted.
-- **The clock starts when the search does**, not when the root is set: match play re-roots the moment
-  it hears the opponent's move and only searches when it is asked to, and the wait in between is not
-  part of its turn.
+- **Fresh visit counts are not what the log reports.** `bot.cpp` prints the simulations behind the
+  move as the sum of the root's counts, and that sum is the full `kSimulations` — part of it inherited
+  from an earlier turn rather than run just now. Still 800 simulations behind the move, just not 800
+  new ones.
 
 ### Verification
 
@@ -456,10 +461,12 @@ queues game after game and only returns on error. Four callbacks, same shape as 
   any log. It is also how a promotion by a trainer running alongside gets picked up.
 - **`kLeaves` is 16, not 1.** One game means the batch can only come from inside the one search, so
   virtual loss earns its keep here and nowhere else.
-- **The search is deadline-bound, not count-bound.** `kSimulations` is 20000 and `kTurnBudget` is 4 s
-  against the server's 5 s. The count is simulations *through the root*, so a re-rooted tree spends
-  fewer of the 4 s getting to the same place. The trainer may be holding the GPU, and a turn that arrives late is a
-  forfeit while a turn that only managed 300 simulations is merely a weaker move.
+- **The search is count-bound, not deadline-bound.** `kSimulations` is 800 and there is no clock, so
+  the move logged is always the one 800 simulations chose. Those are simulations *through the root*,
+  so a re-rooted tree reaches 800 with fewer new evaluations and the reply lands sooner. Nothing
+  enforces the server's 5 s — `on_move` times the whole reply, sync and translation included, and
+  prints it next to the visit count and the root's legal-move count so a flat distribution can be
+  told apart from a truncated one.
 - **Every callback is wrapped in `guarded()`.** A C++ exception unwinding through the SDK's C frames
   is undefined behaviour. An unanswered turn times out and loses one game; a crash loses every game
   that would have followed.

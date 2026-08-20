@@ -719,8 +719,7 @@ int main(int argc, char** argv)
         bot::report("");
         bot::report("======== generation {} ========", generation);
 
-        std::vector<bot::Sample> fresh =
-            bot::selfPlay(*best, settings, settings.seed + static_cast<uint64_t>(generation) * 1000);
+        std::vector<bot::Sample> fresh = bot::selfPlay(*best, settings, settings.seed + static_cast<uint64_t>(generation) * 1000);
 
         // Game ids have to stay unique across generations, or splitByGame will hold
         // out a game from this generation and train on a different one with the same

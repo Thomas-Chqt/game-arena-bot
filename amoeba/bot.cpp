@@ -26,10 +26,12 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <print>
@@ -44,18 +46,19 @@ namespace bot
 namespace
 {
 
-// 5 s a move on the server. The simulation count is generous and the deadline
-// is what actually ends the search: the trainer may be running on the same
-// machine and holding the GPU, and a turn that arrives late is a forfeit, while
-// a turn that ran only 300 simulations is merely a weaker move.
+// Every search runs to the full simulation count - there is no clock on it, so
+// the move logged is always the one 800 simulations chose and the elapsed time
+// is a measurement rather than a limit. The server allows 5 s a move, and
+// nothing here enforces that. The count is simulations *through the root*, so a
+// re-rooted tree arrives having spent part of it on an earlier turn: still 800
+// simulations behind the move, just not 800 new ones.
 //
 // Leaves are batched 16 at a time because the network costs 1.70 ms for a single
 // position and 0.16 ms each for 64 - one position per forward pass would spend
 // the whole turn on overhead. Self-play fills its batch from the other games in
 // flight and needs none of this; a match has one game and no such option.
-constexpr int                       kSimulations = 20000;
-constexpr int                       kLeaves      = 16;
-constexpr std::chrono::milliseconds kTurnBudget{4000};
+constexpr int kSimulations = 800;
+constexpr int kLeaves      = 16;
 
 // A C++ exception unwinding through the SDK's C frames is undefined behaviour,
 // so nothing may leave a callback. A turn that goes unanswered times out and
@@ -222,7 +225,10 @@ void syncToServer(Context& context, const char* serverBoard, arena_side_t curren
 // Callbacks
 // ---------------------------------------------------------------------------
 
-const ServerMove& chooseMove(Context& context, const std::vector<ServerMove>& moves)
+// The clock starts when the callback does, not when the search does: the server
+// times the whole reply, so sync and translation count against the budget too.
+const ServerMove& chooseMove(Context& context, const std::vector<ServerMove>& moves,
+                             std::chrono::steady_clock::time_point turnStart)
 {
     if (context.board.state != amoeba::State::Ongoing)
     {
@@ -241,7 +247,12 @@ const ServerMove& chooseMove(Context& context, const std::vector<ServerMove>& mo
         return moves.front();
     }
 
-    std::println("[bot] ply {}: {} -> {}{}  {}/{} visits", context.board.ply, found->from, found->to, found->move.splitting ? " sow" : "", counts[chosen], kSimulations);
+    const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - turnStart;
+    const uint32_t simulations = std::accumulate(counts.begin(), counts.end(), uint32_t{0});
+    std::println("[bot] ply {}: {} -> {}{}  {}/{} visits over {} moves in {:.0f} ms ({:.2f} s)",
+                 context.board.ply, found->from, found->to, found->move.splitting ? " sow" : "",
+                 counts[chosen], simulations, context.board.moveCount, elapsed.count(),
+                 elapsed.count() / 1000.0);
     return *found;
 }
 
@@ -249,9 +260,7 @@ void loadNetwork(Context& context)
 {
     context.network = std::make_unique<Network>(context.weights);
     context.evaluator = std::make_unique<NetworkEvaluator>(*context.network);
-    context.search.emplace(Config{.simulations = kSimulations,
-                                  .deadline    = kTurnBudget,
-                                  .batchSize   = kLeaves});
+    context.search.emplace(Config{.simulations = kSimulations, .batchSize = kLeaves});
 
     std::println("[bot] {}: {} blocks, width {}, {} heads, {} parameters",
                  context.weights.filename().string(), context.network->shape().blocks,
@@ -276,6 +285,8 @@ void onGameStart(const arena_game_state_t* state, void* userData)
 void onMove(const arena_game_state_t* state, arena_move_t* output, void* userData)
 {
     guarded("on_move", [&] {
+        const std::chrono::steady_clock::time_point turnStart = std::chrono::steady_clock::now();
+
         Context& context = *static_cast<Context*>(userData);
         if (!context.search.has_value())
         {
@@ -292,7 +303,7 @@ void onMove(const arena_game_state_t* state, arena_move_t* output, void* userDat
             return;
         }
 
-        const ServerMove& chosen = chooseMove(context, moves);
+        const ServerMove& chosen = chooseMove(context, moves, turnStart);
 
         // The SDK owns these strings for the duration of the callback, and they
         // carry the server's own spelling of the move.
