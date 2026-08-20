@@ -3,12 +3,15 @@
 // in a .safetensors file, so either can be killed and restarted without the
 // other noticing.
 //
-//   amoeba_bot [weights.safetensors]
+//   amoeba_bot <weights.safetensors>
 //
-// With no argument it takes the first .safetensors file in the working
-// directory - the same one amoeba_train writes to. Credentials come from
-// BOT1_ID and BOT1_KEY; ROOM_ID picks a practice room, and without it the bot
-// queues for ranked games back to back.
+// The path is required and must exist: this program never trains and never
+// writes weights, so there is nothing sensible to do without them, and guessing
+// at which file to load is how you end up playing rated games with a network you
+// did not mean to. Point it at the file amoeba_train is writing to.
+//
+// Credentials come from BOT1_ID and BOT1_KEY; ROOM_ID picks a practice room, and
+// without it the bot queues for ranked games back to back.
 //
 // The SDK side is the same shape as the random bot in the reference: fill
 // arena_move_t with the strings the server sent, and copy the piece's splitting
@@ -30,6 +33,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -330,28 +334,19 @@ void onDisconnect(const char* reason, void*)
     std::println(stderr, "[bot] disconnected: {}", reason == nullptr ? "unknown reason" : reason);
 }
 
-// The trainer writes one file and keeps writing to it, so with no argument
-// there is normally exactly one candidate in the directory.
-std::filesystem::path firstCheckpointHere()
-{
-    std::vector<std::filesystem::path> found;
-    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator("."))
-        if (entry.path().extension() == ".safetensors")
-            found.push_back(entry.path());
-
-    if (found.empty())
-        throw std::runtime_error("no .safetensors file here - name one, or run amoeba_train first");
-
-    std::ranges::sort(found);
-    return found.front();
-}
-
 } // namespace
 
 } // namespace bot
 
 int main(int argc, char** argv)
 {
+    if (argc != 2)
+    {
+        std::println(stderr, "usage: amoeba_bot <weights.safetensors>");
+        std::println(stderr, "  the file must exist - this program only ever reads it");
+        return EXIT_FAILURE;
+    }
+
     const char* botId  = std::getenv("BOT1_ID");
     const char* apiKey = std::getenv("BOT1_KEY");
     if (botId == nullptr || apiKey == nullptr)
@@ -363,7 +358,9 @@ int main(int argc, char** argv)
     bot::Context context;
     try
     {
-        context.weights = argc > 1 ? std::filesystem::path{argv[1]} : bot::firstCheckpointHere();
+        context.weights = std::filesystem::path{argv[1]};
+        if (!std::filesystem::exists(context.weights))
+            throw std::runtime_error(std::format("{} does not exist", context.weights.string()));
         bot::loadNetwork(context);
     }
     catch (const std::exception& error)

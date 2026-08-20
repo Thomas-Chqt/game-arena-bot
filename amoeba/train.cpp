@@ -1,12 +1,13 @@
 // amoeba_train: improves a network by playing it against itself, forever.
 //
-//   amoeba_train [weights.safetensors]
+//   amoeba_train <weights.safetensors>
 //
-// With no argument it takes the first .safetensors file in the working directory,
-// and starts from random weights if there are none. Whenever a generation beats
-// the one before it, the new weights are written back over that same file - which
-// is the file amoeba_bot reads, so a bot running alongside picks the improvement
-// up at its next game.
+// The path is required and is created from random weights if it does not exist -
+// naming the file is how you say whether this is a new run or a continued one, and
+// guessing at it was one silent way to resume the wrong network. Whenever a
+// generation beats the one before it, the new weights are written back over that
+// same file, which is the file amoeba_bot reads, so a bot running alongside picks
+// the improvement up at its next game.
 //
 // One generation is three steps:
 //
@@ -189,7 +190,7 @@ struct Settings
     // A quarter of self-play's field, because a gate that stops early throws away
     // whatever is still in flight. settled() needs twenty games in, and twenty of a
     // field of 64 land well before the other 44 - which are then abandoned.
-    int gateConcurrent = envInt("GATE_CONCURRENT", 64);
+    int gateConcurrent = envInt("GATE_CONCURRENT", 256);
 
     // Ranking two networks needs far less search than generating a training
     // target does: the visit counts are thrown away here, only the result counts.
@@ -783,26 +784,22 @@ double gate(const Network& candidate, const Network& champion, const Settings& s
 
 // ---------------------------------------------------------------------------
 
-std::filesystem::path firstCheckpointHere()
-{
-    std::vector<std::filesystem::path> found;
-    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator("."))
-        if (entry.path().extension() == ".safetensors")
-            found.push_back(entry.path());
-
-    std::ranges::sort(found);
-    return found.empty() ? std::filesystem::path{"amoeba.safetensors"} : found.front();
-}
-
 } // namespace
 
 } // namespace bot
 
 int main(int argc, char** argv)
 {
+    if (argc != 2)
+    {
+        std::println(stderr, "usage: amoeba_train <weights.safetensors>");
+        std::println(stderr, "  created from random weights if it does not exist, and written back to");
+        std::println(stderr, "  whenever a generation beats the one before it");
+        return EXIT_FAILURE;
+    }
+
     const bot::Settings         settings;
-    const std::filesystem::path weights =
-        argc > 1 ? std::filesystem::path{argv[1]} : bot::firstCheckpointHere();
+    const std::filesystem::path weights{argv[1]};
 
     // Generation 0 is random weights, written straight away so that amoeba_bot has
     // something to load while the first generation is still being played.

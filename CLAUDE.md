@@ -347,9 +347,9 @@ starts a thread per game.
 
 ## Trainer
 
-`amoeba/train.cpp` -> `amoeba_train`. Takes an optional `.safetensors` path; with no argument it uses
-the first one in the working directory, and starts from random weights if there are none. It loops
-forever, and **writes back over that same file whenever a generation passes the gate** — which is the
+`amoeba/train.cpp` -> `amoeba_train`. **The `.safetensors` path is a required argument** and is
+created from random weights if it does not exist. It loops forever, and **writes back over that same
+file whenever a generation passes the gate** — which is the
 file `amoeba_bot` reads, so a bot running alongside picks the improvement up at its next game.
 
 One generation is three steps: play `GAMES` games of the current best against itself into a replay
@@ -463,8 +463,9 @@ shape comes out of the checkpoint), `SEED GAMES CONCURRENT SIMULATIONS LEAVES SA
 
 ## Arena client
 
-`amoeba/bot.cpp` -> `amoeba_bot`. Takes an optional `.safetensors` path, defaulting to the first one
-in the working directory. Credentials are `BOT1_ID` and `BOT1_KEY`, the same as the reference random
+`amoeba/bot.cpp` -> `amoeba_bot`. **The `.safetensors` path is a required argument and must exist** —
+this program never trains and never writes weights, so there is nothing sensible to do without them.
+Credentials are `BOT1_ID` and `BOT1_KEY`, the same as the reference random
 bot; `ROOM_ID` picks a practice room, and without it the bot runs `arena_start_continuous`, which
 queues game after game and only returns on error. Four callbacks, same shape as the random bot.
 
@@ -735,20 +736,21 @@ cmake --build build.nosync
 shared library, and before `project()` CMake has not yet established that the platform can link
 one. The `arena` call above it predates that and only works because its import is static.
 
-Both programs take an optional `.safetensors` path and otherwise use the first one in the working
-directory. Run them side by side in the same directory and the bot picks up each promotion at its
-next game.
+**Both programs require the `.safetensors` path.** Neither guesses: the trainer creates the file if it
+is missing, the bot fails. Naming it is how you say which run you mean, and a directory scan made
+resuming the wrong network — or playing rated games with one — a silent mistake. Point both at the same
+file and the bot picks up each promotion at its next game.
 
 ```
-# train forever at the overnight defaults, starting from random weights if the file does not exist
-./build.nosync/amoeba_train                       # ./amoeba.safetensors
+# train forever at the overnight defaults, creating the file if it does not exist
 ./build.nosync/amoeba_train run7.safetensors
 
 # ranked games back to back, for as long as the process lives
-BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot
+BOT1_ID=… BOT1_KEY=… ./build.nosync/amoeba_bot run7.safetensors
 
 # one practice game
-ROOM_ID=… BOT1_ID=… BOT1_KEY=… ARENA_DOMAIN=staging-game-arena.irvine.jp ./build.nosync/amoeba_bot
+ROOM_ID=… BOT1_ID=… BOT1_KEY=… ARENA_DOMAIN=staging-game-arena.irvine.jp \
+  ./build.nosync/amoeba_bot run7.safetensors
 ```
 
 There are **no tests**. `amoeba_encode_test` and `amoeba_random_test` both existed and were both
