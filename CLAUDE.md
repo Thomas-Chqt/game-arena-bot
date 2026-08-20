@@ -363,10 +363,20 @@ pool — one `forEach` over the slots per round — and the driver thread does t
 "Batching across games" above for why.
 
 - **`CONCURRENT` is the batch size.** One position per game per round, so a field of 256 is a batch of
-  256. `GAMES` above it only keeps the field full while the early finishers are replaced; games end at
-  very different plies, and a field draining down to a handful is paying 3.84 ms a position instead of
-  0.155. **The default of 256 measured no faster than the old code while 64 measured 1.82× faster** —
+  256. **The default of 256 measured no faster than the old code while 64 measured 1.82× faster** —
   see "Batching across games" for the experiment that would explain it.
+- **`GAMES` is above `CONCURRENT`, so a slot takes on another game instead of going idle.** What a
+  game costs does not depend on when it is played: all 512 build their own tree from nothing and all
+  512 get their own cheap endgame, so refill buys games rather than adding overhead. Set `GAMES` for
+  how much data a generation should hold, not for scheduling — the schedule barely moves the number,
+  because the late plies of a long game inherit most of their 400 simulations and cost a fraction of
+  an opening ply, which is what makes a draining field far less wasteful than a naive
+  cost-per-ply estimate suggests.
+- **The tail is the one thing a full field does not fix.** A game can only take one simulation per
+  round, so once the field is down to a handful they are each paying 0.75 ms a position instead of
+  0.155 with nobody to share the call. `Config::batchSize` is the lever — `256 / games still playing`
+  rather than a fixed 1 would keep the batch full to the end, at the cost of virtual loss on those
+  last simulations. Not done.
 - **The gate's field is smaller (`GATE_CONCURRENT`, 64)** because there the field size is also how long
   it takes to hear a verdict: `settled()` is only reconsulted as games come in, and 256 at once would
   spend most of `GATE_GAMES` before the first chance to stop. Once it does say stop, the games still in
@@ -374,7 +384,12 @@ pool — one `forEach` over the slots per round — and the driver thread does t
 - **The gate needs two trees per game and two batches per round**, one per network. Only one side is to
   move at a time, so each batch is about half the field.
 - **`finished` is called under the field's lock**, once per game, so the callers' tallies need no
-  atomics.
+  atomics. It is also where the one line a game gets is printed: how long it took, how many moves it
+  played, how many network calls it cost, and how many games are left. **There is no per-round
+  progress line, on purpose** — the games are never on the same move, so a field-wide "round" can only
+  be an average, and reporting one reads as though the games move in lockstep at the move level. They
+  do not: every game gets one simulation per round, so a game whose tree is nearly full plays its next
+  move in ~50 rounds while one in the opening needs 400.
 - **Everything random about a game comes from its id**, never from which slot or thread picked it up, so
   a run stays reproducible from `SEED` however the field interleaves.
 

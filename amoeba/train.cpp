@@ -37,6 +37,8 @@
 
 #include "network.hpp"
 
+#include <sys/resource.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -72,6 +74,35 @@ void report(std::format_string<Args...> format, Args&&... args)
 {
     std::println(format, std::forward<Args>(args)...);
     std::fflush(stdout);
+}
+
+// MLX hands freed device buffers to a pool rather than back to the system, and the
+// pool's default limit is the memory limit - on Metal, 1.5x the device's
+// recommended working set, so most of the machine. That makes the split worth
+// printing rather than guessing at:
+//
+//   live    what MLX is actually holding for arrays that exist
+//   cached  handed back by MLX but not released to the system
+//   process the OS's high-water mark, which includes everything above plus the
+//           replay buffer, the trees and every other allocation we make
+//
+// A large cache beside a small live figure is shape churn, not a leak: the field's
+// batch shrinks by one every time a game ends, and each distinct batch size is a
+// differently shaped set of intermediates for the pool to keep. A large live figure
+// is something genuinely retained, and then the fault is ours.
+void reportMemory(const char* phase)
+{
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);   // ru_maxrss is bytes on macOS, kilobytes on Linux
+
+    report("[memory] after {}: {:.2f} GiB live, {:.2f} GiB cached, {:.2f} GiB MLX peak, "
+           "{:.2f} GiB process high-water",
+           phase, static_cast<double>(mlx::core::get_active_memory()) / kGiB,
+           static_cast<double>(mlx::core::get_cache_memory()) / kGiB,
+           static_cast<double>(mlx::core::get_peak_memory()) / kGiB,
+           static_cast<double>(usage.ru_maxrss) / kGiB);
 }
 
 int envInt(const char* name, int fallback)
@@ -115,14 +146,19 @@ struct Settings
     // 512 games is roughly 60k positions. Fewer than that and each generation's
     // training set is mostly the previous generation's, so the gate compares two
     // networks that saw nearly the same data and rejects almost everything.
+    //
+    // Above CONCURRENT, so a slot takes on another game as its own ends rather than
+    // going idle. What a game costs does not depend on when it is played - every one
+    // of the 512 builds its own tree from nothing and gets its own cheap endgame - so
+    // this buys games rather than adding overhead, and it keeps the batch full for
+    // the bulk of the run instead of only until the first game ends.
     int   games         = envInt("GAMES", 512);
     int   samplingPlies = envInt("SAMPLING_PLIES", 20);
     float noise         = envFloat("NOISE", 0.25f);
 
     // How many games are in flight at once, which is also the batch the network
     // sees: one position per game per round. The evaluator costs 0.155 ms/position
-    // at 256 against 3.84 ms on its own, so the field is what buys the throughput,
-    // and GAMES above it only keeps it full while the early finishers are replaced.
+    // at 256 against 3.84 ms on its own, so the field is what buys the throughput.
     //
     // Measure before trusting 256: a field of 64 came out at 1.82x the old code and
     // a field of 256 at parity with it, which the evaluator's own numbers say should
@@ -212,6 +248,11 @@ struct Playing
     int                   id     = 0;
     bool                  active = false;
 
+    // Reported when the game ends. `samples` is one per move, so the move count is
+    // already there; the evaluations have to be counted as they are absorbed.
+    std::chrono::steady_clock::time_point started;
+    long long                             evaluations = 0;
+
     // One tree per network, not per colour. Self-play has a single network and so
     // a single tree, which it re-roots after every ply instead of every other one -
     // that is where most of the reuse comes from, since the tree keeps what both
@@ -260,10 +301,12 @@ private:
 
 void Field::begin(Playing& game, int id, Pairing pairing, uint64_t seed) const
 {
-    game.id      = id;
-    game.board   = amoeba::startPosition();
-    game.pairing = pairing;
-    game.active  = true;
+    game.id          = id;
+    game.board       = amoeba::startPosition();
+    game.pairing     = pairing;
+    game.active      = true;
+    game.started     = std::chrono::steady_clock::now();
+    game.evaluations = 0;
     game.history.assign(1, game.board.hash);
     game.samples.clear();
     game.rng.seed(seed ^ (0x9e3779b97f4a7c15ULL * (static_cast<uint64_t>(id) + 1)));
@@ -327,9 +370,8 @@ void Field::play(int games, int slots, uint64_t seed, const char* label,
 
     std::mutex        gatekeeper;
     std::atomic<bool> wanted{true};
-    int               started   = 0;
     int               completed = 0;
-    const auto        clock     = std::chrono::steady_clock::now();
+    int               started   = 0;
 
     report("[{}] {} games, {} in flight at {} simulations, {} leaves per search", label, games,
            field.size(), m_search.simulations, m_search.batchSize);
@@ -342,21 +384,30 @@ void Field::play(int games, int slots, uint64_t seed, const char* label,
 
     // Hands a finished game over and takes on the next one, under one lock: it is
     // where the caller keeps its tally and decides whether any more games are worth
-    // playing, and it runs once per game rather than once per round.
+    // playing, and where the one line a game gets is printed. Once per game rather
+    // than once per round, so the lock is never contended for long.
+    //
+    // The line reports the game's own numbers because the field's do not mean much:
+    // the games are never on the same move, so there is no shared round to report.
+    // A game's moves and evaluations together say what its tree reuse was worth -
+    // 400 simulations a move, minus whatever it inherited.
     const auto handOver = [&](Playing& game) {
         for (Sample& sample : game.samples) {
             sample.outcome = outcomeFor(game.board.state, sample.board.whiteToMove);
         }
 
         const std::lock_guard guard{gatekeeper};
+
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - game.started).count();
+        const size_t moves = game.samples.size();
+
         if (!finished(game.id, std::move(game.samples)))
             wanted = false;
-
-        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - clock).count();
         ++completed;
-        if (completed == 1 || completed % 25 == 0 || completed == games)
-            report("[{}] {}/{} games, {:.0f}s elapsed, {:.0f}s left", label, completed, games, elapsed,
-                   elapsed / completed * (games - completed));
+
+        report("[{}] game {}: {:.0f}s, {} moves, {} network calls -- {} games left", label, game.id,
+               seconds, moves, game.evaluations, games - completed);
 
         if (!wanted || started >= games)
         {
@@ -367,14 +418,17 @@ void Field::play(int games, int slots, uint64_t seed, const char* label,
         ++started;
     };
 
-    const std::function<void(size_t)> round = [&](size_t slot) {
+    const std::function<void(size_t)> stepSlot = [&](size_t slot) {
         Playing& game = field[slot];
         if (!game.active)
             return;
 
         if (!game.pending.empty())
+        {
+            game.evaluations += static_cast<long long>(game.pending.size());
             game.trees[static_cast<size_t>(game.network)].absorb(
                 std::span{answers[static_cast<size_t>(game.network)]}.subspan(game.offset, game.pending.size()));
+        }
 
         takeToPending(game);
         while (game.active && game.pending.empty())
@@ -387,7 +441,7 @@ void Field::play(int games, int slots, uint64_t seed, const char* label,
 
     for (;;)
     {
-        ThreadPool::global().forEach(field.size(), round);
+        ThreadPool::global().forEach(field.size(), stepSlot);
         if (!wanted)
             return;
 
@@ -729,6 +783,8 @@ int main(int argc, char** argv)
         }
         gameIdBase += settings.games;
 
+        bot::reportMemory("self-play");
+
         replay.insert(replay.end(), std::make_move_iterator(fresh.begin()),
                       std::make_move_iterator(fresh.end()));
         if (replay.size() > settings.buffer)
@@ -739,9 +795,11 @@ int main(int argc, char** argv)
         // generation is meant to refine, not to relearn the game.
         bot::Network candidate = *best;
         bot::train(candidate, replay, settings, settings.seed + static_cast<uint64_t>(generation));
+        bot::reportMemory("training");
 
         const double score =
             bot::gate(candidate, *best, settings, settings.seed + 7777 + static_cast<uint64_t>(generation));
+        bot::reportMemory("the gate");
 
         if (score < settings.gate)
         {
