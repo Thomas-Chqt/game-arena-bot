@@ -27,7 +27,12 @@
 //   network     BLOCKS WIDTH HEADS          (only read when starting from scratch)
 //   generating  SEED GAMES SIMULATIONS LEAVES SAMPLING_PLIES NOISE
 //   training    STEPS BATCH RATE DECAY BUFFER
-//   gating      GATE_GAMES GATE
+//   gating      GATE_GAMES GATE GATE_SIMULATIONS
+//
+// STEPS and GATE_GAMES are both caps rather than costs: training stops when the
+// held-out loss stops improving, and the gate stops as soon as the verdict is
+// settled. Both run to the cap only when the extra work is actually buying
+// something.
 
 #include "network.hpp"
 
@@ -97,8 +102,13 @@ struct Settings
     // 400 simulations is half of AlphaZero's 800, which is the usual trade on one
     // machine: the policy target is a distribution over visits, and doubling the
     // visits sharpens it far less than doubling the games broadens it.
+    // 64 leaves per forward pass rather than 16: the GPU is the bottleneck and it
+    // costs 0.16 ms/position at 64 against ~0.21 at 16, almost all of it fixed
+    // dispatch overhead. The cost is coarser search - only six rounds of "look,
+    // learn, redirect" per move at 400 simulations - which virtual loss covers
+    // but does not make free.
     Config search = {.simulations = envInt("SIMULATIONS", 400),
-                     .batchSize   = envInt("LEAVES", 16)};
+                     .batchSize   = envInt("LEAVES", 64)};
 
     // 200 games is roughly 20k positions. Fewer than that and each generation's
     // training set is mostly the previous generation's, so the gate compares two
@@ -121,8 +131,15 @@ struct Settings
     // a 55% result to mean anything - at 40 games the bar is +/-8% and promotion
     // is close to a coin flip. It costs as much as the self-play it judges, and
     // that is the price of the only honest signal in the system.
+    // 200 is the cap, not the usual cost: the gate stops as soon as the verdict is
+    // settled, which for a clearly better candidate is about twenty games. The cap
+    // only gets spent when the two networks are genuinely close.
     int   gateGames = envInt("GATE_GAMES", 200);
     float gate      = envFloat("GATE", 0.55f);
+
+    // Ranking two networks needs far less search than generating a training
+    // target does: the visit counts are thrown away here, only the result counts.
+    int gateSimulations = envInt("GATE_SIMULATIONS", 200);
 };
 
 // ---------------------------------------------------------------------------
@@ -192,22 +209,27 @@ std::vector<Sample> playGame(Search& white, Search& black, int samplingPlies, st
 // Concurrent MLX evaluation was tested and behaved - 24 searches across 8 threads
 // agreed with the single-threaded result - but that is evidence, not a guarantee.
 // If self-play ever misbehaves in a way that smells like a race, try one thread.
+// `playOne` returns false once further games cannot change the answer - the gate
+// uses that to quit early. Games already in flight still finish, so the count
+// that comes back is not necessarily where it stopped asking.
 template <typename PlayOne>
-void acrossGames(int games, const char* label, PlayOne&& playOne)
+int acrossGames(int games, const char* label, PlayOne&& playOne)
 {
-    const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
-    std::atomic<int> nextGame{0};
-    std::atomic<int> completed{0};
-    const auto       start = std::chrono::steady_clock::now();
+    const unsigned    threads = std::max(1u, std::thread::hardware_concurrency());
+    std::atomic<int>  nextGame{0};
+    std::atomic<int>  completed{0};
+    std::atomic<bool> stop{false};
+    const auto        start = std::chrono::steady_clock::now();
 
     const auto worker = [&] {
         for (;;)
         {
             const int game = nextGame.fetch_add(1);
-            if (game >= games)
+            if (game >= games || stop.load())
                 return;
 
-            playOne(game);
+            if (!playOne(game))
+                stop = true;
 
             const int done = completed.fetch_add(1) + 1;
             if (done == 1 || done % 25 == 0 || done == games)
@@ -220,11 +242,14 @@ void acrossGames(int games, const char* label, PlayOne&& playOne)
         }
     };
 
-    std::vector<std::jthread> pool;
-    pool.reserve(threads);
-    for (unsigned i = 0; i < threads; ++i) {
-        pool.emplace_back(worker);
+    {
+        std::vector<std::jthread> pool;
+        pool.reserve(threads);
+        for (unsigned i = 0; i < threads; ++i) {
+            pool.emplace_back(worker);
+        }
     }
+    return completed.load();
 }
 
 std::vector<Sample> selfPlay(const Network& best, const Settings& settings, uint64_t seed)
@@ -251,6 +276,7 @@ std::vector<Sample> selfPlay(const Network& best, const Settings& settings, uint
             sample.game = game;
         }
         perGame[static_cast<size_t>(game)] = std::move(played);
+        return true;   // self-play always plays every game it was asked for
     });
 
     std::vector<Sample> samples;
@@ -346,11 +372,20 @@ void train(Network& net, const std::vector<Sample>& samples, const Settings& set
            settings.batchSize);
     report("{:>7}  {:>9}  {:>9}  {:>9}  {:>9}", "step", "policy", "value", "held.pol", "held.val");
 
+    // Checked four times more often than it is printed, because the optimum moves
+    // as the replay buffer fills: at 22k positions it lands around step 100, and
+    // at the buffer's full 200k the same step count is barely one pass over the
+    // data and the optimum is far later. Stopping on patience rather than on a
+    // fixed count is what lets one STEPS serve both.
+    constexpr int kCheckEvery = 25;
+    constexpr int kPatience   = 8;
+
     Adam                          adam{params};
     std::vector<size_t>           picks(static_cast<size_t>(settings.batchSize));
     std::vector<mlx::core::array> best = params;
     float                         bestHeld = std::numeric_limits<float>::max();
     int                           bestStep = 0;
+    int                           stale    = 0;
 
     for (int step = 1; step <= settings.steps; ++step)
     {
@@ -367,23 +402,37 @@ void train(Network& net, const std::vector<Sample>& samples, const Settings& set
         params = adam.step(params, gradients, settings.rate);
         mlx::core::eval(params);
 
-        if (step % 100 == 0 || step == 1)
-        {
-            const std::vector<mlx::core::array> held = loss(params, net.shape(), validation, 0.0f);
-            mlx::core::eval(values);
-            mlx::core::eval(held);
+        if (step % kCheckEvery != 0 && step != 1)
+            continue;
 
-            // Judged on policy and value together: one orders the moves, the other
-            // evaluates the leaves, and the search needs both.
-            const float combined = held[1].item<float>() + held[2].item<float>();
-            if (combined < bestHeld)
-            {
-                bestHeld = combined;
-                bestStep = step;
-                best     = params;
-            }
+        const std::vector<mlx::core::array> held = loss(params, net.shape(), validation, 0.0f);
+        mlx::core::eval(values);
+        mlx::core::eval(held);
+
+        // Judged on policy and value together: one orders the moves, the other
+        // evaluates the leaves, and the search needs both.
+        const float combined = held[1].item<float>() + held[2].item<float>();
+        if (combined < bestHeld)
+        {
+            bestHeld = combined;
+            bestStep = step;
+            best     = params;
+            stale    = 0;
+        }
+        else
+        {
+            ++stale;
+        }
+
+        if (step % 100 == 0 || step == 1)
             report("{:>7}  {:>9.4f}  {:>9.4f}  {:>9.4f}  {:>9.4f}", step, values[1].item<float>(),
                    values[2].item<float>(), held[1].item<float>(), held[2].item<float>());
+
+        if (stale >= kPatience)
+        {
+            report("[train] held-out loss has not improved in {} checks, stopping at step {}",
+                   kPatience, step);
+            break;
         }
     }
 
@@ -396,16 +445,41 @@ void train(Network& net, const std::vector<Sample>& samples, const Settings& set
 // The gate
 // ---------------------------------------------------------------------------
 
+// Standard error of a proportion. Quoted with every gate result so a score is
+// not read as more precise than it is: 3.5 points at 200 games, 8 at 40.
+double standardError(double score, int games)
+{
+    return std::sqrt(std::max(score * (1.0 - score), 0.01) / games);
+}
+
+// Whether more games could still change the verdict. A candidate that is clearly
+// better says so in about twenty games, and one that is genuinely within a point
+// or two of the champion would need thousands - neither is worth playing two
+// hundred for. Three sigma rather than two because the question is asked after
+// every game, and repeated testing at two sigma promotes noise.
+bool settled(int played, double score, float threshold)
+{
+    constexpr int kMinimumGames = 20;
+    return played >= kMinimumGames
+        && std::abs(score - static_cast<double>(threshold)) > 3.0 * standardError(score, played);
+}
+
 // The candidate's score, draws counted as half. Colours alternate so the
 // first-move advantage cancels rather than being handed to whoever is listed
 // first, and the early sampling in chooseMove is what makes the games differ -
 // two argmax players would replay one game GATE_GAMES times.
+//
+// Ranks with fewer simulations than self-play used, because only the result is
+// read here - the visit counts that needed the deeper search are discarded.
 double gate(const Network& candidate, const Network& champion, const Settings& settings, uint64_t seed)
 {
-    Config search    = settings.search;
-    search.rootNoise = 0.0f;   // competition keeps the network's own opinion
+    Config search      = settings.search;
+    search.simulations = settings.gateSimulations;
+    search.rootNoise   = 0.0f;   // competition keeps the network's own opinion
 
-    std::vector<int> results(static_cast<size_t>(settings.gateGames));
+    std::atomic<int> wins{0};
+    std::atomic<int> draws{0};
+    std::atomic<int> losses{0};
 
     acrossGames(settings.gateGames, "gate", [&](int game) {
         const uint64_t gameSeed = seed + static_cast<uint64_t>(game);
@@ -426,26 +500,24 @@ double gate(const Network& candidate, const Network& champion, const Settings& s
         const Sample& last     = played.back();
         const bool    whiteWon = last.outcome < 0.0f ? !last.board.whiteToMove : last.board.whiteToMove;
 
-        results[static_cast<size_t>(game)] =
-            last.outcome == 0.0f ? 0 : (whiteWon == candidateIsWhite ? 1 : -1);
+        if (last.outcome == 0.0f)
+            draws.fetch_add(1);
+        else if (whiteWon == candidateIsWhite)
+            wins.fetch_add(1);
+        else
+            losses.fetch_add(1);
+
+        const int    total = wins.load() + draws.load() + losses.load();
+        const double score = (wins.load() + 0.5 * draws.load()) / total;
+        return !settled(total, score, settings.gate);
     });
 
-    int wins = 0, losses = 0, draws = 0;
-    for (const int result : results)
-    {
-        if (result > 0) ++wins;
-        else if (result < 0) ++losses;
-        else ++draws;
-    }
+    const int    total = wins.load() + draws.load() + losses.load();
+    const double score = (wins.load() + 0.5 * draws.load()) / total;
 
-    const double score = (wins + 0.5 * draws) / settings.gateGames;
-
-    // Standard error of a proportion, so a result is not read as more precise than
-    // it is: at the default 200 games it is about 3.5 points, and at 40 it is 8,
-    // which cannot separate 55% from a coin flip.
-    const double error = std::sqrt(score * (1.0 - score) / settings.gateGames);
-    report("[gate] candidate {:.1f}% +/- {:.1f}% ({}-{}-{}) over {} games", 100.0 * score,
-           100.0 * error, wins, losses, draws, settings.gateGames);
+    report("[gate] candidate {:.1f}% +/- {:.1f}% ({}-{}-{}) over {} games at {} simulations",
+           100.0 * score, 100.0 * standardError(score, total), wins.load(), draws.load(),
+           losses.load(), total, settings.gateSimulations);
     return score;
 }
 
