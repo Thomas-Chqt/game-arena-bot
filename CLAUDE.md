@@ -362,8 +362,9 @@ simulation per game, gathered into one network call per network. The whole field
 pool — one `forEach` over the slots per round — and the driver thread does the MLX call. See
 "Batching across games" above for why.
 
-- **`CONCURRENT` is the batch size.** One position per game per round, so a field of 256 is a batch of
-  256. **The default of 256 measured no faster than the old code while 64 measured 1.82× faster** —
+- **`CONCURRENT` is twice the batch size.** The field is walked in two halves that take turns, so a
+  field of 256 sends batches of 128. That costs 5% per position (0.163 ms against 0.155) and buys the
+  overlap below, which is worth ~1.3×. **The default of 256 measured no faster than the old code while 64 measured 1.82× faster** —
   see "Batching across games" for the experiment that would explain it.
 - **`GAMES` is above `CONCURRENT`, so a slot takes on another game instead of going idle.** What a
   game costs does not depend on when it is played: all 512 build their own tree from nothing and all
@@ -431,9 +432,20 @@ shape comes out of the checkpoint), `SEED GAMES CONCURRENT SIMULATIONS LEAVES SA
   own opinion.
 - **Progress output is flushed.** `std::println` block-buffers when stdout is not a terminal, so a
   redirected run showed an empty log for 100 s. Short runs hide this because exiting flushes.
-- **MLX is called from one thread only.** It used to be called from every game thread at once, which
-  worked but left ten threads each pushing a small batch. Now the tree work is on the pool and the
-  forward pass is on the driver, which is both faster and one less thing to have to trust.
+- **MLX is called from one thread at a time**, though not always the same one: the device call is task
+  0 of the same `forEach` round as the tree work, so whichever thread picks it up spends the round
+  inside MLX while the others walk trees. It used to be called from every game thread at once, which
+  worked but left ten threads each pushing a small batch.
+- **The device call and the tree work overlap.** A round used to be every descent with the device idle
+  (~15 ms) and then one network call with every core idle (~40 ms). Now half the field's batch is on
+  the device while the other half's trees are walked, so neither waits: ~42 ms per 256 positions
+  against 55, about **1.3×**. Each half is evaluated on one turn and stepped on the next, which is
+  what keeps an answer from being left unabsorbed. `NetworkEvaluator`'s own encode is a nested
+  `forEach` and so runs serially inside that task — 0.3 ms for 128 boards, measured, against a device
+  call of twenty.
+- **When one half empties, it degrades to the old behaviour rather than to something worse.** The
+  turns still alternate, but the empty half's turn costs nothing, so the surviving half pays
+  `evaluate + step` unoverlapped — exactly what every round used to cost.
 
 ### Deliberate gaps
 

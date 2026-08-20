@@ -40,6 +40,7 @@
 #include <sys/resource.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -365,16 +366,38 @@ void Field::play(int games, int slots, uint64_t seed, const char* label,
         return;
 
     std::vector<Playing> field(static_cast<size_t>(std::max(1, std::min(games, slots))));
-    std::vector<std::vector<const amoeba::Board*>> boards(m_networks.size());
-    std::vector<std::vector<Evaluation>>           answers(m_networks.size());
 
     std::mutex        gatekeeper;
     std::atomic<bool> wanted{true};
     int               completed = 0;
     int               started   = 0;
 
-    report("[{}] {} games, {} in flight at {} simulations, {} leaves per search", label, games,
-           field.size(), m_search.simulations, m_search.batchSize);
+    // The field is walked in two halves that take turns: while one half's batch is on
+    // the device, the other half's trees are walked on the pool. A round used to be
+    // every descent with the device idle and then one network call with every core
+    // idle - 15 ms and 40 ms of a 55 ms round, neither overlapping the other.
+    struct Half
+    {
+        size_t                                         first = 0;
+        size_t                                         count = 0;
+        std::vector<std::vector<const amoeba::Board*>> boards;
+        std::vector<std::vector<Evaluation>>           answers;
+        size_t                                         gathered = 0;
+    };
+
+    std::array<Half, 2> halves;
+    halves[0].count = field.size() - field.size() / 2;
+    halves[1].first = halves[0].count;
+    halves[1].count = field.size() / 2;
+    for (Half& half : halves)
+    {
+        half.boards.resize(m_networks.size());
+        half.answers.resize(m_networks.size());
+    }
+
+    report("[{}] {} games, {} in flight in halves of {} and {}, at {} simulations, {} leaves per search",
+           label, games, field.size(), halves[0].count, halves[1].count, m_search.simulations,
+           m_search.batchSize);
 
     for (Playing& game : field)
     {
@@ -418,7 +441,9 @@ void Field::play(int games, int slots, uint64_t seed, const char* label,
         ++started;
     };
 
-    const std::function<void(size_t)> stepSlot = [&](size_t slot) {
+    // Absorbs what the device returned for this slot last time round, then takes the
+    // game as far as it can before it needs an answer again.
+    const auto stepOne = [&](Half& half, size_t slot) {
         Playing& game = field[slot];
         if (!game.active)
             return;
@@ -427,7 +452,7 @@ void Field::play(int games, int slots, uint64_t seed, const char* label,
         {
             game.evaluations += static_cast<long long>(game.pending.size());
             game.trees[static_cast<size_t>(game.network)].absorb(
-                std::span{answers[static_cast<size_t>(game.network)]}.subspan(game.offset, game.pending.size()));
+                std::span{half.answers[static_cast<size_t>(game.network)]}.subspan(game.offset, game.pending.size()));
         }
 
         takeToPending(game);
@@ -439,41 +464,73 @@ void Field::play(int games, int slots, uint64_t seed, const char* label,
         }
     };
 
-    for (;;)
-    {
-        ThreadPool::global().forEach(field.size(), stepSlot);
-        if (!wanted)
-            return;
-
-        size_t total = 0;
-        for (std::vector<const amoeba::Board*>& group : boards) {
+    // Collects one half's waiting boards into one batch per network, remembering
+    // where each game's own boards landed so absorb() can find them again.
+    const auto gather = [&](Half& half) {
+        half.gathered = 0;
+        for (std::vector<const amoeba::Board*>& group : half.boards) {
             group.clear();
         }
-        for (Playing& game : field)
+
+        for (size_t slot = half.first; slot < half.first + half.count; ++slot)
         {
+            Playing& game = field[slot];
             if (!game.active || game.pending.empty())
                 continue;
 
-            std::vector<const amoeba::Board*>& group = boards[static_cast<size_t>(game.network)];
+            std::vector<const amoeba::Board*>& group = half.boards[static_cast<size_t>(game.network)];
             game.offset = group.size();
             group.insert(group.end(), game.pending.begin(), game.pending.end());
-            total += game.pending.size();
+            half.gathered += game.pending.size();
         }
-        if (total == 0)
+    };
+
+    Half* stepping   = nullptr;
+    Half* evaluating = nullptr;
+
+    // Task 0 is the device call, tasks 1.. are the other half's trees, all in one
+    // round of the pool. No extra thread, and only ever one thread inside MLX: its
+    // own encode is a nested forEach and so runs serially there, which costs 0.3 ms
+    // against a call of twenty.
+    const std::function<void(size_t)> round = [&](size_t index) {
+        if (index == 0)
+        {
+            for (size_t n = 0; n < m_networks.size(); ++n)
+            {
+                if (evaluating->boards[n].empty())
+                    continue;
+                evaluating->answers[n].resize(evaluating->boards[n].size());
+                m_networks[n]->evaluate(evaluating->boards[n], evaluating->answers[n]);
+            }
+            return;
+        }
+        stepOne(*stepping, stepping->first + index - 1);
+    };
+
+    // One half has to have something to evaluate before the two can start taking
+    // turns; there is nothing to overlap this once.
+    ThreadPool::global().forEach(halves[0].count,
+                                 [&](size_t i) { stepOne(halves[0], halves[0].first + i); });
+    gather(halves[0]);
+
+    for (size_t turn = 0;; turn ^= 1)
+    {
+        evaluating = &halves[turn];
+        stepping   = &halves[turn ^ 1];
+
+        ThreadPool::global().forEach(1 + stepping->count, round);
+        if (!wanted)
             return;
 
-        // One call per network, from one thread. MLX is dispatch-bound at this size,
-        // so a single stream of large batches beats several threads each pushing a
-        // small one, and it is the whole reason the games are driven in lockstep.
-        for (size_t n = 0; n < m_networks.size(); ++n)
-        {
-            if (boards[n].empty())
-                continue;
-            answers[n].resize(boards[n].size());
-            m_networks[n]->evaluate(boards[n], answers[n]);
-        }
+        gather(*stepping);
+
+        // Each half is evaluated on one turn and stepped on the next, so nothing is
+        // left holding an answer nobody absorbed when both come up empty.
+        if (halves[0].gathered == 0 && halves[1].gathered == 0)
+            return;
     }
 }
+
 
 std::vector<Sample> selfPlay(const Network& best, const Settings& settings, uint64_t seed)
 {
