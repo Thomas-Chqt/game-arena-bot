@@ -51,7 +51,8 @@ namespace
 //
 // Leaves are batched 16 at a time because the network costs 1.70 ms for a single
 // position and 0.16 ms each for 64 - one position per forward pass would spend
-// the whole turn on overhead.
+// the whole turn on overhead. Self-play fills its batch from the other games in
+// flight and needs none of this; a match has one game and no such option.
 constexpr int                       kSimulations = 20000;
 constexpr int                       kLeaves      = 16;
 constexpr std::chrono::milliseconds kTurnBudget{4000};
@@ -173,10 +174,15 @@ bool samePosition(const amoeba::Board& left, const amoeba::Board& right)
     return left.whiteToMove == right.whiteToMove && std::ranges::equal(left.hexes, right.hexes);
 }
 
+// Re-roots the tree on the move as well as playing it, so the simulations that
+// already went into that move are still there next turn instead of being thrown
+// away - our own moves and the opponent's alike, since a reply the search looked
+// at is a subtree it can keep.
 void advance(Context& context, amoeba::Move move)
 {
     context.board = amoeba::apply(context.board, move, context.history);
     context.history.push_back(context.board.hash);
+    context.search->advance(move.id(), context.board, context.history);
 }
 
 void syncToServer(Context& context, const char* serverBoard, arena_side_t currentTurn)
@@ -209,6 +215,7 @@ void syncToServer(Context& context, const char* serverBoard, arena_side_t curren
     context.board     = remote;
     context.board.ply = static_cast<uint16_t>(ply + 1);
     context.history.assign(1, context.board.hash);
+    context.search->restart(context.board, context.history);
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +231,7 @@ const ServerMove& chooseMove(Context& context, const std::vector<ServerMove>& mo
         return moves.front();
     }
 
-    const VisitCounts counts = context.search->run(context.board, context.history);
+    const VisitCounts counts = runSearch(*context.search, *context.evaluator);
     const uint16_t    chosen = bestMove(counts);
 
     const auto found = std::ranges::find_if(moves, [chosen](const ServerMove& m) { return m.move.id() == chosen; });
@@ -242,9 +249,9 @@ void loadNetwork(Context& context)
 {
     context.network = std::make_unique<Network>(context.weights);
     context.evaluator = std::make_unique<NetworkEvaluator>(*context.network);
-    context.search.emplace(*context.evaluator, Config{.simulations = kSimulations,
-                                                           .deadline    = kTurnBudget,
-                                                           .batchSize   = kLeaves});
+    context.search.emplace(Config{.simulations = kSimulations,
+                                  .deadline    = kTurnBudget,
+                                  .batchSize   = kLeaves});
 
     std::println("[bot] {}: {} blocks, width {}, {} heads, {} parameters",
                  context.weights.filename().string(), context.network->shape().blocks,
@@ -260,6 +267,7 @@ void onGameStart(const arena_game_state_t* state, void* userData)
 
         context.board = amoeba::fromString(state->board, state->current_turn == ARENA_SIDE_WHITE);
         context.history.assign(1, context.board.hash);
+        context.search->restart(context.board, context.history);
 
         std::println("[bot] game start, I am {}, {} to move", arena_side_str(state->my_side), arena_side_str(state->current_turn));
     });

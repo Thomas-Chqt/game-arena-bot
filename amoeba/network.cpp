@@ -285,16 +285,19 @@ void NetworkEvaluator::evaluate(std::span<const amoeba::Board* const> boards, st
     std::vector<float> encoded(static_cast<size_t>(batch) * amoeba::kEncodedSize);
     std::vector<float> mask(static_cast<size_t>(batch) * amoeba::kNumMoveIds);
 
-    for (int i = 0; i < batch; ++i)
-    {
-        const size_t base = static_cast<size_t>(i) * amoeba::kEncodedSize;
+    // Every position writes into its own slice, so the whole batch goes across the
+    // pool. At the sizes the search now asks for - hundreds of boards, one per game
+    // in flight - encoding them one after another is measurable next to the forward
+    // pass it is feeding.
+    ThreadPool::global().forEach(static_cast<size_t>(batch), [&](size_t i) {
+        const size_t base = i * amoeba::kEncodedSize;
         amoeba::encode(*boards[i], std::span<float, amoeba::kEncodedSize>(encoded.data() + base, amoeba::kEncodedSize));
 
         const std::span<const uint16_t, amoeba::kNumMoveIds> toAbsolute = amoeba::policyToAbsolute(boards[i]->whiteToMove);
-        const size_t maskBase = static_cast<size_t>(i) * amoeba::kNumMoveIds;
+        const size_t maskBase = i * amoeba::kNumMoveIds;
         for (int slot = 0; slot < amoeba::kNumMoveIds; ++slot)
             mask[maskBase + slot] = boards[i]->isLegal(toAbsolute[slot]) ? 1.0f : 0.0f;
-    }
+    });
 
     const mlx::core::array input(encoded.data(), mlx::core::Shape{batch, amoeba::kEncodedSize}, mlx::core::float32);
     const Prediction prediction = forward(m_network.parameters(), m_network.shape(), input);
@@ -314,15 +317,14 @@ void NetworkEvaluator::evaluate(std::span<const amoeba::Board* const> boards, st
     const float* policyData = probabilities.data<float>();
     const float* valueData = prediction.value.data<float>();
 
-    for (int i = 0; i < batch; ++i)
-    {
+    ThreadPool::global().forEach(static_cast<size_t>(batch), [&](size_t i) {
         const std::span<const uint16_t, amoeba::kNumMoveIds> toAbsolute = amoeba::policyToAbsolute(boards[i]->whiteToMove);
-        const size_t base = static_cast<size_t>(i) * amoeba::kNumMoveIds;
+        const size_t base = i * amoeba::kNumMoveIds;
 
         for (int slot = 0; slot < amoeba::kNumMoveIds; ++slot)
             out[i].policy[toAbsolute[slot]] = policyData[base + slot];
         out[i].value = valueData[i];
-    }
+    });
 }
 
 // ===========================================================================
@@ -340,9 +342,11 @@ Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const Vi
     std::vector<float> legal(static_cast<size_t>(batch) * amoeba::kNumMoveIds);
     std::vector<float> policy(static_cast<size_t>(batch) * amoeba::kNumMoveIds);
 
-    for (int i = 0; i < batch; ++i)
-    {
-        const size_t inputBase = static_cast<size_t>(i) * amoeba::kEncodedSize;
+    // One slice per position again, and this one is on the critical path of every
+    // training step: a batch of 256 boards has to be encoded before the step can
+    // start, and the step itself is a few milliseconds.
+    ThreadPool::global().forEach(static_cast<size_t>(batch), [&](size_t i) {
+        const size_t inputBase = i * amoeba::kEncodedSize;
         amoeba::encode(*boards[i], std::span<float, amoeba::kEncodedSize>(input.data() + inputBase, amoeba::kEncodedSize));
 
         uint64_t total = 0;
@@ -356,7 +360,7 @@ Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const Vi
         // flipped space encode() used, so the target has to cross over. Same table
         // in both directions - it is its own inverse.
         const std::span<const uint16_t, amoeba::kNumMoveIds> toAbsolute = amoeba::policyToAbsolute(boards[i]->whiteToMove);
-        const size_t base = static_cast<size_t>(i) * amoeba::kNumMoveIds;
+        const size_t base = i * amoeba::kNumMoveIds;
 
         for (int slot = 0; slot < amoeba::kNumMoveIds; ++slot)
         {
@@ -364,7 +368,7 @@ Batch makeBatch(std::span<const amoeba::Board* const> boards, std::span<const Vi
             legal[base + slot] = boards[i]->isLegal(id) ? 1.0f : 0.0f;
             policy[base + slot] = static_cast<float>(visits[i][id]) / static_cast<float>(total);
         }
-    }
+    });
 
     return {
         mlx::core::array(input.data(), mlx::core::Shape{batch, amoeba::kEncodedSize}, mlx::core::float32),

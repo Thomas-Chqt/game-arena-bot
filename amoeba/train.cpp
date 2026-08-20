@@ -21,13 +21,14 @@
 // The defaults are meant for a real overnight run, not a smoke test. To check
 // the wiring quickly instead:
 //
-//   BLOCKS=2 WIDTH=64 HEADS=4 GAMES=8 SIMULATIONS=50 STEPS=100 GATE_GAMES=8
+//   BLOCKS=2 WIDTH=64 HEADS=4 GAMES=8 CONCURRENT=8 SIMULATIONS=50 STEPS=100
+//   GATE_GAMES=8 GATE_CONCURRENT=8
 //
 // Environment, all optional:
 //   network     BLOCKS WIDTH HEADS          (only read when starting from scratch)
-//   generating  SEED GAMES SIMULATIONS LEAVES SAMPLING_PLIES NOISE
+//   generating  SEED GAMES CONCURRENT SIMULATIONS LEAVES SAMPLING_PLIES NOISE
 //   training    STEPS BATCH RATE DECAY BUFFER
-//   gating      GATE_GAMES GATE GATE_SIMULATIONS
+//   gating      GATE_GAMES GATE_CONCURRENT GATE GATE_SIMULATIONS
 //
 // STEPS and GATE_GAMES are both caps rather than costs: training stops when the
 // held-out loss stops improving, and the gate stops as soon as the verdict is
@@ -44,8 +45,10 @@
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <print>
 #include <random>
@@ -53,7 +56,6 @@
 #include <span>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace bot
@@ -101,31 +103,41 @@ struct Settings
 
     // 400 simulations is half of AlphaZero's 800, which is the usual trade on one
     // machine: the policy target is a distribution over visits, and doubling the
-    // visits sharpens it far less than doubling the games broadens it.
-    // 64 leaves per forward pass rather than 16: the GPU is the bottleneck and it
-    // costs 0.16 ms/position at 64 against ~0.21 at 16, almost all of it fixed
-    // dispatch overhead. The cost is coarser search - only six rounds of "look,
-    // learn, redirect" per move at 400 simulations - which virtual loss covers
-    // but does not make free.
+    // visits sharpens it far less than doubling the games broadens it. It counts
+    // simulations through the root, so a re-rooted tree arrives with a good share
+    // of them already spent.
+    // One leaf per search, because the batch comes from the other games in flight
+    // and there is nothing to gain from guessing at a second leaf before hearing
+    // about the first.
     Config search = {.simulations = envInt("SIMULATIONS", 400),
-                     .batchSize   = envInt("LEAVES", 64)};
+                     .batchSize   = envInt("LEAVES", 1)};
 
-    // 200 games is roughly 20k positions. Fewer than that and each generation's
+    // 512 games is roughly 60k positions. Fewer than that and each generation's
     // training set is mostly the previous generation's, so the gate compares two
     // networks that saw nearly the same data and rejects almost everything.
-    int   games         = envInt("GAMES", 200);
+    int   games         = envInt("GAMES", 512);
     int   samplingPlies = envInt("SAMPLING_PLIES", 20);
     float noise         = envFloat("NOISE", 0.25f);
+
+    // How many games are in flight at once, which is also the batch the network
+    // sees: one position per game per round. The evaluator costs 0.155 ms/position
+    // at 256 against 3.84 ms on its own, so the field is what buys the throughput,
+    // and GAMES above it only keeps it full while the early finishers are replaced.
+    //
+    // Measure before trusting 256: a field of 64 came out at 1.82x the old code and
+    // a field of 256 at parity with it, which the evaluator's own numbers say should
+    // be impossible. See "Batching across games" in CLAUDE.md.
+    int concurrent = envInt("CONCURRENT", 256);
 
     int   steps     = envInt("STEPS", 1000);
     int   batchSize = envInt("BATCH", 256);
     float rate      = envFloat("RATE", 1e-3f);
     float decay     = envFloat("DECAY", 1e-4f);
 
-    // About the last ten generations. Older positions came from networks several
+    // About the last five generations. Older positions came from networks several
     // generations weaker and hold the current one back; keeping none of them at
-    // all makes each generation overfit the games it just played. ~440 MB.
-    size_t buffer = static_cast<size_t>(envInt("BUFFER", 200000));
+    // all makes each generation overfit the games it just played. ~650 MB.
+    size_t buffer = static_cast<size_t>(envInt("BUFFER", 300000));
 
     // 200 games puts the gate's error bar at +/-3.5%, which is what it takes for
     // a 55% result to mean anything - at 40 games the bar is +/-8% and promotion
@@ -137,13 +149,18 @@ struct Settings
     int   gateGames = envInt("GATE_GAMES", 200);
     float gate      = envFloat("GATE", 0.55f);
 
+    // A quarter of self-play's field, because a gate that stops early throws away
+    // whatever is still in flight. settled() needs twenty games in, and twenty of a
+    // field of 64 land well before the other 44 - which are then abandoned.
+    int gateConcurrent = envInt("GATE_CONCURRENT", 64);
+
     // Ranking two networks needs far less search than generating a training
     // target does: the visit counts are thrown away here, only the result counts.
     int gateSimulations = envInt("GATE_SIMULATIONS", 200);
 };
 
 // ---------------------------------------------------------------------------
-// Playing games
+// Playing games, hundreds of them at once
 // ---------------------------------------------------------------------------
 
 struct Sample
@@ -177,121 +194,259 @@ uint16_t chooseMove(const VisitCounts& counts, int ply, int samplingPlies, std::
     return bestMove(counts);
 }
 
-// `white` and `black` are the same search in self-play and different ones in the
-// gate. The samples come back with the game's result already written into them.
-std::vector<Sample> playGame(Search& white, Search& black, int samplingPlies, std::mt19937_64& rng)
+// Which network takes which colour, as indices into the field's network list.
+struct Pairing
 {
+    int white;
+    int black;
+};
+
+// One game in flight.
+struct Playing
+{
+    amoeba::Board         board;
+    std::vector<uint64_t> history;
     std::vector<Sample>   samples;
-    amoeba::Board         board = amoeba::startPosition();
-    std::vector<uint64_t> history{board.hash};
+    std::mt19937_64       rng;
+    Pairing               pairing{0, 0};
+    int                   id     = 0;
+    bool                  active = false;
 
-    while (board.state == amoeba::State::Ongoing)
+    // One tree per network, not per colour. Self-play has a single network and so
+    // a single tree, which it re-roots after every ply instead of every other one -
+    // that is where most of the reuse comes from, since the tree keeps what both
+    // sides found. The gate has two, because a tree's statistics are worth exactly
+    // what the network that produced them is.
+    std::vector<Search> trees;
+
+    // Set fresh each round: the boards this game cannot go on without, which
+    // network owes it the answers, and where they sit in that network's batch.
+    std::span<const amoeba::Board* const> pending;
+    int                                   network = 0;
+    size_t                                offset  = 0;
+};
+
+// Plays a whole field of games at once, one simulation each per round, so that a
+// single network call answers every game in flight. The batch is the size of the
+// field rather than the size of whatever leaves one search could guess at, and
+// nothing is stale: each descent sees the statistics its own tree ended the last
+// round with, so no virtual loss is needed and none is applied.
+class Field
+{
+public:
+    Field(std::span<Evaluator* const> networks, Config search, int samplingPlies)
+        : m_networks(networks), m_search(search), m_samplingPlies(samplingPlies)
     {
-        Search&           search = board.whiteToMove ? white : black;
-        const VisitCounts counts = search.run(board, history);
-        samples.push_back({board, counts, 0.0f, 0});
-
-        const uint16_t chosen = chooseMove(counts, board.ply, samplingPlies, rng);
-        board = amoeba::apply(board, amoeba::Move::fromId(chosen), history);
-        history.push_back(board.hash);
     }
 
-    for (Sample& sample : samples) {
-        sample.outcome = outcomeFor(board.state, sample.board.whiteToMove);
+    // Plays `games` games with `slots` of them in flight, refilling a slot as its
+    // game ends so the batch stays full until the work runs out. `pairingFor(game)`
+    // says who plays which colour; `finished` is handed each game as it ends, under
+    // a lock, so its tally needs no synchronisation of its own. `finished` returning
+    // false stops the field there and then - the games still in flight are
+    // abandoned, so the tally is exactly what it was when it said stop.
+    void play(int games, int slots, uint64_t seed, const char* label,
+              const std::function<Pairing(int)>&                     pairingFor,
+              const std::function<bool(int, std::vector<Sample>&&)>& finished);
+
+private:
+    void begin(Playing&, int id, Pairing, uint64_t seed) const;
+    void takeToPending(Playing&) const;
+
+    std::span<Evaluator* const> m_networks;
+    Config                      m_search;
+    int                         m_samplingPlies;
+};
+
+void Field::begin(Playing& game, int id, Pairing pairing, uint64_t seed) const
+{
+    game.id      = id;
+    game.board   = amoeba::startPosition();
+    game.pairing = pairing;
+    game.active  = true;
+    game.history.assign(1, game.board.hash);
+    game.samples.clear();
+    game.rng.seed(seed ^ (0x9e3779b97f4a7c15ULL * (static_cast<uint64_t>(id) + 1)));
+
+    // Everything random about a game comes from its id, never from which slot or
+    // thread happened to pick it up, so a whole run stays reproducible from SEED
+    // however the field interleaves.
+    game.trees.clear();
+    for (size_t i = 0; i < m_networks.size(); ++i)
+    {
+        Config config    = m_search;
+        config.noiseSeed = seed + static_cast<uint64_t>(id);
+        game.trees.emplace_back(config);
     }
-    return samples;
+    for (Search& tree : game.trees)
+        tree.restart(game.board, game.history);
 }
 
-// Games share nothing, so one slot per game means each thread writes where nobody
-// else does and no lock is needed. Seeding from the game index rather than the
-// thread keeps a whole run reproducible from SEED however the threads interleave.
-//
-// Concurrent MLX evaluation was tested and behaved - 24 searches across 8 threads
-// agreed with the single-threaded result - but that is evidence, not a guarantee.
-// If self-play ever misbehaves in a way that smells like a race, try one thread.
-// `playOne` returns false once further games cannot change the answer - the gate
-// uses that to quit early. Games already in flight still finish, so the count
-// that comes back is not necessarily where it stopped asking.
-template <typename PlayOne>
-int acrossGames(int games, const char* label, PlayOne&& playOne)
+// Plays as far as it can without an evaluation, leaving the boards it is waiting
+// on in `pending` - or leaving it empty, which means the game is over.
+void Field::takeToPending(Playing& game) const
 {
-    const unsigned    threads = std::max(1u, std::thread::hardware_concurrency());
-    std::atomic<int>  nextGame{0};
-    std::atomic<int>  completed{0};
-    std::atomic<bool> stop{false};
-    const auto        start = std::chrono::steady_clock::now();
+    while (game.board.state == amoeba::State::Ongoing)
+    {
+        const int network = game.board.whiteToMove ? game.pairing.white : game.pairing.black;
+        Search&   tree    = game.trees[static_cast<size_t>(network)];
 
-    const auto worker = [&] {
-        for (;;)
+        const std::span<const amoeba::Board* const> pending = tree.pendingLeaves();
+        if (!pending.empty())
         {
-            const int game = nextGame.fetch_add(1);
-            if (game >= games || stop.load())
-                return;
+            game.network = network;
+            game.pending = pending;
+            return;
+        }
 
-            if (!playOne(game))
-                stop = true;
+        const VisitCounts counts = tree.visits();
+        game.samples.push_back({game.board, counts, 0.0f, game.id});
 
-            const int done = completed.fetch_add(1) + 1;
-            if (done == 1 || done % 25 == 0 || done == games)
-            {
-                const double elapsed =
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-                report("[{}] {}/{} games, {:.0f}s elapsed, {:.0f}s left", label, done, games, elapsed,
-                       elapsed / done * (games - done));
-            }
+        const uint16_t chosen = chooseMove(counts, game.board.ply, m_samplingPlies, game.rng);
+        game.board = amoeba::apply(game.board, amoeba::Move::fromId(chosen), game.history);
+        game.history.push_back(game.board.hash);
+
+        // Every tree follows the game, not just the one that was searching: a tree
+        // can only keep a subtree while its root is where the game is.
+        for (Search& follower : game.trees)
+            follower.advance(chosen, game.board, game.history);
+    }
+    game.pending = {};
+}
+
+void Field::play(int games, int slots, uint64_t seed, const char* label,
+                 const std::function<Pairing(int)>&                     pairingFor,
+                 const std::function<bool(int, std::vector<Sample>&&)>& finished)
+{
+    if (games <= 0)
+        return;
+
+    std::vector<Playing> field(static_cast<size_t>(std::max(1, std::min(games, slots))));
+    std::vector<std::vector<const amoeba::Board*>> boards(m_networks.size());
+    std::vector<std::vector<Evaluation>>           answers(m_networks.size());
+
+    std::mutex        gatekeeper;
+    std::atomic<bool> wanted{true};
+    int               started   = 0;
+    int               completed = 0;
+    const auto        clock     = std::chrono::steady_clock::now();
+
+    report("[{}] {} games, {} in flight at {} simulations, {} leaves per search", label, games,
+           field.size(), m_search.simulations, m_search.batchSize);
+
+    for (Playing& game : field)
+    {
+        begin(game, started, pairingFor(started), seed);
+        ++started;
+    }
+
+    // Hands a finished game over and takes on the next one, under one lock: it is
+    // where the caller keeps its tally and decides whether any more games are worth
+    // playing, and it runs once per game rather than once per round.
+    const auto handOver = [&](Playing& game) {
+        for (Sample& sample : game.samples) {
+            sample.outcome = outcomeFor(game.board.state, sample.board.whiteToMove);
+        }
+
+        const std::lock_guard guard{gatekeeper};
+        if (!finished(game.id, std::move(game.samples)))
+            wanted = false;
+
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - clock).count();
+        ++completed;
+        if (completed == 1 || completed % 25 == 0 || completed == games)
+            report("[{}] {}/{} games, {:.0f}s elapsed, {:.0f}s left", label, completed, games, elapsed,
+                   elapsed / completed * (games - completed));
+
+        if (!wanted || started >= games)
+        {
+            game.active = false;
+            return;
+        }
+        begin(game, started, pairingFor(started), seed);
+        ++started;
+    };
+
+    const std::function<void(size_t)> round = [&](size_t slot) {
+        Playing& game = field[slot];
+        if (!game.active)
+            return;
+
+        if (!game.pending.empty())
+            game.trees[static_cast<size_t>(game.network)].absorb(
+                std::span{answers[static_cast<size_t>(game.network)]}.subspan(game.offset, game.pending.size()));
+
+        takeToPending(game);
+        while (game.active && game.pending.empty())
+        {
+            handOver(game);
+            if (game.active)
+                takeToPending(game);
         }
     };
 
+    for (;;)
     {
-        std::vector<std::jthread> pool;
-        pool.reserve(threads);
-        for (unsigned i = 0; i < threads; ++i) {
-            pool.emplace_back(worker);
+        ThreadPool::global().forEach(field.size(), round);
+        if (!wanted)
+            return;
+
+        size_t total = 0;
+        for (std::vector<const amoeba::Board*>& group : boards) {
+            group.clear();
+        }
+        for (Playing& game : field)
+        {
+            if (!game.active || game.pending.empty())
+                continue;
+
+            std::vector<const amoeba::Board*>& group = boards[static_cast<size_t>(game.network)];
+            game.offset = group.size();
+            group.insert(group.end(), game.pending.begin(), game.pending.end());
+            total += game.pending.size();
+        }
+        if (total == 0)
+            return;
+
+        // One call per network, from one thread. MLX is dispatch-bound at this size,
+        // so a single stream of large batches beats several threads each pushing a
+        // small one, and it is the whole reason the games are driven in lockstep.
+        for (size_t n = 0; n < m_networks.size(); ++n)
+        {
+            if (boards[n].empty())
+                continue;
+            answers[n].resize(boards[n].size());
+            m_networks[n]->evaluate(boards[n], answers[n]);
         }
     }
-    return completed.load();
 }
 
 std::vector<Sample> selfPlay(const Network& best, const Settings& settings, uint64_t seed)
 {
-    Config search  = settings.search;
+    Config search    = settings.search;
     search.rootNoise = settings.noise;
 
-    report("[selfplay] {} games at {} simulations, {} leaves, noise {:.2f}", settings.games,
-           search.simulations, search.batchSize, search.rootNoise);
-
-    std::vector<std::vector<Sample>> perGame(static_cast<size_t>(settings.games));
-
-    acrossGames(settings.games, "selfplay", [&](int game) {
-        const uint64_t gameSeed = seed + static_cast<uint64_t>(game);
-
-        NetworkEvaluator evaluator{best};
-        Config           config = search;
-        config.noiseSeed        = gameSeed;
-        Search          tree{evaluator, config};
-        std::mt19937_64 rng{seed ^ (0x9e3779b97f4a7c15ULL * (static_cast<uint64_t>(game) + 1))};
-
-        std::vector<Sample> played = playGame(tree, tree, settings.samplingPlies, rng);
-        for (Sample& sample : played) {
-            sample.game = game;
-        }
-        perGame[static_cast<size_t>(game)] = std::move(played);
-        return true;   // self-play always plays every game it was asked for
-    });
+    NetworkEvaluator evaluator{best};
+    Evaluator* const networks[]{&evaluator};
 
     std::vector<Sample> samples;
     int whiteWins = 0, blackWins = 0, draws = 0;
-    for (const std::vector<Sample>& game : perGame)
-    {
-        samples.insert(samples.end(), game.begin(), game.end());
 
-        // The last sample's mover lost, drew, or was adjudicated against; read the
-        // result off it rather than threading the final Board out of playGame.
-        const float last = game.back().outcome;
-        if (last == 0.0f) ++draws;
-        else if (game.back().board.whiteToMove == (last > 0.0f)) ++whiteWins;
-        else ++blackWins;
-    }
+    Field field{networks, search, settings.samplingPlies};
+    field.play(settings.games, settings.concurrent, seed, "selfplay",
+               [](int) { return Pairing{0, 0}; },
+               [&](int, std::vector<Sample>&& played) {
+                   // The last sample's mover lost, drew, or was adjudicated against;
+                   // read the result off it rather than threading the final Board out.
+                   const float last = played.back().outcome;
+                   if (last == 0.0f) ++draws;
+                   else if (played.back().board.whiteToMove == (last > 0.0f)) ++whiteWins;
+                   else ++blackWins;
+
+                   samples.insert(samples.end(), std::make_move_iterator(played.begin()),
+                                  std::make_move_iterator(played.end()));
+                   return true;   // self-play always plays every game it was asked for
+               });
 
     report("[selfplay] {} positions from {} games: {} White, {} Black, {} drawn", samples.size(),
            settings.games, whiteWins, blackWins, draws);
@@ -477,47 +632,41 @@ double gate(const Network& candidate, const Network& champion, const Settings& s
     search.simulations = settings.gateSimulations;
     search.rootNoise   = 0.0f;   // competition keeps the network's own opinion
 
-    std::atomic<int> wins{0};
-    std::atomic<int> draws{0};
-    std::atomic<int> losses{0};
+    NetworkEvaluator candidateEval{candidate};
+    NetworkEvaluator championEval{champion};
+    Evaluator* const networks[]{&candidateEval, &championEval};
 
-    acrossGames(settings.gateGames, "gate", [&](int game) {
-        const uint64_t gameSeed = seed + static_cast<uint64_t>(game);
+    int wins = 0, draws = 0, losses = 0;
 
-        NetworkEvaluator candidateEval{candidate};
-        NetworkEvaluator championEval{champion};
-        Search           candidateSearch{candidateEval, search};
-        Search           championSearch{championEval, search};
+    // A smaller field than self-play, because everything still in flight when the
+    // verdict settles is work thrown away: settled() is consulted on each game that
+    // comes in, and the twentieth of 64 lands long before the rest.
+    Field field{networks, search, settings.samplingPlies};
+    field.play(settings.gateGames, settings.gateConcurrent, seed, "gate",
+               [](int game) { return game % 2 == 0 ? Pairing{0, 1} : Pairing{1, 0}; },
+               [&](int game, std::vector<Sample>&& played) {
+                   // The final sample is from the point of view of the side that lost or drew.
+                   const Sample& last     = played.back();
+                   const bool    whiteWon = last.outcome < 0.0f ? !last.board.whiteToMove : last.board.whiteToMove;
 
-        const bool candidateIsWhite = game % 2 == 0;
-        Search&    white = candidateIsWhite ? candidateSearch : championSearch;
-        Search&    black = candidateIsWhite ? championSearch : candidateSearch;
+                   if (last.outcome == 0.0f)
+                       ++draws;
+                   else if (whiteWon == (game % 2 == 0))
+                       ++wins;
+                   else
+                       ++losses;
 
-        std::mt19937_64           rng{gameSeed};
-        const std::vector<Sample> played = playGame(white, black, settings.samplingPlies, rng);
+                   const int    total = wins + draws + losses;
+                   const double score = (wins + 0.5 * draws) / total;
+                   return !settled(total, score, settings.gate);
+               });
 
-        // The final sample is from the point of view of the side that lost or drew.
-        const Sample& last     = played.back();
-        const bool    whiteWon = last.outcome < 0.0f ? !last.board.whiteToMove : last.board.whiteToMove;
-
-        if (last.outcome == 0.0f)
-            draws.fetch_add(1);
-        else if (whiteWon == candidateIsWhite)
-            wins.fetch_add(1);
-        else
-            losses.fetch_add(1);
-
-        const int    total = wins.load() + draws.load() + losses.load();
-        const double score = (wins.load() + 0.5 * draws.load()) / total;
-        return !settled(total, score, settings.gate);
-    });
-
-    const int    total = wins.load() + draws.load() + losses.load();
-    const double score = (wins.load() + 0.5 * draws.load()) / total;
+    const int    total = wins + draws + losses;
+    const double score = (wins + 0.5 * draws) / total;
 
     report("[gate] candidate {:.1f}% +/- {:.1f}% ({}-{}-{}) over {} games at {} simulations",
-           100.0 * score, 100.0 * standardError(score, total), wins.load(), draws.load(),
-           losses.load(), total, settings.gateSimulations);
+           100.0 * score, 100.0 * standardError(score, total), wins, draws, losses, total,
+           settings.gateSimulations);
     return score;
 }
 
