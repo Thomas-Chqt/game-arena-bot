@@ -1,7 +1,8 @@
 #ifndef NETWORK_HPP
 #define NETWORK_HPP
 
-// The network behind bot::Evaluator. Untrained: runInference() computes, nothing fits it yet.
+// The neural network used to evaluate MCTS leaves. Untrained: runInference()
+// computes, nothing fits it yet.
 //
 // encodeBoard() already produces 37 hex blocks plus 8 globals, so the natural unit is
 // a token per hex: 37 tokens, attention between all of them, a policy head of 12
@@ -41,8 +42,7 @@ inline constexpr int policyOutputsPerHex = amoeba::directionCount * 2;
 // which is exactly the attack relation the rules are written in. The stride for
 // direction is the number of distance buckets, not the number of directions -
 // they are both 6 here, which makes the mistake invisible.
-inline constexpr auto relativePositionBuckets =
-    [] -> std::array<std::array<uint8_t, amoeba::hexCount>, amoeba::hexCount>
+inline constexpr auto relativePositionBuckets = [] -> std::array<std::array<uint8_t, amoeba::hexCount>, amoeba::hexCount>
 {
     std::array<std::array<uint8_t, amoeba::hexCount>, amoeba::hexCount> table{};
     for (int sourceHex = 0; sourceHex < amoeba::hexCount; ++sourceHex)
@@ -113,12 +113,11 @@ struct Prediction
 };
 
 // `parameters` is walked positionally, so it must be in Network::parameterLayout() order.
-Prediction runInference(const std::vector<mlx::core::array>& parameters, NetworkShape shape,
-                        const mlx::core::array& input);
+Prediction runInference(const std::vector<mlx::core::array>& parameters, NetworkShape shape, const mlx::core::array& input);
 
 // Encodes a batch of boards, runs one forward pass, and hands the search back
 // probabilities over legal moves in absolute move ids.
-class NetworkEvaluator final : public Evaluator
+class NetworkEvaluator
 {
 public:
     explicit NetworkEvaluator(const Network& network)
@@ -126,7 +125,7 @@ public:
     {
     }
 
-    void evaluate(std::span<const amoeba::Board* const> boards, std::span<Evaluation> outputs) override;
+    void evaluate(std::span<const amoeba::Board* const> boards, std::span<Evaluation> outputs);
 
 private:
     const Network& m_network;
@@ -152,14 +151,13 @@ struct TrainingBatch
     mlx::core::array valueTarget;  // [batch], in [-1, 1]
 };
 
-// `visits` is indexed by absolute amoeba::Move::id, straight off Search::run.
+// `visits` is indexed by absolute amoeba::Move::id, straight off MCTS::visits().
 // `outcomes` is already from the point of view of the side to move at that
 // position: +1 if they went on to win, -1 if they lost, 0 for a draw. Getting
 // that sign wrong trains a bot that prefers losing while the loss curve stays
 // healthy, so it is deliberately the caller's business - only self-play knows the
 // result - and this function will not second-guess it.
-TrainingBatch makeTrainingBatch(std::span<const amoeba::Board* const> boards, std::span<const VisitCounts> visits,
-                                std::span<const float> outcomes);
+TrainingBatch makeTrainingBatch(std::span<const amoeba::Board* const> boards, std::span<const VisitCounts> visits, std::span<const float> outcomes);
 
 // Returns { total, policy, value }. The total is the scalar to differentiate; the
 // two components come back alongside because they say different things - a value
@@ -174,8 +172,7 @@ TrainingBatch makeTrainingBatch(std::span<const amoeba::Board* const> boards, st
 // biases as well; separating those out is not worth it at this size. Pass 0 when
 // overfitting a single batch on purpose, since the penalty otherwise keeps the
 // loss off zero and hides whether the gradients actually connect.
-std::vector<mlx::core::array> computeLoss(const std::vector<mlx::core::array>& parameters, NetworkShape shape,
-                                          const TrainingBatch& batch, float weightDecay);
+std::vector<mlx::core::array> computeLoss(const std::vector<mlx::core::array>& parameters, NetworkShape shape, const TrainingBatch& batch, float weightDecay);
 
 // The decay rates are the conventional beta1 and beta2, named for what they do.
 // 0.9 averages roughly the last ten gradients, 0.999 the last thousand. epsilon
@@ -214,8 +211,7 @@ public:
     //
     // `rate` is an argument rather than config because it is expected to fall on a
     // schedule as training progresses.
-    std::vector<mlx::core::array> updateParameters(const std::vector<mlx::core::array>& parameters,
-                                                   const std::vector<mlx::core::array>& gradients, float rate);
+    std::vector<mlx::core::array> updateParameters(const std::vector<mlx::core::array>& parameters, const std::vector<mlx::core::array>& gradients, float rate);
 
     int steps() const { return m_steps; }
 

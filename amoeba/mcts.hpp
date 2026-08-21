@@ -3,7 +3,7 @@
 
 // ---------------------------------------------------------------------------
 // PUCT Monte Carlo tree search, the AlphaZero variant: no random playouts in
-// the search itself, the value of a new position comes from an Evaluator.
+// the search itself, and the caller supplies the value of each new position.
 //
 // The tree keeps two numbers per move: how many simulations went through it,
 // and the sum of the values that came back. Their ratio is the move's running
@@ -15,71 +15,21 @@
 // Every stored value is from the point of view of the side to move at the node
 // that owns it, which is why the backup flips sign once per level.
 //
-// The search does not own an evaluator and does not call one. It hands out the
-// boards it is waiting on and takes the answers back, so the batch that reaches
-// the network can be gathered across every game in flight rather than out of one
-// search's guesses. runSearch() is the one-game convenience wrapper.
+// Each descent hands its one leaf to the caller, then receives that leaf's
+// evaluation before the next descent. A caller driving several independent
+// searches may batch those leaves.
 // ---------------------------------------------------------------------------
 
 #include "amoeba.hpp"
 
 #include <array>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
 #include <cstdint>
-#include <exception>
-#include <functional>
-#include <mutex>
-#include <random>
+#include <optional>
 #include <span>
-#include <thread>
-#include <utility>
 #include <vector>
 
 namespace bot
 {
-
-// One set of threads for the whole process, because everything here wants all of
-// the machine and nothing wants to share it with another pool: self-play descends
-// hundreds of trees, the trainer encodes hundreds of boards per step, and both
-// are bursts of identical work with no reason to own threads between bursts.
-class ThreadPool
-{
-public:
-    static ThreadPool& global();
-
-    explicit ThreadPool(unsigned width);
-    ~ThreadPool();
-
-    unsigned width() const { return static_cast<unsigned>(m_workers.size()) + 1; }
-
-    // Runs body(0), ..., body(count - 1) somewhere across the pool and returns
-    // once every one of them has run. The calling thread takes indices too, so a
-    // one-thread pool is just a loop and no work is left waiting on a thread that
-    // does not exist.
-    //
-    // A call from inside a body runs serially: the outer call already has every
-    // thread, so waiting for one here would deadlock. An exception from a body is
-    // rethrown to the caller once the round has finished.
-    void forEach(size_t taskCount, const std::function<void(size_t)>& task);
-
-private:
-    void workerLoop();
-    void runAvailableTasks();
-
-    std::mutex m_mutex;
-    std::condition_variable m_workAvailable;
-    std::condition_variable m_roundFinished;
-    const std::function<void(size_t)>* m_task = nullptr;
-    size_t m_taskCount = 0;
-    std::atomic<size_t> m_nextTaskIndex{0};
-    uint64_t m_roundId = 0;
-    unsigned m_activeWorkerCount = 0;
-    bool m_stopping = false;
-    std::exception_ptr m_taskFailure;
-    std::vector<std::thread> m_workers;
-};
 
 // What the search wants to know about a position it has just reached.
 //
@@ -92,50 +42,12 @@ struct Evaluation
     float value;
 };
 
-class Evaluator
+struct MCTSConfig
 {
-public:
-    virtual ~Evaluator() = default;
-
-    // `out` is the same length as `boards`. Plural because evaluating a single
-    // position on a GPU wastes most of the device: 1.70 ms for one position
-    // against 0.15 ms each for 256.
-    virtual void evaluate(std::span<const amoeba::Board* const> boards, std::span<Evaluation> outputs) = 0;
-};
-
-// Uniform priors, and a value read off one uniformly random playout to the end
-// of the game. It knows nothing about Amoeba, but it makes the search playable
-// before the network exists and it is the baseline the network has to beat.
-class RolloutEvaluator final : public Evaluator
-{
-public:
-    explicit RolloutEvaluator(uint64_t seed)
-        : m_randomEngine(seed)
-    {
-    }
-
-    void evaluate(std::span<const amoeba::Board* const> boards, std::span<Evaluation> outputs) override;
-
-private:
-    float playout(amoeba::Board);
-
-    std::mt19937_64 m_randomEngine;
-};
-
-struct Config
-{
-    // Simulations through the root, not new ones: a re-rooted tree arrives with
-    // some of them already spent, and that is the whole point of keeping it.
+    // Every move starts a fresh tree and receives this many simulations through
+    // its root.
     int simulations = 800;
     float explorationConstant = 1.5f;
-
-    // The search stops at the simulation count or the deadline, whichever comes
-    // first, and always runs one batch so the visit counts can never be empty.
-    // Match play sets the count high and lets the clock bind: a turn that arrives
-    // late is a forfeit, while a turn that only managed 300 simulations is merely
-    // a weaker move. Self-play does the reverse, so its data does not depend on
-    // how busy the machine was.
-    std::chrono::milliseconds deadline = std::chrono::hours{1};
 
     // Self-play only, and off by default so competition keeps the network's own
     // opinion. A network is deterministic and so is edge selection, so without
@@ -152,54 +64,29 @@ struct Config
     float rootNoise = 0.0f;
     float noiseAlpha = 0.35f;
     uint64_t noiseSeed = 0;
-
-    // How many leaves one search offers per round. Leave it at 1 whenever there
-    // are other games to batch with: descents inside a round cannot see each
-    // other's results, so they need a virtual loss to diverge at all and they
-    // still choose on statistics that are one round stale. Raise it only when a
-    // single search has to fill the batch by itself, which is match play - there
-    // the alternative is one position per forward pass and ten times the cost.
-    int batchSize = 1;
 };
 
 // Simulations spent on each move id. The argmax is the move to play; normalised
 // it is the policy target the network trains on.
 using VisitCounts = std::array<uint32_t, amoeba::moveIdCount>;
 
-class Search
+class MCTS
 {
 public:
-    explicit Search(Config config = {})
-        : m_config(config)
-        , m_randomEngine(config.noiseSeed)
-    {
-    }
+    // `history` is the hash of every position the real game has passed through,
+    // ending with `root`'s own; amoeba::applyMove() needs it to see repetitions
+    // that the search walks into. One MCTS searches this one root only.
+    MCTS(const amoeba::Board& root, std::span<const uint64_t> history, MCTSConfig config = {});
 
-    // Throws the tree away and starts again at `root`. `history` is the hash of
-    // every position the real game has passed through, ending with `root`'s own;
-    // amoeba::applyMove() needs it to see repetitions that the search walks into.
-    void restart(const amoeba::Board& root, std::span<const uint64_t> history);
-
-    // Re-roots on the child node `moveId` leads to and keeps its subtree, so the
-    // simulations that already went through that move are still there next turn -
-    // 20-40% of the next search for free, and more when the move played was the
-    // one the search liked. Falls back to restart() when that child node was never
-    // expanded, which is what happens when the opponent plays something the search
-    // never looked at.
+    // Descends once and returns the leaf that needs a network evaluation. A null
+    // pointer means the budget is spent and visits() is ready. Terminal leaves are
+    // backed up immediately because their value comes from the rules.
     //
-    // The path from the new root down is the same path it always was, only with one
-    // more ply of it now living in the game history, so every node's
-    // repetition-dependent verdict stays true.
-    void advance(uint16_t moveId, const amoeba::Board& next, std::span<const uint64_t> history);
+    // The pointer stays valid until absorb() or this MCTS is destroyed.
+    const amoeba::Board* pendingLeaf();
 
-    // The boards this search cannot go any further without an evaluation of.
-    // Empty means it has spent its budget and visits() is ready to read.
-    //
-    // The pointers stay valid until the next call to any of these three.
-    std::span<const amoeba::Board* const> pendingLeaves();
-
-    // Answers to the last pendingLeaves(), in the same order.
-    void absorb(std::span<const Evaluation>);
+    // Expands and backs up the leaf returned by pendingLeaf().
+    void absorb(const Evaluation&);
 
     VisitCounts visits() const;
 
@@ -221,59 +108,26 @@ private:
         uint32_t visits;
     };
 
-    // Where one descent ended, and everything needed to back it up once its leaf
-    // has been evaluated.
-    struct Descent
-    {
-        uint32_t edgeTrailStart;
-        uint32_t edgeTrailLength;
-        int32_t expandedEdgeIndex; // -1 when the descent ends at a terminal node
-        int32_t pendingBoardIndex; // -1 when no network evaluation is needed
-        float terminalValue;
-    };
-
     uint32_t addNode(const amoeba::Board&, const Evaluation&);
     uint32_t selectEdgeToExplore(uint32_t node) const;
-    int32_t findRootChild(uint16_t moveId) const;
-    void retainSubtree(uint32_t node);
     void addExplorationNoise();
-    void collectPendingLeaves(int requestedLeafCount);
-    void backpropagate(std::span<const Evaluation>);
-    bool hasSpentBudget() const;
+    bool descend();
+    void backpropagate(float value);
 
-    Config m_config;
+    MCTSConfig m_config;
 
     std::vector<Node> m_nodes; // node 0 is always the root
     std::vector<Edge> m_edges;
-    std::vector<Node> m_spareNodes; // buffers for re-rooting, swapped in
-    std::vector<Edge> m_spareEdges;
-    std::vector<uint64_t> m_positionHistory; // the game history, then hashes down the descent being collected
-    size_t m_gameHistoryLength = 0;
 
-    amoeba::Board m_rootBoard;
-    bool m_rootNeedsEvaluation = true; // the root exists but has not been evaluated yet
+    std::array<uint64_t, amoeba::moveLimit + 1> m_gameHistory;
+    size_t m_gameHistorySize;
 
-    // The clock starts when the search does, not when the root is set: match play
-    // re-roots as soon as it hears the opponent's move and only searches when it is
-    // asked for one, and the wait in between is not part of its turn.
-    std::chrono::steady_clock::time_point m_deadline;
-    bool m_searchStarted = false;
+    std::array<uint32_t, amoeba::moveLimit> m_edgeTrail;
+    size_t m_edgeTrailSize = 0;
 
-    std::mt19937_64 m_randomEngine;
-    std::vector<float> m_rootNoiseValues;
-
-    std::vector<Descent> m_descents;
-    std::vector<uint32_t> m_edgeTrails; // every trail in the round, concatenated
-    std::vector<amoeba::Board> m_pendingBoards;
-    std::vector<const amoeba::Board*> m_pendingBoardPointers;
+    std::optional<amoeba::Board> m_pendingLeaf;
 };
 
-// Drives one search to the end against one evaluator. Match play has a single
-// game, so its batch can only come from inside a single search; self-play has
-// hundreds and gathers across them instead.
-VisitCounts runSearch(Search&, Evaluator&);
-
-uint16_t randomLegalMove(const amoeba::Board&, std::mt19937_64&);
 uint16_t bestMove(const VisitCounts&);
 
 // What a finished game is worth to a given side. Every value in the search and

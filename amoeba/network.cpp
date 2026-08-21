@@ -201,8 +201,9 @@ void Network::save(const std::filesystem::path& checkpoint) const
 
 size_t Network::parameterCount() const
 {
-    return std::accumulate(m_parameters.begin(), m_parameters.end(), size_t{0},
-                           [](size_t total, const mlx::core::array& tensor) { return total + tensor.size(); });
+    return std::accumulate(m_parameters.begin(), m_parameters.end(), size_t{0}, [](size_t total, const mlx::core::array& tensor) {
+        return total + tensor.size();
+    });
 }
 
 void Network::replaceParameters(std::vector<mlx::core::array> parameters)
@@ -322,23 +323,21 @@ void NetworkEvaluator::evaluate(std::span<const amoeba::Board* const> boards, st
     std::vector<float> encodedBoards(static_cast<size_t>(batchSize) * amoeba::encodedBoardSize);
     std::vector<float> legalMoveMask(static_cast<size_t>(batchSize) * amoeba::moveIdCount);
 
-    // Every position writes into its own slice, so the whole batch goes across the
-    // pool. At the sizes the search now asks for - hundreds of boards, one per game
-    // in flight - encoding them one after another is measurable next to the forward
-    // pass it is feeding.
-    ThreadPool::global().forEach(
-        static_cast<size_t>(batchSize),
-        [&](size_t boardIndex)
-        {
-            const size_t encodedBoardOffset = boardIndex * amoeba::encodedBoardSize;
-            const size_t maskOffset = boardIndex * amoeba::moveIdCount;
+    for (size_t boardIndex = 0; boardIndex < boards.size(); ++boardIndex)
+    {
+        const size_t encodedBoardOffset = boardIndex * amoeba::encodedBoardSize;
+        const size_t maskOffset = boardIndex * amoeba::moveIdCount;
 
-            amoeba::encodeBoard(*boards[boardIndex], std::span<float, amoeba::encodedBoardSize>(encodedBoards.data() + encodedBoardOffset, amoeba::encodedBoardSize));
+        amoeba::encodeBoard(*boards[boardIndex], std::span<float, amoeba::encodedBoardSize>(
+                                                      encodedBoards.data() + encodedBoardOffset,
+                                                      amoeba::encodedBoardSize));
 
-            const std::span<const uint16_t, amoeba::moveIdCount> moveIdsByPolicyIndex = amoeba::policyIndicesToMoveIds(boards[boardIndex]->whiteToMove);
-            for (int policyIndex = 0; policyIndex < amoeba::moveIdCount; ++policyIndex)
-                legalMoveMask[maskOffset + policyIndex] = boards[boardIndex]->isLegal(moveIdsByPolicyIndex[policyIndex]) ? 1.0f : 0.0f;
-        });
+        const std::span<const uint16_t, amoeba::moveIdCount> moveIdsByPolicyIndex =
+            amoeba::policyIndicesToMoveIds(boards[boardIndex]->whiteToMove);
+        for (int policyIndex = 0; policyIndex < amoeba::moveIdCount; ++policyIndex)
+            legalMoveMask[maskOffset + policyIndex] =
+                boards[boardIndex]->isLegal(moveIdsByPolicyIndex[policyIndex]) ? 1.0f : 0.0f;
+    }
 
     const mlx::core::array input(encodedBoards.data(), mlx::core::Shape{batchSize, amoeba::encodedBoardSize}, mlx::core::float32);
     const Prediction prediction = runInference(m_network.parameters(), m_network.shape(), input);
@@ -358,14 +357,14 @@ void NetworkEvaluator::evaluate(std::span<const amoeba::Board* const> boards, st
     const float* policyData = probabilities.data<float>();
     const float* valueData = prediction.value.data<float>();
 
-    ThreadPool::global().forEach(static_cast<size_t>(batchSize), [&](size_t boardIndex)
+    for (size_t boardIndex = 0; boardIndex < boards.size(); ++boardIndex)
     {
         const std::span<const uint16_t, amoeba::moveIdCount> moveIdsByPolicyIndex = amoeba::policyIndicesToMoveIds(boards[boardIndex]->whiteToMove);
         const size_t policyOffset = boardIndex * amoeba::moveIdCount;
         for (int policyIndex = 0; policyIndex < amoeba::moveIdCount; ++policyIndex)
             outputs[boardIndex].policy[moveIdsByPolicyIndex[policyIndex]] = policyData[policyOffset + policyIndex];
         outputs[boardIndex].value = valueData[boardIndex];
-    });
+    }
 }
 
 // ===========================================================================
@@ -385,41 +384,33 @@ TrainingBatch makeTrainingBatch(std::span<const amoeba::Board* const> boards, st
     std::vector<float> legal(static_cast<size_t>(batch) * amoeba::moveIdCount);
     std::vector<float> policy(static_cast<size_t>(batch) * amoeba::moveIdCount);
 
-    // One slice per position again, and this one is on the critical path of every
-    // training step: a batch of 256 boards has to be encoded before the step can
-    // start, and the step itself is a few milliseconds.
-    ThreadPool::global().forEach(
-        static_cast<size_t>(batch),
-        [&](size_t sampleIndex)
+    for (size_t sampleIndex = 0; sampleIndex < boards.size(); ++sampleIndex)
+    {
+        const size_t inputOffset = sampleIndex * amoeba::encodedBoardSize;
+        amoeba::encodeBoard(*boards[sampleIndex], std::span<float, amoeba::encodedBoardSize>(
+                                                      input.data() + inputOffset, amoeba::encodedBoardSize));
+
+        uint64_t totalVisits = 0;
+        for (const uint32_t count : visits[sampleIndex])
+            totalVisits += count;
+        if (totalVisits == 0)
+            throw std::runtime_error(std::format("sample {} has no visits, so it has no policy to learn", sampleIndex));
+
+        // The search counts moves in absolute ids and runInference() answers in the
+        // flipped space encodeBoard() used, so the target has to cross over. Same table
+        // in both directions - it is its own inverse.
+        const std::span<const uint16_t, amoeba::moveIdCount> moveIdsByPolicyIndex =
+            amoeba::policyIndicesToMoveIds(boards[sampleIndex]->whiteToMove);
+        const size_t policyOffset = sampleIndex * amoeba::moveIdCount;
+
+        for (int policyIndex = 0; policyIndex < amoeba::moveIdCount; ++policyIndex)
         {
-            const size_t inputOffset = sampleIndex * amoeba::encodedBoardSize;
-            amoeba::encodeBoard(*boards[sampleIndex], std::span<float, amoeba::encodedBoardSize>(
-                                                          input.data() + inputOffset, amoeba::encodedBoardSize));
-
-            uint64_t totalVisits = 0;
-            for (const uint32_t count : visits[sampleIndex])
-            {
-                totalVisits += count;
-            }
-            if (totalVisits == 0)
-                throw std::runtime_error(
-                    std::format("sample {} has no visits, so it has no policy to learn", sampleIndex));
-
-            // The search counts moves in absolute ids and runInference() answers in the
-            // flipped space encodeBoard() used, so the target has to cross over. Same table
-            // in both directions - it is its own inverse.
-            const std::span<const uint16_t, amoeba::moveIdCount> moveIdsByPolicyIndex =
-                amoeba::policyIndicesToMoveIds(boards[sampleIndex]->whiteToMove);
-            const size_t policyOffset = sampleIndex * amoeba::moveIdCount;
-
-            for (int policyIndex = 0; policyIndex < amoeba::moveIdCount; ++policyIndex)
-            {
-                const uint16_t moveId = moveIdsByPolicyIndex[policyIndex];
-                legal[policyOffset + policyIndex] = boards[sampleIndex]->isLegal(moveId) ? 1.0f : 0.0f;
-                policy[policyOffset + policyIndex] =
-                    static_cast<float>(visits[sampleIndex][moveId]) / static_cast<float>(totalVisits);
-            }
-        });
+            const uint16_t moveId = moveIdsByPolicyIndex[policyIndex];
+            legal[policyOffset + policyIndex] = boards[sampleIndex]->isLegal(moveId) ? 1.0f : 0.0f;
+            policy[policyOffset + policyIndex] =
+                static_cast<float>(visits[sampleIndex][moveId]) / static_cast<float>(totalVisits);
+        }
+    }
 
     return {mlx::core::array(input.data(), mlx::core::Shape{batch, amoeba::encodedBoardSize}, mlx::core::float32),
             mlx::core::array(legal.data(), mlx::core::Shape{batch, amoeba::moveIdCount}, mlx::core::float32),
