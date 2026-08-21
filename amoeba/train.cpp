@@ -549,8 +549,7 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
     }
 }
 
-std::vector<TrainingSample> generateSelfPlaySamples(const Network& champion, const TrainingSettings& settings,
-                                                    uint64_t seed)
+std::vector<TrainingSample> generateSelfPlaySamples(const Network& champion, const TrainingSettings& settings, uint64_t seed)
 {
     Config searchConfig = settings.searchConfig;
     searchConfig.rootNoise = settings.rootNoise;
@@ -577,8 +576,7 @@ std::vector<TrainingSample> generateSelfPlaySamples(const Network& champion, con
             else
                 ++blackWins;
 
-            trainingSamples.insert(trainingSamples.end(), std::make_move_iterator(played.begin()),
-                                   std::make_move_iterator(played.end()));
+            trainingSamples.insert(trainingSamples.end(), std::make_move_iterator(played.begin()), std::make_move_iterator(played.end()));
             return true; // self-play always plays every game it was asked for
         });
 
@@ -751,8 +749,7 @@ double standardError(double score, int games)
 bool gateResultIsSettled(int played, double score, float threshold)
 {
     constexpr int minimumGameCount = 20;
-    return played >= minimumGameCount &&
-           std::abs(score - static_cast<double>(threshold)) > 3.0 * standardError(score, played);
+    return played >= minimumGameCount && std::abs(score - static_cast<double>(threshold)) > 3.0 * standardError(score, played);
 }
 
 // The candidate's score, draws counted as half. Colours alternate so the
@@ -762,8 +759,7 @@ bool gateResultIsSettled(int played, double score, float threshold)
 //
 // Ranks with fewer simulations than self-play used, because only the result is
 // read here - the visit counts that needed the deeper search are discarded.
-double evaluateCandidate(const Network& candidate, const Network& champion, const TrainingSettings& settings,
-                         uint64_t seed)
+double evaluateCandidate(const Network& candidate, const Network& champion, const TrainingSettings& settings, uint64_t seed)
 {
     Config searchConfig = settings.searchConfig;
     searchConfig.simulations = settings.gateSimulationCount;
@@ -841,8 +837,7 @@ int main(int argc, char** argv)
     {
         champion = std::make_unique<bot::Network>(settings.networkShape, settings.seed);
         champion->save(weights);
-        bot::report("[train] {} did not exist: started from random weights, {} parameters, saved", weights.string(),
-                    champion->parameterCount());
+        bot::report("[train] {} did not exist: started from random weights, {} parameters, saved", weights.string(), champion->parameterCount());
     }
 
     std::vector<bot::TrainingSample> replay;
@@ -853,24 +848,20 @@ int main(int argc, char** argv)
         bot::report("");
         bot::report("======== generation {} ========", generation);
 
-        std::vector<bot::TrainingSample> fresh =
-            bot::generateSelfPlaySamples(*champion, settings, settings.seed + static_cast<uint64_t>(generation) * 1000);
+        std::vector<bot::TrainingSample> fresh = bot::generateSelfPlaySamples(*champion, settings, settings.seed + static_cast<uint64_t>(generation) * 1000);
 
         // Game ids have to stay unique across generations, or splitDatasetByGame will hold
         // out a game from this generation and train on a different one with the same
         // id from the last.
         for (bot::TrainingSample& sample : fresh)
-        {
             sample.gameId += gameIdBase;
-        }
         gameIdBase += settings.selfPlayGameCount;
 
         bot::reportMemory("self-play");
 
         replay.insert(replay.end(), std::make_move_iterator(fresh.begin()), std::make_move_iterator(fresh.end()));
         if (replay.size() > settings.replayBufferCapacity)
-            replay.erase(replay.begin(),
-                         replay.begin() + static_cast<long>(replay.size() - settings.replayBufferCapacity));
+            replay.erase(replay.begin(), replay.begin() + static_cast<long>(replay.size() - settings.replayBufferCapacity));
         bot::report("[train] replay buffer holds {} positions", replay.size());
 
         // The candidate starts from the best weights rather than from scratch: each
@@ -879,19 +870,18 @@ int main(int argc, char** argv)
         bot::trainCandidate(candidate, replay, settings, settings.seed + static_cast<uint64_t>(generation));
         bot::reportMemory("training");
 
-        const double score = bot::evaluateCandidate(candidate, *champion, settings,
-                                                    settings.seed + 7777 + static_cast<uint64_t>(generation));
+        const double score = bot::evaluateCandidate(candidate, *champion, settings, settings.seed + 7777 + static_cast<uint64_t>(generation));
         bot::reportMemory("the gate");
 
         if (score < settings.promotionThreshold)
         {
-            bot::report("[train] generation {} rejected at {:.1f}%, keeping the previous weights", generation,
-                        100.0 * score);
-            continue;
+            bot::report("[train] generation {} rejected at {:.1f}%, keeping the previous weights", generation, 100.0 * score);
         }
-
-        *champion = candidate;
-        champion->save(weights);
-        bot::report("[train] generation {} PROMOTED at {:.1f}%, wrote {}", generation, 100.0 * score, weights.string());
+        else
+        {
+            *champion = candidate;
+            champion->save(weights);
+            bot::report("[train] generation {} PROMOTED at {:.1f}%, wrote {}", generation, 100.0 * score, weights.string());
+        }
     }
 }

@@ -2,8 +2,8 @@
 #define AMOEBA_HPP
 
 #include <array>
+#include <bit>
 #include <cassert>
-#include <compare>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -41,17 +41,14 @@ struct Direction
 
 // Opposite directions are three positions apart. The same mapping is used when
 // rotating a position into Black's perspective.
-inline constexpr auto directions = [] -> std::array<Direction, directionCount>
-{
-    return {{
-        {1, 0},  // 0 east
-        {1, -1}, // 1 northeast
-        {0, -1}, // 2 northwest
-        {-1, 0}, // 3 west
-        {-1, 1}, // 4 southwest
-        {0, 1},  // 5 southeast
-    }};
-}();
+inline constexpr std::array<Direction, directionCount> directions = { {
+    {  1,  0 }, // 0 east
+    {  1, -1 }, // 1 northeast
+    {  0, -1 }, // 2 northwest
+    { -1,  0 }, // 3 west
+    { -1,  1 }, // 4 southwest
+    {  0,  1 }, // 5 southeast
+}};
 
 constexpr uint8_t oppositeDirection(uint8_t direction)
 {
@@ -100,12 +97,9 @@ constexpr int8_t hexIndex(int q, int r)
 inline constexpr auto neighboringHexes = [] -> std::array<std::array<int8_t, directionCount>, hexCount>
 {
     std::array<std::array<int8_t, directionCount>, hexCount> table{};
-    for (int hex = 0; hex < hexCount; ++hex)
-    {
-        for (int direction = 0; direction < directionCount; ++direction)
-        {
-            table[hex][direction] =
-                hexIndex(coordinates[hex].q + directions[direction].q, coordinates[hex].r + directions[direction].r);
+    for (int hex = 0; hex < hexCount; ++hex) {
+        for (int direction = 0; direction < directionCount; ++direction) {
+            table[hex][direction] = hexIndex(coordinates[hex].q + directions[direction].q, coordinates[hex].r + directions[direction].r);
         }
     }
     return table;
@@ -128,10 +122,10 @@ inline constexpr auto rotatedHexes = [] -> std::array<uint8_t, hexCount>
 // a slot is empty iff its depth >= height.
 enum class Piece : uint8_t
 {
-    empty = 0,
-    white = 1,
+    empty       = 0,
+    white       = 1,
     whiteKernel = 2,
-    black = 3,
+    black       = 3,
     blackKernel = 4,
 };
 
@@ -141,8 +135,13 @@ constexpr bool isWhitePiece(Piece piece)
 }
 
 // Indexed by Piece's underlying value.
-inline constexpr std::array<Piece, 5> swappedPieceColors = {Piece::empty, Piece::black, Piece::blackKernel,
-                                                            Piece::white, Piece::whiteKernel};
+inline constexpr std::array<Piece, 5> swappedPieceColors = {
+    Piece::empty,
+    Piece::black,
+    Piece::blackKernel,
+    Piece::white,
+    Piece::whiteKernel
+};
 
 // ---------------------------------------------------------------------------
 // Hex: a stack packed into a single 64-bit word.
@@ -234,8 +233,11 @@ struct Move
     static constexpr Move fromId(uint16_t id)
     {
         assert(id < moveIdCount);
-        return Move{static_cast<uint8_t>(id / (directionCount * 2)), static_cast<uint8_t>((id / 2) % directionCount),
-                    (id & 1) != 0};
+        return Move{
+            .sourceHex = static_cast<uint8_t>(id / (directionCount * 2)),
+            .direction = static_cast<uint8_t>((id / 2) % directionCount),
+            .splitsStack = (id & 1) != 0
+        };
     }
 
     constexpr auto operator<=>(const Move&) const = default;
@@ -265,9 +267,11 @@ struct Board
 
     uint8_t whiteKernelIndex{};
     uint8_t blackKernelIndex{};
+
     uint16_t plyCount{};
     uint16_t stalenessCount{};
     uint8_t repetitionCount{1};
+
     bool whiteToMove{true};
     State state{State::ongoing};
 
@@ -298,7 +302,7 @@ struct Board
         {
             for (uint64_t remaining = legalMoveBits[word]; remaining != 0; remaining &= remaining - 1)
             {
-                const int leastSignificantBit = __builtin_ctzll(remaining);
+                const int leastSignificantBit = std::countr_zero(remaining);
                 callback(static_cast<uint16_t>(word * 64 + leastSignificantBit));
             }
         }
@@ -515,8 +519,9 @@ inline constexpr auto rotatedPolicyMapping = [] -> std::array<uint16_t, moveIdCo
         {
             for (int splitsStack = 0; splitsStack < 2; ++splitsStack)
             {
-                table[(token * directionCount + direction) * 2 + splitsStack] = static_cast<uint16_t>(
-                    (rotatedHexes[token] * directionCount + oppositeDirection(direction)) * 2 + splitsStack);
+                const uint16_t moveId = (token * directionCount + direction) * 2 + splitsStack;
+                const uint16_t rotatedMoveId = static_cast<uint16_t>((rotatedHexes[token] * directionCount + oppositeDirection(direction)) * 2 + splitsStack);
+                table[moveId] = rotatedMoveId;
             }
         }
     }

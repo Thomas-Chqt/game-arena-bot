@@ -232,21 +232,18 @@ void synchronizeWithServer(BotContext& context, const char* serializedServerBoar
 
 // The clock starts when the callback does, not when the search does: the server
 // times the whole reply, so sync and translation count against the budget too.
-const TranslatedMove& selectMove(BotContext& context, const std::vector<TranslatedMove>& serverMoves,
-                                 std::chrono::steady_clock::time_point turnStart)
+const TranslatedMove& selectMove(BotContext& context, const std::vector<TranslatedMove>& serverMoves, std::chrono::steady_clock::time_point turnStart)
 {
     if (context.board.state != amoeba::State::ongoing)
     {
-        std::println(stderr, "[bot] engine calls the game over at ply {}, deferring to the server",
-                     context.board.plyCount);
+        std::println(stderr, "[bot] engine calls the game over at ply {}, deferring to the server", context.board.plyCount);
         return serverMoves.front();
     }
 
     const VisitCounts visitCounts = runSearch(*context.search, *context.evaluator);
     const uint16_t chosenMoveId = bestMove(visitCounts);
 
-    const auto chosenMove = std::ranges::find_if(serverMoves, [chosenMoveId](const TranslatedMove& move)
-                                                 { return move.move.id() == chosenMoveId; });
+    const auto chosenMove = std::ranges::find_if(serverMoves, [chosenMoveId](const TranslatedMove& move) { return move.move.id() == chosenMoveId; });
     if (chosenMove == serverMoves.end())
     {
         std::println(stderr, "[bot] search picked a move the server did not offer, falling back");
@@ -255,10 +252,16 @@ const TranslatedMove& selectMove(BotContext& context, const std::vector<Translat
 
     const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - turnStart;
     const uint32_t totalVisits = std::accumulate(visitCounts.begin(), visitCounts.end(), uint32_t{0});
-    std::println("[bot] ply {}: {} -> {}{}  {}/{} visits over {} moves in {:.0f} ms ({:.2f} s)", context.board.plyCount,
-                 chosenMove->sourcePosition, chosenMove->destinationPosition,
-                 chosenMove->move.splitsStack ? " sow" : "", visitCounts[chosenMoveId], totalVisits,
-                 context.board.legalMoveCount, elapsed.count(), elapsed.count() / 1000.0);
+    std::println("[bot] ply {}: {} -> {}{}  {}/{} visits over {} moves in {:.0f} ms ({:.2f} s)",
+        context.board.plyCount,
+        chosenMove->sourcePosition,
+        chosenMove->destinationPosition,
+        chosenMove->move.splitsStack ? " sow" : "",
+        visitCounts[chosenMoveId], totalVisits,
+        context.board.legalMoveCount,
+        elapsed.count(),
+        elapsed.count() / 1000.0
+    );
     return *chosenMove;
 }
 
@@ -275,67 +278,59 @@ void loadCheckpoint(BotContext& context)
 
 void onGameStart(const arena_game_state_t* state, void* userData)
 {
-    runGuardedCallback("on_game_start",
-                       [&]
-                       {
-                           BotContext& context = *static_cast<BotContext*>(userData);
-                           loadCheckpoint(context);
+    runGuardedCallback("on_game_start", [&] {
+        BotContext& context = *static_cast<BotContext*>(userData);
+        loadCheckpoint(context);
 
-                           context.board = amoeba::parseBoard(state->board, state->current_turn == ARENA_SIDE_WHITE);
-                           context.positionHistory.assign(1, context.board.positionHash);
-                           context.search->restart(context.board, context.positionHistory);
+        context.board = amoeba::parseBoard(state->board, state->current_turn == ARENA_SIDE_WHITE);
+        context.positionHistory.assign(1, context.board.positionHash);
+        context.search->restart(context.board, context.positionHistory);
 
-                           std::println("[bot] game start, I am {}, {} to move", arena_side_str(state->my_side),
-                                        arena_side_str(state->current_turn));
-                       });
+        std::println("[bot] game start, I am {}, {} to move", arena_side_str(state->my_side), arena_side_str(state->current_turn));
+    });
 }
 
 void onMove(const arena_game_state_t* state, arena_move_t* output, void* userData)
 {
-    runGuardedCallback("on_move",
-                       [&]
-                       {
-                           const std::chrono::steady_clock::time_point turnStart = std::chrono::steady_clock::now();
+    runGuardedCallback("on_move", [&] {
+        const std::chrono::steady_clock::time_point turnStart = std::chrono::steady_clock::now();
 
-                           BotContext& context = *static_cast<BotContext*>(userData);
-                           if (!context.search.has_value())
-                           {
-                               std::println(stderr, "[bot] no model loaded, cannot move");
-                               return;
-                           }
+        BotContext& context = *static_cast<BotContext*>(userData);
+        if (!context.search.has_value())
+        {
+            std::println(stderr, "[bot] no model loaded, cannot move");
+            return;
+        }
 
-                           synchronizeWithServer(context, state->board, state->current_turn);
+        synchronizeWithServer(context, state->board, state->current_turn);
 
-                           const std::vector<TranslatedMove> serverMoves = translateServerMoves(*state, context.board);
-                           if (serverMoves.empty())
-                           {
-                               std::println(stderr, "[bot] no usable move in the server's list for {}", state->board);
-                               return;
-                           }
+        const std::vector<TranslatedMove> serverMoves = translateServerMoves(*state, context.board);
+        if (serverMoves.empty())
+        {
+            std::println(stderr, "[bot] no usable move in the server's list for {}", state->board);
+            return;
+        }
 
-                           const TranslatedMove& chosenMove = selectMove(context, serverMoves, turnStart);
+        const TranslatedMove& chosenMove = selectMove(context, serverMoves, turnStart);
 
-                           // The SDK owns these strings for the duration of the callback, and they
-                           // carry the server's own spelling of the move.
-                           output->from_pos = chosenMove.sourcePosition;
-                           output->to_pos = chosenMove.destinationPosition;
-                           output->side = nullptr;
-                           output->splitting = chosenMove.serverSplittingFlag;
+        // The SDK owns these strings for the duration of the callback, and they
+        // carry the server's own spelling of the move.
+        output->from_pos = chosenMove.sourcePosition;
+        output->to_pos = chosenMove.destinationPosition;
+        output->side = nullptr;
+        output->splitting = chosenMove.serverSplittingFlag;
 
-                           advanceLocalGame(context, chosenMove.move);
-                       });
+        advanceLocalGame(context, chosenMove.move);
+    });
 }
 
 void onGameEnd(const arena_game_end_t* state, void* userData)
 {
-    runGuardedCallback(
-        "on_game_end",
-        [&]
-        {
-            const BotContext& context = *static_cast<BotContext*>(userData);
-            const char* result = !state->has_winner ? "draw" : state->winner == state->my_side ? "won" : "lost";
-            std::println("[bot] {} after {} plies", result, context.board.plyCount);
-        });
+    runGuardedCallback("on_game_end", [&] {
+        const BotContext& context = *static_cast<BotContext*>(userData);
+        const char* result = !state->has_winner ? "draw" : state->winner == state->my_side ? "won" : "lost";
+        std::println("[bot] {} after {} plies", result, context.board.plyCount);
+    });
 }
 
 void onDisconnect(const char* reason, void*)

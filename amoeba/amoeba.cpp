@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <span>
 #include <utility>
 
 namespace amoeba
@@ -484,22 +485,23 @@ void encodeBoard(const Board& board, std::span<float, encodedBoardSize> output)
     int ownPrisonerCount = 0;
     int opponentPrisonerCount = 0;
 
-    for (int token = 0; token < hexCount; ++token)
+    for (int hexIdx = 0; hexIdx < hexCount; ++hexIdx)
     {
-        const uint8_t absoluteHex = moverIsWhite ? static_cast<uint8_t>(token) : rotatedHexes[token];
-        const Hex& stack = board.hexes[absoluteHex];
+        const std::span<float, featuresPerHex> hexFeatures{output.data() + (hexIdx * featuresPerHex), featuresPerHex};
+
+        const uint8_t absoluteHexIdx = moverIsWhite ? static_cast<uint8_t>(hexIdx) : rotatedHexes[hexIdx];
+        const Hex& stack = board.hexes[absoluteHexIdx];
         const uint8_t stackHeight = stack.height();
-        float* const features = output.data() + token * featuresPerHex;
 
         // pieceAt() reports empty past the top, so short stacks pad themselves.
         for (uint8_t depth = 0; depth < encodedStackDepth; ++depth)
         {
             const int pieceCode = perspectiveCode(stack.pieceAt(depth), moverIsWhite);
-            features[stackSlotsOffset + depth * pieceCodeCount + pieceCode] = 1.0f;
+            hexFeatures[stackSlotsOffset + depth * pieceCodeCount + pieceCode] = 1.0f;
         }
 
-        features[stackHeightOffset + std::min<int>(stackHeight, maximumMovableStackHeight + 1)] = 1.0f;
-        features[topPieceOffset + perspectiveCode(stack.topPiece(), moverIsWhite)] = 1.0f;
+        hexFeatures[stackHeightOffset + std::min<int>(stackHeight, maximumMovableStackHeight + 1)] = 1.0f;
+        hexFeatures[topPieceOffset + perspectiveCode(stack.topPiece(), moverIsWhite)] = 1.0f;
 
         int ownPieces = 0;
         int opponentPieces = 0;
@@ -512,22 +514,20 @@ void encodeBoard(const Board& board, std::span<float, encodedBoardSize> output)
                 ++opponentPieces;
 
             if (pieceCode == 2)
-                features[kernelPresenceOffset] = 1.0f;
+                hexFeatures[kernelPresenceOffset] = 1.0f;
             if (pieceCode == 4)
-                features[kernelPresenceOffset + 1] = 1.0f;
+                hexFeatures[kernelPresenceOffset + 1] = 1.0f;
         }
-        features[pieceCountsOffset] = static_cast<float>(ownPieces) * countScale;
-        features[pieceCountsOffset + 1] = static_cast<float>(opponentPieces) * countScale;
+        hexFeatures[pieceCountsOffset] = static_cast<float>(ownPieces) * countScale;
+        hexFeatures[pieceCountsOffset + 1] = static_cast<float>(opponentPieces) * countScale;
 
         if (stackHeight > 0)
         {
-            if (perspectiveCode(stack.topPiece(), moverIsWhite) <= 2)
-            {
+            if (perspectiveCode(stack.topPiece(), moverIsWhite) <= 2) {
                 ++ownStackCount;
                 ownPrisonerCount += opponentPieces;
             }
-            else
-            {
+            else {
                 ++opponentStackCount;
                 opponentPrisonerCount += ownPieces;
             }
@@ -538,20 +538,18 @@ void encodeBoard(const Board& board, std::span<float, encodedBoardSize> output)
             const uint8_t absoluteDirection = moverIsWhite ? relativeDirection : oppositeDirection(relativeDirection);
             for (int splitsStack = 0; splitsStack < 2; ++splitsStack)
             {
-                const Move move{absoluteHex, absoluteDirection, splitsStack != 0};
-                features[legalMovesOffset + relativeDirection * 2 + splitsStack] =
+                const Move move{absoluteHexIdx, absoluteDirection, splitsStack != 0};
+                hexFeatures[legalMovesOffset + relativeDirection * 2 + splitsStack] =
                     board.isLegal(move.id()) ? 1.0f : 0.0f;
             }
         }
     }
 
-    float* const globalFeatures = output.data() + hexCount * featuresPerHex;
+    const std::span<float, globalFeatureCount> globalFeatures{output.data() + hexCount * featuresPerHex, globalFeatureCount};
 
     globalFeatures[globalMoveNumberIndex] = std::min<float>(static_cast<float>(board.plyCount), moveLimit) / moveLimit;
-    globalFeatures[globalStalenessIndex] =
-        std::min<float>(static_cast<float>(board.stalenessCount), stalenessLimit) / stalenessLimit;
-    globalFeatures[globalRepetitionIndex] =
-        std::min<float>(static_cast<float>(board.repetitionCount - 1), repetitionLimit - 1) / (repetitionLimit - 1);
+    globalFeatures[globalStalenessIndex] = std::min<float>(static_cast<float>(board.stalenessCount), stalenessLimit) / stalenessLimit;
+    globalFeatures[globalRepetitionIndex] = std::min<float>(static_cast<float>(board.repetitionCount - 1), repetitionLimit - 1) / (repetitionLimit - 1);
 
     globalFeatures[globalOwnStackCountIndex] = static_cast<float>(ownStackCount) * countScale;
     globalFeatures[globalOpponentStackCountIndex] = static_cast<float>(opponentStackCount) * countScale;

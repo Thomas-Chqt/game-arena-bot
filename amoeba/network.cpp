@@ -25,9 +25,13 @@ mlx::core::array gelu(const mlx::core::array& input)
 // over the 37 hexes independently.
 mlx::core::array splitHeads(const mlx::core::array& input, int attentionHeadCount)
 {
-    return mlx::core::transpose(mlx::core::reshape(input, {input.shape(0), amoeba::hexCount, attentionHeadCount,
-                                                           input.shape(2) / attentionHeadCount}),
-                                {0, 2, 1, 3});
+    return mlx::core::transpose(
+        mlx::core::reshape(
+            input,
+            {input.shape(0), amoeba::hexCount, attentionHeadCount, input.shape(2) / attentionHeadCount}
+        ),
+        {0, 2, 1, 3}
+    );
 }
 
 mlx::core::array mergeHeads(const mlx::core::array& input)
@@ -95,42 +99,46 @@ mlx::core::array initializeParameter(const std::string& name, const mlx::core::S
 
 std::vector<std::pair<std::string, mlx::core::Shape>> Network::parameterLayout(NetworkShape shape)
 {
-    const int embeddingWidth = shape.embeddingWidth;
-    const int feedForwardWidth = embeddingWidth * 4;
+    const int feedForwardWidth = shape.embeddingWidth * 4;
 
     // Linear weights are stored [in, out] so the forward pass is a plain matmul
     // with no transpose.
-    std::vector<std::pair<std::string, mlx::core::Shape>> parameterDefinitions{
-        {"embed.weight", {amoeba::featuresPerHex + amoeba::globalFeatureCount, embeddingWidth}},
-        {"embed.bias", {embeddingWidth}},
-        {"position", {amoeba::hexCount, embeddingWidth}},
-    };
+    std::vector<std::pair<std::string, mlx::core::Shape>> parameterDefinitions;
+
+    parameterDefinitions.emplace_back("embed.weight", mlx::core::Shape{amoeba::featuresPerHex + amoeba::globalFeatureCount, shape.embeddingWidth});
+    parameterDefinitions.emplace_back("embed.bias",   mlx::core::Shape{shape.embeddingWidth});
+
+    parameterDefinitions.emplace_back("position",     mlx::core::Shape{amoeba::hexCount, shape.embeddingWidth});
 
     for (int block = 0; block < shape.blockCount; ++block)
     {
         const std::string prefix = std::format("block{}.", block);
-        parameterDefinitions.emplace_back(prefix + "norm1.scale", mlx::core::Shape{embeddingWidth});
-        parameterDefinitions.emplace_back(prefix + "norm1.shift", mlx::core::Shape{embeddingWidth});
-        parameterDefinitions.emplace_back(prefix + "attn.query", mlx::core::Shape{embeddingWidth, embeddingWidth});
-        parameterDefinitions.emplace_back(prefix + "attn.key", mlx::core::Shape{embeddingWidth, embeddingWidth});
-        parameterDefinitions.emplace_back(prefix + "attn.value", mlx::core::Shape{embeddingWidth, embeddingWidth});
-        parameterDefinitions.emplace_back(prefix + "attn.out", mlx::core::Shape{embeddingWidth, embeddingWidth});
-        parameterDefinitions.emplace_back(prefix + "attn.bias",
-                                          mlx::core::Shape{shape.attentionHeadCount, relativePositionBucketCount});
-        parameterDefinitions.emplace_back(prefix + "norm2.scale", mlx::core::Shape{embeddingWidth});
-        parameterDefinitions.emplace_back(prefix + "norm2.shift", mlx::core::Shape{embeddingWidth});
-        parameterDefinitions.emplace_back(prefix + "mlp.in", mlx::core::Shape{embeddingWidth, feedForwardWidth});
-        parameterDefinitions.emplace_back(prefix + "mlp.in.bias", mlx::core::Shape{feedForwardWidth});
-        parameterDefinitions.emplace_back(prefix + "mlp.out", mlx::core::Shape{feedForwardWidth, embeddingWidth});
-        parameterDefinitions.emplace_back(prefix + "mlp.out.bias", mlx::core::Shape{embeddingWidth});
+        parameterDefinitions.emplace_back(prefix + "norm1.scale",  mlx::core::Shape{shape.embeddingWidth});
+        parameterDefinitions.emplace_back(prefix + "norm1.shift",  mlx::core::Shape{shape.embeddingWidth});
+
+        parameterDefinitions.emplace_back(prefix + "attn.query",   mlx::core::Shape{shape.embeddingWidth,     shape.embeddingWidth});
+        parameterDefinitions.emplace_back(prefix + "attn.key",     mlx::core::Shape{shape.embeddingWidth,     shape.embeddingWidth});
+        parameterDefinitions.emplace_back(prefix + "attn.value",   mlx::core::Shape{shape.embeddingWidth,     shape.embeddingWidth});
+        parameterDefinitions.emplace_back(prefix + "attn.out",     mlx::core::Shape{shape.embeddingWidth,     shape.embeddingWidth});
+        parameterDefinitions.emplace_back(prefix + "attn.bias",    mlx::core::Shape{shape.attentionHeadCount, relativePositionBucketCount});
+
+        parameterDefinitions.emplace_back(prefix + "norm2.scale",  mlx::core::Shape{shape.embeddingWidth});
+        parameterDefinitions.emplace_back(prefix + "norm2.shift",  mlx::core::Shape{shape.embeddingWidth});
+
+        parameterDefinitions.emplace_back(prefix + "mlp.in",       mlx::core::Shape{shape.embeddingWidth, feedForwardWidth});
+        parameterDefinitions.emplace_back(prefix + "mlp.in.bias",  mlx::core::Shape{feedForwardWidth});
+        parameterDefinitions.emplace_back(prefix + "mlp.out",      mlx::core::Shape{feedForwardWidth, shape.embeddingWidth});
+        parameterDefinitions.emplace_back(prefix + "mlp.out.bias", mlx::core::Shape{shape.embeddingWidth});
     }
 
-    parameterDefinitions.emplace_back("policy.weight", mlx::core::Shape{embeddingWidth, policyOutputsPerHex});
-    parameterDefinitions.emplace_back("policy.bias", mlx::core::Shape{policyOutputsPerHex});
-    parameterDefinitions.emplace_back("value.hidden", mlx::core::Shape{embeddingWidth, embeddingWidth});
-    parameterDefinitions.emplace_back("value.hidden.bias", mlx::core::Shape{embeddingWidth});
-    parameterDefinitions.emplace_back("value.out", mlx::core::Shape{embeddingWidth, 1});
-    parameterDefinitions.emplace_back("value.out.bias", mlx::core::Shape{1});
+    parameterDefinitions.emplace_back("policy.weight",     mlx::core::Shape{shape.embeddingWidth, policyOutputsPerHex});
+    parameterDefinitions.emplace_back("policy.bias",       mlx::core::Shape{policyOutputsPerHex});
+
+    parameterDefinitions.emplace_back("value.hidden",      mlx::core::Shape{shape.embeddingWidth, shape.embeddingWidth});
+    parameterDefinitions.emplace_back("value.hidden.bias", mlx::core::Shape{shape.embeddingWidth});
+
+    parameterDefinitions.emplace_back("value.out",         mlx::core::Shape{shape.embeddingWidth, 1});
+    parameterDefinitions.emplace_back("value.out.bias",    mlx::core::Shape{1});
 
     return parameterDefinitions;
 }
@@ -205,8 +213,7 @@ void Network::replaceParameters(std::vector<mlx::core::array> parameters)
     m_parameters = std::move(parameters);
 }
 
-Prediction runInference(const std::vector<mlx::core::array>& parameters, NetworkShape shape,
-                        const mlx::core::array& inputBatch)
+Prediction runInference(const std::vector<mlx::core::array>& parameters, NetworkShape shape, const mlx::core::array& inputBatch)
 {
     validateNetworkShape(shape);
     assert(inputBatch.ndim() == 2);
@@ -220,15 +227,17 @@ Prediction runInference(const std::vector<mlx::core::array>& parameters, Network
     const int batchSize = inputBatch.shape(0);
     constexpr int hexFeatureCount = amoeba::hexCount * amoeba::featuresPerHex;
 
-    const mlx::core::array perHexFeatures =
-        mlx::core::reshape(mlx::core::slice(inputBatch, {0, 0}, {batchSize, hexFeatureCount}),
-                           {batchSize, amoeba::hexCount, amoeba::featuresPerHex});
+    const mlx::core::array perHexFeatures = mlx::core::reshape(
+        mlx::core::slice(inputBatch, {0, 0}, {batchSize, hexFeatureCount}),
+        {batchSize, amoeba::hexCount, amoeba::featuresPerHex});
 
     // The globals go to every token: staleness or being in check changes what
     // every hex on the board means.
     const mlx::core::array globalFeatures = mlx::core::broadcast_to(
-        mlx::core::reshape(mlx::core::slice(inputBatch, {0, hexFeatureCount}, {batchSize, amoeba::encodedBoardSize}),
-                           {batchSize, 1, amoeba::globalFeatureCount}),
+        mlx::core::reshape(
+            mlx::core::slice(inputBatch, {0, hexFeatureCount}, {batchSize, amoeba::encodedBoardSize}),
+            {batchSize, 1, amoeba::globalFeatureCount}
+        ),
         {batchSize, amoeba::hexCount, amoeba::globalFeatureCount});
 
     const mlx::core::array& embedWeight = next();
@@ -278,8 +287,7 @@ Prediction runInference(const std::vector<mlx::core::array>& parameters, Network
         const mlx::core::array& mlpOut = next();
         const mlx::core::array& mlpOutBias = next();
 
-        const mlx::core::array hidden =
-            mlx::core::matmul(mlx::core::fast::layer_norm(tokenEmbeddings, norm2Scale, norm2Shift, 1e-5f), mlpIn);
+        const mlx::core::array hidden = mlx::core::matmul(mlx::core::fast::layer_norm(tokenEmbeddings, norm2Scale, norm2Shift, 1e-5f), mlpIn);
         const mlx::core::array activated = gelu(hidden + mlpInBias);
         tokenEmbeddings = tokenEmbeddings + (mlx::core::matmul(activated, mlpOut) + mlpOutBias);
     }
@@ -323,32 +331,24 @@ void NetworkEvaluator::evaluate(std::span<const amoeba::Board* const> boards, st
         [&](size_t boardIndex)
         {
             const size_t encodedBoardOffset = boardIndex * amoeba::encodedBoardSize;
-            amoeba::encodeBoard(*boards[boardIndex],
-                                std::span<float, amoeba::encodedBoardSize>(encodedBoards.data() + encodedBoardOffset,
-                                                                           amoeba::encodedBoardSize));
-
-            const std::span<const uint16_t, amoeba::moveIdCount> moveIdsByPolicyIndex =
-                amoeba::policyIndicesToMoveIds(boards[boardIndex]->whiteToMove);
             const size_t maskOffset = boardIndex * amoeba::moveIdCount;
+
+            amoeba::encodeBoard(*boards[boardIndex], std::span<float, amoeba::encodedBoardSize>(encodedBoards.data() + encodedBoardOffset, amoeba::encodedBoardSize));
+
+            const std::span<const uint16_t, amoeba::moveIdCount> moveIdsByPolicyIndex = amoeba::policyIndicesToMoveIds(boards[boardIndex]->whiteToMove);
             for (int policyIndex = 0; policyIndex < amoeba::moveIdCount; ++policyIndex)
-            {
-                legalMoveMask[maskOffset + policyIndex] =
-                    boards[boardIndex]->isLegal(moveIdsByPolicyIndex[policyIndex]) ? 1.0f : 0.0f;
-            }
+                legalMoveMask[maskOffset + policyIndex] = boards[boardIndex]->isLegal(moveIdsByPolicyIndex[policyIndex]) ? 1.0f : 0.0f;
         });
 
-    const mlx::core::array input(encodedBoards.data(), mlx::core::Shape{batchSize, amoeba::encodedBoardSize},
-                                 mlx::core::float32);
+    const mlx::core::array input(encodedBoards.data(), mlx::core::Shape{batchSize, amoeba::encodedBoardSize}, mlx::core::float32);
     const Prediction prediction = runInference(m_network.parameters(), m_network.shape(), input);
 
     // A large finite penalty rather than -inf: a terminal position has no legal
     // moves at all, and softmax over an all -inf row is NaN, which would spread
     // into every parameter that touched it. The search creates no edges there, so
     // the resulting uniform row is never read.
-    const mlx::core::array legal(legalMoveMask.data(), mlx::core::Shape{batchSize, amoeba::moveIdCount},
-                                 mlx::core::float32);
-    const mlx::core::array masked =
-        mlx::core::where(mlx::core::greater(legal, mlx::core::array(0.0f)), prediction.policy, mlx::core::array(-1e9f));
+    const mlx::core::array legal(legalMoveMask.data(), mlx::core::Shape{batchSize, amoeba::moveIdCount}, mlx::core::float32);
+    const mlx::core::array masked = mlx::core::where(mlx::core::greater(legal, mlx::core::array(0.0f)), prediction.policy, mlx::core::array(-1e9f));
 
     // The search sums the priors of the legal moves and divides, so it needs
     // probabilities; raw logits would give it negative priors.
@@ -358,20 +358,14 @@ void NetworkEvaluator::evaluate(std::span<const amoeba::Board* const> boards, st
     const float* policyData = probabilities.data<float>();
     const float* valueData = prediction.value.data<float>();
 
-    ThreadPool::global().forEach(static_cast<size_t>(batchSize),
-                                 [&](size_t boardIndex)
-                                 {
-                                     const std::span<const uint16_t, amoeba::moveIdCount> moveIdsByPolicyIndex =
-                                         amoeba::policyIndicesToMoveIds(boards[boardIndex]->whiteToMove);
-                                     const size_t policyOffset = boardIndex * amoeba::moveIdCount;
-
-                                     for (int policyIndex = 0; policyIndex < amoeba::moveIdCount; ++policyIndex)
-                                     {
-                                         outputs[boardIndex].policy[moveIdsByPolicyIndex[policyIndex]] =
-                                             policyData[policyOffset + policyIndex];
-                                     }
-                                     outputs[boardIndex].value = valueData[boardIndex];
-                                 });
+    ThreadPool::global().forEach(static_cast<size_t>(batchSize), [&](size_t boardIndex)
+    {
+        const std::span<const uint16_t, amoeba::moveIdCount> moveIdsByPolicyIndex = amoeba::policyIndicesToMoveIds(boards[boardIndex]->whiteToMove);
+        const size_t policyOffset = boardIndex * amoeba::moveIdCount;
+        for (int policyIndex = 0; policyIndex < amoeba::moveIdCount; ++policyIndex)
+            outputs[boardIndex].policy[moveIdsByPolicyIndex[policyIndex]] = policyData[policyOffset + policyIndex];
+        outputs[boardIndex].value = valueData[boardIndex];
+    });
 }
 
 // ===========================================================================
@@ -479,8 +473,7 @@ Adam::Adam(const std::vector<mlx::core::array>& parameters, AdamConfig config)
     }
 }
 
-std::vector<mlx::core::array> Adam::updateParameters(const std::vector<mlx::core::array>& parameters,
-                                                     const std::vector<mlx::core::array>& gradients, float rate)
+std::vector<mlx::core::array> Adam::updateParameters(const std::vector<mlx::core::array>& parameters, const std::vector<mlx::core::array>& gradients, float rate)
 {
     if (parameters.size() != m_mean.size() || parameters.size() != gradients.size())
         throw std::runtime_error(std::format("Adam was built for {} tensors but got {} parameters and {} gradients",
@@ -499,13 +492,17 @@ std::vector<mlx::core::array> Adam::updateParameters(const std::vector<mlx::core
 
     for (size_t parameterIndex = 0; parameterIndex < parameters.size(); ++parameterIndex)
     {
-        m_mean[parameterIndex] =
-            m_mean[parameterIndex] * m_config.meanDecay + gradients[parameterIndex] * (1.0f - m_config.meanDecay);
-        m_variance[parameterIndex] = m_variance[parameterIndex] * m_config.varianceDecay +
-                                     mlx::core::square(gradients[parameterIndex]) * (1.0f - m_config.varianceDecay);
+        m_mean[parameterIndex] = m_mean[parameterIndex]
+            * m_config.meanDecay
+            + gradients[parameterIndex]
+            * (1.0f - m_config.meanDecay);
 
-        const mlx::core::array typicalGradient =
-            mlx::core::sqrt(m_variance[parameterIndex] / varianceScale) + m_config.epsilon;
+        m_variance[parameterIndex] = m_variance[parameterIndex]
+            * m_config.varianceDecay
+            + mlx::core::square(gradients[parameterIndex])
+            * (1.0f - m_config.varianceDecay);
+
+        const mlx::core::array typicalGradient = mlx::core::sqrt(m_variance[parameterIndex] / varianceScale) + m_config.epsilon;
         updated.push_back(parameters[parameterIndex] - (m_mean[parameterIndex] / meanScale) / typicalGradient * rate);
     }
     return updated;
