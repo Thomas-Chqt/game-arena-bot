@@ -213,11 +213,16 @@ private:
         uint16_t moveId;
     };
 
-    struct Node
+    struct OngoingNode
     {
         amoeba::Board board;
         uint32_t firstEdgeIndex;
-        uint32_t edgeCount; // 0 at a terminal position
+        uint32_t edgeCount;
+    };
+
+    struct Node
+    {
+        std::variant<OngoingNode, float> contents;
         uint32_t visits;
     };
 
@@ -233,6 +238,7 @@ private:
     };
 
     uint32_t addNode(const amoeba::Board&, const Evaluation&);
+    uint32_t addTerminalNode(float value);
     uint32_t selectEdgeToExplore(uint32_t node) const;
     int32_t findRootChild(uint16_t moveId) const;
     void retainSubtree(uint32_t node);
@@ -280,7 +286,7 @@ uint16_t bestMove(const VisitCounts&);
 // every training target is signed this way - from the point of view of the side
 // to move - and inverting it trains a bot that reliably plays badly while every
 // loss curve looks healthy.
-float outcomeFor(amoeba::State, bool whiteToMove);
+float outcomeFor(amoeba::Outcome, bool whiteToMove);
 
 } // namespace bot
 

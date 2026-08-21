@@ -55,6 +55,7 @@
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <print>
 #include <random>
 #include <set>
@@ -248,6 +249,7 @@ struct NetworkPairing
 struct ActiveGame
 {
     amoeba::Board board;
+    std::optional<amoeba::Outcome> outcome;
     std::vector<uint64_t> positionHistory;
     std::vector<TrainingSample> trainingSamples;
     std::mt19937_64 randomEngine;
@@ -317,6 +319,7 @@ void GameBatchRunner::initializeGame(ActiveGame& game, int gameId, NetworkPairin
     game.startTime = std::chrono::steady_clock::now();
     game.evaluatedPositionCount = 0;
     game.positionHistory.assign(1, game.board.positionHash);
+    game.outcome.reset();
     game.trainingSamples.clear();
     game.randomEngine.seed(seed ^ (0x9e3779b97f4a7c15ULL * (static_cast<uint64_t>(gameId) + 1)));
 
@@ -338,7 +341,7 @@ void GameBatchRunner::initializeGame(ActiveGame& game, int gameId, NetworkPairin
 // on in `pendingBoards` - or leaving it empty, which means the game is over.
 void GameBatchRunner::advanceUntilEvaluation(ActiveGame& game) const
 {
-    while (game.board.state == amoeba::State::ongoing)
+    while (!game.outcome.has_value())
     {
         const int evaluatorIndex = game.board.whiteToMove ? game.pairing.whiteEvaluator : game.pairing.blackEvaluator;
         Search& search = game.searches[static_cast<size_t>(evaluatorIndex)];
@@ -356,7 +359,15 @@ void GameBatchRunner::advanceUntilEvaluation(ActiveGame& game) const
 
         const uint16_t chosenMoveId =
             selectMoveFromVisits(visitCounts, game.board.plyCount, m_samplingPlies, game.randomEngine);
-        game.board = amoeba::applyMove(game.board, amoeba::Move::fromId(chosenMoveId), game.positionHistory);
+        amoeba::MoveResult result =
+            amoeba::applyMove(game.board, amoeba::Move::fromId(chosenMoveId), game.positionHistory);
+        if (const auto* outcome = std::get_if<amoeba::Outcome>(&result))
+        {
+            game.outcome = *outcome;
+            break;
+        }
+
+        game.board = std::get<amoeba::Board>(std::move(result));
         game.positionHistory.push_back(game.board.positionHash);
 
         // Every tree follows the game, not just the one that was searching: a tree
@@ -427,7 +438,8 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
     {
         for (TrainingSample& sample : game.trainingSamples)
         {
-            sample.outcome = outcomeFor(game.board.state, sample.board.whiteToMove);
+            assert(game.outcome.has_value());
+            sample.outcome = outcomeFor(*game.outcome, sample.board.whiteToMove);
         }
 
         const std::lock_guard guard{completionMutex};

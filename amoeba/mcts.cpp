@@ -12,14 +12,6 @@ namespace bot
 namespace
 {
 
-// Seen by whoever is to move in it - which, at a terminal position, is the side
-// that was just mated or ran out of moves.
-float terminalValue(const amoeba::Board& board)
-{
-    assert(board.state != amoeba::State::ongoing);
-    return outcomeFor(board.state, board.whiteToMove);
-}
-
 // A body running on the pool must not wait for the pool: the round it would be
 // waiting on cannot start until it returns.
 thread_local bool threadIsInsidePool = false;
@@ -132,12 +124,11 @@ void ThreadPool::workerLoop()
 
 // ---------------------------------------------------------------------------
 
-float outcomeFor(amoeba::State state, bool whiteToMove)
+float outcomeFor(amoeba::Outcome outcome, bool whiteToMove)
 {
-    assert(state != amoeba::State::ongoing);
-    if (state == amoeba::State::draw)
+    if (outcome == amoeba::Outcome::draw)
         return 0.0f;
-    return (state == amoeba::State::whiteWins) == whiteToMove ? 1.0f : -1.0f;
+    return (outcome == amoeba::Outcome::whiteWins) == whiteToMove ? 1.0f : -1.0f;
 }
 
 uint16_t randomLegalMove(const amoeba::Board& board, std::mt19937_64& randomEngine)
@@ -178,23 +169,23 @@ float RolloutEvaluator::playout(amoeba::Board board)
     // No history, so repetitions go unseen; the staleness and move caps still
     // end every playout, and a random game's verdict is too crude for one
     // missed draw to matter.
-    while (board.state == amoeba::State::ongoing)
-        board = amoeba::applyMove(board, amoeba::Move::fromId(randomLegalMove(board, m_randomEngine)));
-
-    return outcomeFor(board.state, originalMoverIsWhite);
+    for (;;)
+    {
+        amoeba::MoveResult result =
+            amoeba::applyMove(board, amoeba::Move::fromId(randomLegalMove(board, m_randomEngine)));
+        if (const auto* outcome = std::get_if<amoeba::Outcome>(&result))
+            return outcomeFor(*outcome, originalMoverIsWhite);
+        board = std::get<amoeba::Board>(std::move(result));
+    }
 }
 
 // ---------------------------------------------------------------------------
 
-// Appends the node and its outgoing edges from an evaluation already in hand. A
-// terminal board gets a node with no edges and its Evaluation is ignored.
+// Appends an ongoing node and its outgoing edges from an evaluation already in hand.
 uint32_t Search::addNode(const amoeba::Board& board, const Evaluation& evaluation)
 {
     const uint32_t index = static_cast<uint32_t>(m_nodes.size());
-    m_nodes.push_back(Node{board, static_cast<uint32_t>(m_edges.size()), 0, 0});
-
-    if (board.state != amoeba::State::ongoing)
-        return index;
+    m_nodes.push_back(Node{OngoingNode{board, static_cast<uint32_t>(m_edges.size()), 0}, 0});
 
     float totalPrior = 0.0f;
     board.forEachLegal([&](uint16_t moveId) { totalPrior += evaluation.policy[moveId]; });
@@ -202,13 +193,21 @@ uint32_t Search::addNode(const amoeba::Board& board, const Evaluation& evaluatio
     board.forEachLegal([&](uint16_t moveId)
                        { m_edges.push_back(Edge{evaluation.policy[moveId] / totalPrior, 0.0f, 0, -1, moveId}); });
 
-    m_nodes[index].edgeCount = board.legalMoveCount;
+    std::get<OngoingNode>(m_nodes[index].contents).edgeCount = board.legalMoveCount;
+    return index;
+}
+
+uint32_t Search::addTerminalNode(float value)
+{
+    const uint32_t index = static_cast<uint32_t>(m_nodes.size());
+    m_nodes.push_back(Node{value, 0});
     return index;
 }
 
 uint32_t Search::selectEdgeToExplore(uint32_t node) const
 {
     const Node& currentNode = m_nodes[node];
+    const OngoingNode& ongoing = std::get<OngoingNode>(currentNode.contents);
 
     // currentNode.visits was already incremented for this simulation, so the bonus is
     // non-zero on a node's first descent and the priors alone decide.
@@ -222,12 +221,12 @@ uint32_t Search::selectEdgeToExplore(uint32_t node) const
     };
 
     return *std::ranges::max_element(
-        std::views::iota(currentNode.firstEdgeIndex, currentNode.firstEdgeIndex + currentNode.edgeCount), {}, score);
+        std::views::iota(ongoing.firstEdgeIndex, ongoing.firstEdgeIndex + ongoing.edgeCount), {}, score);
 }
 
 int32_t Search::findRootChild(uint16_t moveId) const
 {
-    const Node& root = m_nodes[0];
+    const OngoingNode& root = std::get<OngoingNode>(m_nodes[0].contents);
     for (uint32_t edgeIndex = root.firstEdgeIndex; edgeIndex < root.firstEdgeIndex + root.edgeCount; ++edgeIndex)
     {
         if (m_edges[edgeIndex].moveId == moveId)
@@ -248,9 +247,13 @@ void Search::retainSubtree(uint32_t nodeToKeep)
 
     for (uint32_t nodeIndex = 0; nodeIndex < m_spareNodes.size(); ++nodeIndex)
     {
-        const uint32_t oldFirstEdge = m_spareNodes[nodeIndex].firstEdgeIndex;
-        const uint32_t edgeCount = m_spareNodes[nodeIndex].edgeCount;
-        m_spareNodes[nodeIndex].firstEdgeIndex = static_cast<uint32_t>(m_spareEdges.size());
+        OngoingNode* ongoing = std::get_if<OngoingNode>(&m_spareNodes[nodeIndex].contents);
+        if (ongoing == nullptr)
+            continue;
+
+        const uint32_t oldFirstEdge = ongoing->firstEdgeIndex;
+        const uint32_t edgeCount = ongoing->edgeCount;
+        ongoing->firstEdgeIndex = static_cast<uint32_t>(m_spareEdges.size());
 
         for (uint32_t edgeOffset = 0; edgeOffset < edgeCount; ++edgeOffset)
         {
@@ -272,7 +275,7 @@ void Search::retainSubtree(uint32_t nodeToKeep)
 // normalised to sum to one.
 void Search::addExplorationNoise()
 {
-    const Node& root = m_nodes[0];
+    const OngoingNode& root = std::get<OngoingNode>(m_nodes[0].contents);
     if (root.edgeCount == 0)
         return;
 
@@ -321,11 +324,13 @@ void Search::collectPendingLeaves(int requestedLeafCount)
         uint32_t node = 0;
         for (;;)
         {
-            ++m_nodes[node].visits;
+            Node& currentNode = m_nodes[node];
+            ++currentNode.visits;
 
-            if (m_nodes[node].edgeCount == 0)
+            const OngoingNode* ongoing = std::get_if<OngoingNode>(&currentNode.contents);
+            if (ongoing == nullptr)
             {
-                descent.terminalValue = terminalValue(m_nodes[node].board);
+                descent.terminalValue = std::get<float>(currentNode.contents);
                 break;
             }
 
@@ -341,14 +346,26 @@ void Search::collectPendingLeaves(int requestedLeafCount)
             if (m_edges[edgeIndex].childNode < 0)
             {
                 const amoeba::Move move = amoeba::Move::fromId(m_edges[edgeIndex].moveId);
-                m_pendingBoards.push_back(amoeba::applyMove(m_nodes[node].board, move, m_positionHistory));
-                descent.expandedEdgeIndex = static_cast<int32_t>(edgeIndex);
-                descent.pendingBoardIndex = static_cast<int32_t>(m_pendingBoards.size()) - 1;
+                amoeba::MoveResult result = amoeba::applyMove(ongoing->board, move, m_positionHistory);
+                if (const auto* outcome = std::get_if<amoeba::Outcome>(&result))
+                {
+                    // A terminal child is valued for the player who would have moved
+                    // next there, matching every other node value in the tree.
+                    descent.terminalValue = outcomeFor(*outcome, !ongoing->board.whiteToMove);
+                    m_edges[edgeIndex].childNode = static_cast<int32_t>(addTerminalNode(descent.terminalValue));
+                }
+                else
+                {
+                    m_pendingBoards.push_back(std::get<amoeba::Board>(std::move(result)));
+                    descent.expandedEdgeIndex = static_cast<int32_t>(edgeIndex);
+                    descent.pendingBoardIndex = static_cast<int32_t>(m_pendingBoards.size()) - 1;
+                }
                 break;
             }
 
             node = static_cast<uint32_t>(m_edges[edgeIndex].childNode);
-            m_positionHistory.push_back(m_nodes[node].board.positionHash);
+            if (const OngoingNode* child = std::get_if<OngoingNode>(&m_nodes[node].contents))
+                m_positionHistory.push_back(child->board.positionHash);
         }
 
         descent.edgeTrailLength = static_cast<uint32_t>(m_edgeTrails.size()) - descent.edgeTrailStart;
@@ -366,16 +383,13 @@ void Search::backpropagate(std::span<const Evaluation> evaluations)
 
         if (descent.pendingBoardIndex >= 0)
         {
-            const amoeba::Board leaf = m_pendingBoards[static_cast<size_t>(descent.pendingBoardIndex)];
+            const amoeba::Board& leaf = m_pendingBoards[static_cast<size_t>(descent.pendingBoardIndex)];
             const Evaluation& evaluation = evaluations[static_cast<size_t>(descent.pendingBoardIndex)];
 
             m_edges[static_cast<size_t>(descent.expandedEdgeIndex)].childNode =
                 static_cast<int32_t>(addNode(leaf, evaluation));
 
-            // A terminal leaf is worth what the rules say, not what the network
-            // guesses. It is still in the batch, because keeping the two arrays
-            // parallel is worth more than the handful of wasted evaluations.
-            value = leaf.state == amoeba::State::ongoing ? evaluation.value : terminalValue(leaf);
+            value = evaluation.value;
         }
 
         for (uint32_t trailOffset = descent.edgeTrailLength; trailOffset-- > 0;)
@@ -422,13 +436,6 @@ void Search::restart(const amoeba::Board& root, std::span<const uint64_t> histor
     m_rootNeedsEvaluation = true;
     m_searchStarted = false;
 
-    // Nothing worth asking about a position the rules have already settled, and
-    // nothing to search from it either.
-    if (root.state != amoeba::State::ongoing)
-    {
-        addNode(root, Evaluation{});
-        m_rootNeedsEvaluation = false;
-    }
 }
 
 void Search::advance(uint16_t moveId, const amoeba::Board& next, std::span<const uint64_t> history)
@@ -470,7 +477,7 @@ std::span<const amoeba::Board* const> Search::pendingLeaves()
         return m_pendingBoardPointers;
     }
 
-    while (m_nodes[0].edgeCount != 0 && !hasSpentBudget())
+    while (std::holds_alternative<OngoingNode>(m_nodes[0].contents) && !hasSpentBudget())
     {
         collectPendingLeaves(
             std::min(std::max(1, m_config.batchSize), m_config.simulations - static_cast<int>(m_nodes[0].visits)));
@@ -512,7 +519,7 @@ VisitCounts Search::visits() const
     if (m_rootNeedsEvaluation || m_nodes.empty())
         return counts;
 
-    const Node& root = m_nodes[0];
+    const OngoingNode& root = std::get<OngoingNode>(m_nodes[0].contents);
     for (uint32_t edgeIndex = root.firstEdgeIndex; edgeIndex < root.firstEdgeIndex + root.edgeCount; ++edgeIndex)
         counts[m_edges[edgeIndex].moveId] = m_edges[edgeIndex].visits;
     return counts;

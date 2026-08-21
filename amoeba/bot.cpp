@@ -102,6 +102,8 @@ struct BotContext
     std::unique_ptr<NetworkEvaluator> evaluator;
     std::optional<Search> search;
     amoeba::Board board;
+    std::optional<amoeba::Outcome> outcome;
+    uint16_t plyCount = 0;
     std::vector<uint64_t> positionHistory;
 };
 
@@ -185,7 +187,16 @@ bool hasSamePosition(const amoeba::Board& left, const amoeba::Board& right)
 // at is a subtree it can keep.
 void advanceLocalGame(BotContext& context, amoeba::Move move)
 {
-    context.board = amoeba::applyMove(context.board, move, context.positionHistory);
+    amoeba::MoveResult result = amoeba::applyMove(context.board, move, context.positionHistory);
+    if (const auto* outcome = std::get_if<amoeba::Outcome>(&result))
+    {
+        context.outcome = *outcome;
+        context.plyCount = static_cast<uint16_t>(context.board.plyCount + 1);
+        return;
+    }
+
+    context.board = std::get<amoeba::Board>(std::move(result));
+    context.plyCount = context.board.plyCount;
     context.positionHistory.push_back(context.board.positionHash);
     context.search->advance(move.id(), context.board, context.positionHistory);
 }
@@ -204,7 +215,9 @@ void synchronizeWithServer(BotContext& context, const char* serializedServerBoar
             if (opponentMove.has_value())
                 return;
             const amoeba::Move move = amoeba::Move::fromId(moveId);
-            if (hasSamePosition(amoeba::applyMoveWithoutUpdatingState(context.board, move), serverBoard))
+            const amoeba::MoveResult result = amoeba::applyMove(context.board, move, context.positionHistory);
+            const amoeba::Board* nextBoard = std::get_if<amoeba::Board>(&result);
+            if (nextBoard != nullptr && hasSamePosition(*nextBoard, serverBoard))
                 opponentMove = move;
         });
 
@@ -222,6 +235,8 @@ void synchronizeWithServer(BotContext& context, const char* serializedServerBoar
     const uint16_t plyCount = context.board.plyCount;
     context.board = serverBoard;
     context.board.plyCount = static_cast<uint16_t>(plyCount + 1);
+    context.outcome.reset();
+    context.plyCount = context.board.plyCount;
     context.positionHistory.assign(1, context.board.positionHash);
     context.search->restart(context.board, context.positionHistory);
 }
@@ -234,9 +249,9 @@ void synchronizeWithServer(BotContext& context, const char* serializedServerBoar
 // times the whole reply, so sync and translation count against the budget too.
 const TranslatedMove& selectMove(BotContext& context, const std::vector<TranslatedMove>& serverMoves, std::chrono::steady_clock::time_point turnStart)
 {
-    if (context.board.state != amoeba::State::ongoing)
+    if (context.outcome.has_value())
     {
-        std::println(stderr, "[bot] engine calls the game over at ply {}, deferring to the server", context.board.plyCount);
+        std::println(stderr, "[bot] engine calls the game over at ply {}, deferring to the server", context.plyCount);
         return serverMoves.front();
     }
 
@@ -283,6 +298,8 @@ void onGameStart(const arena_game_state_t* state, void* userData)
         loadCheckpoint(context);
 
         context.board = amoeba::parseBoard(state->board, state->current_turn == ARENA_SIDE_WHITE);
+        context.outcome.reset();
+        context.plyCount = context.board.plyCount;
         context.positionHistory.assign(1, context.board.positionHash);
         context.search->restart(context.board, context.positionHistory);
 
@@ -329,7 +346,7 @@ void onGameEnd(const arena_game_end_t* state, void* userData)
     runGuardedCallback("on_game_end", [&] {
         const BotContext& context = *static_cast<BotContext*>(userData);
         const char* result = !state->has_winner ? "draw" : state->winner == state->my_side ? "won" : "lost";
-        std::println("[bot] {} after {} plies", result, context.board.plyCount);
+        std::println("[bot] {} after {} plies", result, context.plyCount);
     });
 }
 

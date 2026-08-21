@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <variant>
 
 namespace amoeba
 {
@@ -247,9 +248,9 @@ struct Move
 // Board
 // ---------------------------------------------------------------------------
 
-enum class State : uint8_t
+// Absolute game result, independent of any player's point of view.
+enum class Outcome : uint8_t
 {
-    ongoing,
     whiteWins,
     blackWins,
     draw,
@@ -273,7 +274,6 @@ struct Board
     uint8_t repetitionCount{1};
 
     bool whiteToMove{true};
-    State state{State::ongoing};
 
     constexpr bool isLegal(uint16_t id) const
     {
@@ -311,19 +311,24 @@ struct Board
     constexpr uint8_t ownKernelIndex() const { return whiteToMove ? whiteKernelIndex : blackKernelIndex; }
     constexpr uint8_t opponentKernelIndex() const { return whiteToMove ? blackKernelIndex : whiteKernelIndex; }
 
-    // True if the side to move controls this stack.
-    constexpr bool controls(uint8_t hexIndex) const
+    constexpr bool isControlledBy(uint8_t hexIndex, bool white) const
     {
         assert(hexIndex < hexCount);
         const Piece topPiece = hexes[hexIndex].topPiece();
-        return topPiece != Piece::empty && isWhitePiece(topPiece) == whiteToMove;
+        return topPiece != Piece::empty && isWhitePiece(topPiece) == white;
+    }
+
+    // True if the side to move controls this stack.
+    constexpr bool controls(uint8_t hexIndex) const
+    {
+        return isControlledBy(hexIndex, whiteToMove);
     }
 };
 
-// `state` is a cache of something computed from the board plus its history.
-// It is only trustworthy on a Board produced by applyMove(). If you build a Board
-// by hand - parsing a server string, writing a test - you must populate it
-// yourself before reading it.
+// A move either produces another position that can be played or ends the game.
+// Terminal positions are deliberately not represented as Boards: their legal-move
+// cache would no longer describe moves that may actually be played.
+using MoveResult = std::variant<Board, Outcome>;
 
 // ---------------------------------------------------------------------------
 // Rule parameters, taken from amoeba-reference.md, which mirrors the server.
@@ -361,52 +366,17 @@ constexpr int8_t destinationHex(uint8_t startHex, uint8_t direction, uint8_t dis
 }
 
 // ---------------------------------------------------------------------------
-// Hashing
-// ---------------------------------------------------------------------------
-
-// Recompute from scratch. Slow; use it to assert the incremental hash in tests.
-uint64_t computeHash(const Board& board);
-
-// ---------------------------------------------------------------------------
-// Queries
-// ---------------------------------------------------------------------------
-
-// True if `white` controls the stack on `hex` (their piece is on top).
-bool isControlledBy(const Board& board, uint8_t hex, bool white);
-
-// True if the side `attackerIsWhite` has a move that ends with them on top of
-// `kernelHex`. Walks the six rays out from the kernel rather than generating
-// every move, so it is cheap enough for the legality filter.
-bool isKernelAttacked(const Board& board, uint8_t kernelHex, bool attackerIsWhite);
-
-// Rescan the board for both kernels and update the cache.
-// applyMoveWithoutUpdatingState maintains the cache itself; this is for boards
-// built by hand.
-void refreshKernelPositions(Board& board);
-
-// ---------------------------------------------------------------------------
 // Moves
 // ---------------------------------------------------------------------------
 
-// Fills b.legalMoveBits and b.legalMoveCount for the side to move. Excludes
-// moves that lose your own kernel immediately or leave it capturable next ply.
-void generateLegalMoves(Board& board);
-
-// Board mechanics only: move the pieces, update hash / kernel cache / ply, flip
-// the side to move. Does not generate moves and does not set `state`.
-// Preconditions: the source stack belongs to the side to move, the endpoint is
-// on the board, and a split moves at least two pieces.
-Board applyMoveWithoutUpdatingState(const Board& board, Move move);
-
-// Full move: applyMoveWithoutUpdatingState, then generate the reply moves and
-// settle `state`.
+// Full move: returns the next playable Board, or the game's absolute outcome.
 // Pass the hash history - including the hash of `b` itself - to enable
 // repetition detection. Without it, repetition is not checked.
 // Precondition: `move` is legal on `board`.
-Board applyMove(const Board& board, Move move, std::span<const uint64_t> positionHistory = {});
+MoveResult applyMove(const Board& board, Move move, std::span<const uint64_t> positionHistory = {});
 
 // ---------------------------------------------------------------------------
-// Serialization - the server's format, e.g. "-1,1:WK;0,0:WB;1,-1:BK;1,0:W"
+// Parsing the server's format, e.g. "-1,1:WK;0,0:WB;1,-1:BK;1,0:W"
 // Stack contents run bottom to top, so "WB" is white with black above it.
 // ---------------------------------------------------------------------------
 
@@ -416,7 +386,6 @@ Board parseBoard(const std::string& serializedBoard, bool whiteToMove = true);
 // the encoder test both need it, and two copies of a 22-piece board string would
 // eventually disagree.
 Board createStartingBoard();
-std::string serializeBoard(const Board& board);
 
 // ===========================================================================
 // Board -> network input

@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cstdio>
 #include <cstdlib>
 #include <span>
 #include <utility>
@@ -64,6 +63,9 @@ constexpr uint64_t zobristValue(uint8_t hex, uint8_t depth, Piece piece)
 
 // ---------------------------------------------------------------------------
 
+namespace
+{
+
 uint64_t computeHash(const Board& board)
 {
     uint64_t hash = 0;
@@ -77,13 +79,6 @@ uint64_t computeHash(const Board& board)
     if (!board.whiteToMove)
         hash ^= zobristTable.blackToMove;
     return hash;
-}
-
-bool isControlledBy(const Board& board, uint8_t hex, bool white)
-{
-    assert(hex < hexCount);
-    const Piece topPiece = board.hexes[hex].topPiece();
-    return topPiece != Piece::empty && isWhitePiece(topPiece) == white;
 }
 
 void refreshKernelPositions(Board& board)
@@ -122,7 +117,7 @@ bool isKernelAttacked(const Board& board, uint8_t kernelHex, bool attackerIsWhit
             const uint8_t attackerHeight = attacker.height();
             if (attackerHeight == 0)
                 continue;
-            if (!isControlledBy(board, static_cast<uint8_t>(attackerHex), attackerIsWhite))
+            if (!board.isControlledBy(static_cast<uint8_t>(attackerHex), attackerIsWhite))
                 continue;
 
             const uint8_t attackDirection = oppositeDirection(outwardDirection);
@@ -150,7 +145,7 @@ bool isKernelAttacked(const Board& board, uint8_t kernelHex, bool attackerIsWhit
 
 // ---------------------------------------------------------------------------
 
-Board applyMoveWithoutUpdatingState(const Board& board, Move move)
+Board applyMoveWithoutDeterminingOutcome(const Board& board, Move move)
 {
     assert(move.sourceHex < hexCount);
     assert(move.direction < directionCount);
@@ -164,7 +159,6 @@ Board applyMoveWithoutUpdatingState(const Board& board, Move move)
 
     Board result = board;
     result.clearLegal();
-    result.state = State::ongoing;
     Hex& sourceStack = result.hexes[move.sourceHex];
 
     // Only the last hex of the path counts: intermediate captures made during a
@@ -214,8 +208,6 @@ Board applyMoveWithoutUpdatingState(const Board& board, Move move)
     return result;
 }
 
-// ---------------------------------------------------------------------------
-
 void generateLegalMoves(Board& board)
 {
     board.clearLegal();
@@ -243,14 +235,14 @@ void generateLegalMoves(Board& board)
                     continue;
 
                 const Move move{sourceHex, direction, splitsStack};
-                const Board nextBoard = applyMoveWithoutUpdatingState(board, move);
+                const Board nextBoard = applyMoveWithoutDeterminingOutcome(board, move);
 
                 // The move may have carried the mover's kernel somewhere else.
                 const uint8_t moverKernel = moverIsWhite ? nextBoard.whiteKernelIndex : nextBoard.blackKernelIndex;
 
                 // A split can expose an opposing piece above the mover's own
                 // kernel. That is an immediate loss of control, not merely check.
-                if (isControlledBy(nextBoard, moverKernel, !moverIsWhite))
+                if (nextBoard.isControlledBy(moverKernel, !moverIsWhite))
                     continue;
 
                 // The server requires the mover's kernel to be safe even if this
@@ -265,6 +257,8 @@ void generateLegalMoves(Board& board)
     }
 }
 
+} // namespace
+
 // ---------------------------------------------------------------------------
 
 namespace
@@ -272,7 +266,7 @@ namespace
 
 // Both adjudicated endings score the same way: most controlled stacks, then most
 // enemy pieces held inside those stacks, then a draw.
-State adjudicate(const Board& board)
+Outcome adjudicate(const Board& board)
 {
     constexpr int white = 0;
     constexpr int black = 1;
@@ -296,34 +290,33 @@ State adjudicate(const Board& board)
     }
 
     if (controlledStacks[white] != controlledStacks[black])
-        return controlledStacks[white] > controlledStacks[black] ? State::whiteWins : State::blackWins;
+        return controlledStacks[white] > controlledStacks[black] ? Outcome::whiteWins : Outcome::blackWins;
     if (prisoners[white] != prisoners[black])
-        return prisoners[white] > prisoners[black] ? State::whiteWins : State::blackWins;
-    return State::draw;
+        return prisoners[white] > prisoners[black] ? Outcome::whiteWins : Outcome::blackWins;
+    return Outcome::draw;
 }
 
 } // namespace
 
-Board applyMove(const Board& board, Move move, std::span<const uint64_t> positionHistory)
+MoveResult applyMove(const Board& board, Move move, std::span<const uint64_t> positionHistory)
 {
     assert(board.isLegal(move.id()));
 
     const bool moverIsWhite = board.whiteToMove;
-    Board result = applyMoveWithoutUpdatingState(board, move);
+    Board result = applyMoveWithoutDeterminingOutcome(board, move);
 
     // Kernel capture. Check both: a split can lose you your own kernel.
     const uint8_t opponentKernel = moverIsWhite ? result.blackKernelIndex : result.whiteKernelIndex;
     const uint8_t moverKernel = moverIsWhite ? result.whiteKernelIndex : result.blackKernelIndex;
-    const bool opponentKernelCaptured = isControlledBy(result, opponentKernel, moverIsWhite);
-    const bool moverKernelCaptured = isControlledBy(result, moverKernel, !moverIsWhite);
+    const bool opponentKernelCaptured = result.isControlledBy(opponentKernel, moverIsWhite);
+    const bool moverKernelCaptured = result.isControlledBy(moverKernel, !moverIsWhite);
 
     if (opponentKernelCaptured || moverKernelCaptured)
     {
         // A legal move cannot leave the mover's kernel captured. Keep both checks
         // because this function's precondition is enforced only in debug builds.
         const bool winnerIsWhite = opponentKernelCaptured ? moverIsWhite : !moverIsWhite;
-        result.state = winnerIsWhite ? State::whiteWins : State::blackWins;
-        return result;
+        return winnerIsWhite ? Outcome::whiteWins : Outcome::blackWins;
     }
 
     generateLegalMoves(result);
@@ -331,8 +324,7 @@ Board applyMove(const Board& board, Move move, std::span<const uint64_t> positio
     // No legal moves for the side to move: they lose.
     if (result.legalMoveCount == 0)
     {
-        result.state = result.whiteToMove ? State::blackWins : State::whiteWins;
-        return result;
+        return result.whiteToMove ? Outcome::blackWins : Outcome::whiteWins;
     }
 
     if (!positionHistory.empty())
@@ -347,13 +339,12 @@ Board applyMove(const Board& board, Move move, std::span<const uint64_t> positio
         result.repetitionCount = static_cast<uint8_t>(occurrenceCount);
         if (occurrenceCount >= repetitionLimit)
         {
-            result.state = State::draw;
-            return result;
+            return Outcome::draw;
         }
     }
 
     if (result.stalenessCount >= stalenessLimit || result.plyCount >= moveLimit)
-        result.state = adjudicate(result);
+        return adjudicate(result);
 
     return result;
 }
@@ -413,46 +404,6 @@ Board parseBoard(const std::string& serializedBoard, bool whiteToMove)
     board.positionHash = computeHash(board);
     generateLegalMoves(board);
     return board;
-}
-
-std::string serializeBoard(const Board& board)
-{
-    std::string result;
-    for (uint8_t hex = 0; hex < hexCount; ++hex)
-    {
-        const Hex& stack = board.hexes[hex];
-        if (stack.isEmpty())
-            continue;
-        if (!result.empty())
-            result += ';';
-
-        char coordinateText[16];
-        std::snprintf(coordinateText, sizeof coordinateText, "%d,%d", coordinates[hex].q, coordinates[hex].r);
-        result += coordinateText;
-        result += ':';
-
-        for (uint8_t depth = 0; depth < stack.height(); ++depth)
-        {
-            switch (stack.pieceAt(depth))
-            {
-                case Piece::white:
-                    result += "W";
-                    break;
-                case Piece::whiteKernel:
-                    result += "WK";
-                    break;
-                case Piece::black:
-                    result += "B";
-                    break;
-                case Piece::blackKernel:
-                    result += "BK";
-                    break;
-                case Piece::empty:
-                    std::unreachable();
-            }
-        }
-    }
-    return result;
 }
 
 // ===========================================================================
