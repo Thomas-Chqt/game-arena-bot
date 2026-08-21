@@ -49,19 +49,10 @@ namespace bot
 namespace
 {
 
-// Every search runs to the full simulation count - there is no clock on it, so
-// the move logged is always the one `searchSimulationCount` simulations chose,
-// and the elapsed time is a measurement rather than a limit. The server allows 5 s a move, and
-// nothing here enforces that. The count is simulations *through the root*, so a
-// re-rooted tree arrives having spent part of it on an earlier turn: the same
-// total search behind the move, but fewer new simulations.
-//
-// Leaves are batched 16 at a time because the network costs 1.70 ms for a single
-// position and 0.16 ms each for 64 - one position per forward pass would spend
-// the whole turn on overhead. Self-play fills its batch from the other games in
-// flight and needs none of this; a match has one game and no such option.
+// Every move starts a fresh search and runs to the full simulation count. There
+// is no clock on it, so elapsed time is a measurement rather than a limit. The
+// server allows 5 s a move, and nothing here enforces that.
 constexpr int searchSimulationCount = 1000;
-constexpr int searchLeavesPerBatch = 16;
 
 // A C++ exception unwinding through the SDK's C frames is undefined behaviour,
 // so nothing may leave a callback. A turn that goes unanswered times out and
@@ -100,7 +91,7 @@ struct BotContext
     std::filesystem::path checkpointPath;
     std::unique_ptr<Network> network;
     std::unique_ptr<NetworkEvaluator> evaluator;
-    std::optional<Search> search;
+    std::optional<MCTS> search;
     amoeba::Board board;
     std::vector<uint64_t> positionHistory;
 };
@@ -179,15 +170,30 @@ bool hasSamePosition(const amoeba::Board& left, const amoeba::Board& right)
     return left.whiteToMove == right.whiteToMove && std::ranges::equal(left.hexes, right.hexes);
 }
 
-// Re-roots the tree on the move as well as playing it, so the simulations that
-// already went into that move are still there next turn instead of being thrown
-// away - our own moves and the opponent's alike, since a reply the search looked
-// at is a subtree it can keep.
+void startSearch(BotContext& context)
+{
+    context.search.emplace(context.board, context.positionHistory,
+                           MCTSConfig{.simulations = searchSimulationCount});
+}
+
+VisitCounts finishSearch(MCTS& search, NetworkEvaluator& evaluator)
+{
+    while (const amoeba::Board* leaf = search.pendingLeaf())
+    {
+        const amoeba::Board* boards[]{leaf};
+        Evaluation evaluation;
+        evaluator.evaluate(boards, std::span{&evaluation, 1});
+        search.absorb(evaluation);
+    }
+    return search.visits();
+}
+
+// Plays a move locally and creates a fresh search for the resulting position.
 void advanceLocalGame(BotContext& context, amoeba::Move move)
 {
     context.board = amoeba::applyMove(context.board, move, context.positionHistory);
     context.positionHistory.push_back(context.board.positionHash);
-    context.search->advance(move.id(), context.board, context.positionHistory);
+    startSearch(context);
 }
 
 void synchronizeWithServer(BotContext& context, const char* serializedServerBoard, arena_side_t currentTurn)
@@ -223,7 +229,7 @@ void synchronizeWithServer(BotContext& context, const char* serializedServerBoar
     context.board = serverBoard;
     context.board.plyCount = static_cast<uint16_t>(plyCount + 1);
     context.positionHistory.assign(1, context.board.positionHash);
-    context.search->restart(context.board, context.positionHistory);
+    startSearch(context);
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +246,7 @@ const TranslatedMove& selectMove(BotContext& context, const std::vector<Translat
         return serverMoves.front();
     }
 
-    const VisitCounts visitCounts = runSearch(*context.search, *context.evaluator);
+    const VisitCounts visitCounts = finishSearch(*context.search, *context.evaluator);
     const uint16_t chosenMoveId = bestMove(visitCounts);
 
     const auto chosenMove = std::ranges::find_if(serverMoves, [chosenMoveId](const TranslatedMove& move) { return move.move.id() == chosenMoveId; });
@@ -269,7 +275,6 @@ void loadCheckpoint(BotContext& context)
 {
     context.network = std::make_unique<Network>(context.checkpointPath);
     context.evaluator = std::make_unique<NetworkEvaluator>(*context.network);
-    context.search.emplace(Config{.simulations = searchSimulationCount, .batchSize = searchLeavesPerBatch});
 
     std::println("[bot] {}: {} blocks, width {}, {} heads, {} parameters", context.checkpointPath.filename().string(),
                  context.network->shape().blockCount, context.network->shape().embeddingWidth,
@@ -284,7 +289,7 @@ void onGameStart(const arena_game_state_t* state, void* userData)
 
         context.board = amoeba::parseBoard(state->board, state->current_turn == ARENA_SIDE_WHITE);
         context.positionHistory.assign(1, context.board.positionHash);
-        context.search->restart(context.board, context.positionHistory);
+        startSearch(context);
 
         std::println("[bot] game start, I am {}, {} to move", arena_side_str(state->my_side), arena_side_str(state->current_turn));
     });
