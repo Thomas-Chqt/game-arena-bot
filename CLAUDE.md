@@ -25,7 +25,7 @@ per-feature subdirectory, and no test binary.
 amoeba/
   amoeba-reference.md    the rules, mirrored from the server engine
   amoeba.hpp / .cpp      rules engine, startPosition(), and encode() with its policy permutation
-  mcts.hpp / .cpp        PUCT search, rollout evaluator, the global thread pool
+  mcts.hpp / .cpp        fresh-tree sequential PUCT search and rollout evaluator
   network.hpp / .cpp     parameters, forward pass, NetworkEvaluator, Batch, loss(), Adam
   bot.cpp                arena client        -> amoeba_bot
   train.cpp              self-play + training -> amoeba_train
@@ -49,8 +49,8 @@ The rules engine works. ~296k plies/sec, ~3.7k full random games/sec, single-thr
   80, move cap 250, adjudication by controlled stacks then by enemy pieces held inside them.
 - `encode()`, plus `policyToAbsolute()` — the 444-entry permutation that maps a policy out of the
   mover's frame, `static_assert`ed to be its own inverse.
-- PUCT search with tree reuse across moves, Dirichlet root noise and a deadline; a rollout
-  evaluator. One `ThreadPool` for the whole process.
+- Fresh-tree PUCT search with Dirichlet root noise; a rollout evaluator. The
+  application code is single-threaded.
 - The network: attention over 37 hex tokens with a relative-position bias, `loss()` and `Adam`.
 - `amoeba_bot` and `amoeba_train`, both built and both run. The full generation loop — self-play,
   training, gate, promotion, write back to the same file — has been run end to end at toy scale and
@@ -149,24 +149,17 @@ rotated.
 ## Search (MCTS)
 
 `amoeba/mcts.hpp` / `mcts.cpp`. PUCT, the AlphaZero variant — no rollouts *inside* the search;
-a new position's value comes from a `bot::Evaluator`.
+a new position's policy and value come back from the caller as an `Evaluation`.
 
 ### The pieces
 
-- `Evaluator` — `evaluate(span<const Board*>, span<Evaluation>)`, where `Evaluation` is a 444-float
-  policy plus a value in `[-1, 1]`. The span form is deliberate even though the search asks one at a
-  time: a single-position MLX forward pass wastes the device, and widening the interface later would
-  touch every implementation.
-- `RolloutEvaluator` — uniform priors, value from one uniformly random playout to the end of the
-  game. Knows nothing about Amoeba, but it makes the search playable before the network exists and it
-  is the baseline the network has to beat.
-- `Search` — **owns no evaluator and calls none.** `restart(board, history)` starts a tree,
-  `advance(moveId, board, history)` re-roots an existing one, then `pendingLeaves()` hands out the
-  boards it cannot go on without and `absorb()` takes the answers back. `visits()` is the 444 visit
-  counts; `bestMove()` is the argmax, and normalised the same array is the policy target.
-- `runSearch(search, evaluator)` — the loop those four calls make, for a caller with one game.
-  `bot.cpp` uses it; the trainer does not, because the whole point is to gather the batch across
-  games instead.
+- `Evaluation` — a 444-float policy plus a value in `[-1, 1]`. It is the only network-facing type
+  MCTS knows.
+- `MCTS` — **owns no evaluator and calls none.** Its constructor fixes one root board and history;
+  `pendingLeaf()` performs one descent and hands out its one unevaluated leaf, and `absorb()` expands
+  and backs up that leaf. `visits()` is the 444 visit counts; `bestMove()` is the argmax, and
+  normalised the same array is the policy target. A real move creates a new `MCTS` instance. The
+  bot drives this handshake directly; the trainer gathers leaves from multiple searches first.
 
 ### Invariants that are easy to break
 
@@ -177,10 +170,10 @@ a new position's value comes from a `bot::Evaluator`.
   moves that have never been played, i.e. before the resulting position exists. Measured branching is
   52 at the opening and 27 on average, so an 800-simulation search holds ~801 nodes and ~21,600
   edges; making every edge a node would mean 27× the `apply()` calls and 8.5 MB instead of 432 KB.
-- **`m_path` is the repetition history**, maintained as one vector: the caller's game history as a
-  fixed prefix, one hash pushed per node stepped into during the descent, truncated back to the
-  prefix at the top of every simulation. At the `apply()` call its last element is the board being
-  applied — exactly what that function's contract asks for.
+- **Repetition history has fixed storage.** `MCTS` keeps the real-game prefix in an array bounded
+  by the 250-ply move limit. A descent copies that prefix into a local fixed array and appends one
+  hash per node. The edge trail and root-noise samples are fixed arrays too, so none of this scratch
+  state allocates. Only the persistent node and edge vectors grow dynamically.
 - **No transposition table.** A node's terminal `state` is path-dependent (draw by repetition), and
   with one path per node it stays valid forever. Sharing statistics across paths would make a cached
   `Draw` verdict a lie on the other path.
@@ -194,28 +187,17 @@ The cost is cache: the descent reads only `visits`, `edgeCount` and `board.hash`
 bytes. Splitting hot (~24 B) from cold would fix it, and is not worth doing while the evaluator is
 ~99% of the time.
 
-### The deadline
-
-`Config::deadline` stops the search on the clock as well as on the simulation count, whichever comes
-first, and always runs one batch so the visit counts can never be empty. **Nothing sets it any
-more** — both programs leave it at its hour default, so neither's play depends on how busy the machine
-was. `bot.cpp` runs to 800 simulations and reports how long that took; the server's 5 s is not
-enforced, and the elapsed time in the log is what says whether it needs to be.
-
-The mechanism stays because that is a measurement, not a guarantee, and the moment a turn does have
-to be bounded this is where the bound goes. **The clock starts when the search does**, not when the
-root is set: `bot.cpp` re-roots the moment it hears the opponent's move and only searches when it is
-asked to, and the wait in between must not count against a turn.
-
 ### Deliberately absent
 
 - **Temperature sampling** — lives in `train.cpp`'s `chooseMove()` rather than in the search.
-- **Batching leaves across games *inside* `Search`** — the search knows nothing about other games and
-  should not. `Field` in `train.cpp` is what gathers across them.
+- **Batching inside `MCTS`** — every descent observes the result of the previous one. The runner in
+  `train.cpp` gathers one leaf from each independent game into a network batch.
+- **Tree reuse across moves** — every position gets a fresh tree and the full configured simulation
+  budget, which keeps a training target independent of searches performed for earlier positions.
 
 ### Dirichlet root noise
 
-`Config::rootNoise` / `noiseAlpha` / `noiseSeed`, **off by default** so competition keeps the
+`MCTSConfig::rootNoise` / `noiseAlpha` / `noiseSeed`, **off by default** so competition keeps the
 network's own priors. `prior = (1 - rootNoise) * network + rootNoise * Dirichlet(alpha)`, at the root
 only, because the root is the position that becomes a training example — noise deeper in the tree just
 spoils the search's judgement. A Dirichlet draw is independent `std::gamma_distribution` samples
@@ -235,115 +217,37 @@ it does not already understand, and training stalls with every loss curve lookin
 ### Batching across games, not across guesses
 
 The evaluator is the whole cost of the search and it is dispatch-bound, so it has to be fed whole
-batches. There are two places a batch can come from.
+batches. `MCTS` deliberately does not make one batch from speculative descents. It returns one leaf
+and waits for that result, so every selection sees completely current visit and value statistics.
 
-**From one search.** Descend N times before evaluating anything. Nothing makes the N descents
-diverge on their own, so each is provisionally recorded on the way down as having come back a loss
-(*virtual loss*), removed at back-up. It works, but every descent after the first chooses on
-statistics that are a round stale, and at 400 simulations with 64 leaves that is only six rounds of
-"look, learn, redirect" per move.
+`GameBatchRunner` keeps independent games in flight. Each game contributes at most one pending leaf
+per round; the runner groups those leaves by evaluator, performs one network call per non-empty
+group, distributes the answers, and then lets every search descend again. `CONCURRENT` and
+`GATE_CONCURRENT` control this caller-owned batch width.
 
-**From many games.** Keep hundreds of games in flight and take one leaf from each. The batch is the
-size of the field, every descent sees its own tree exactly as the last round left it, and no virtual
-loss is needed — this is what `train.cpp`'s `Field` does, at `CONCURRENT` games and `LEAVES=1`.
+The online bot has only one game, so it evaluates one leaf per call. That is deliberately slower than
+speculative batching, but it keeps batching and virtual-loss policy out of MCTS and establishes a
+simple baseline to measure before adding any optimisation back.
 
-Both are still in `Search`: `Config::batchSize` is leaves per search per round, and virtual loss
-engages only above 1. **Match play is the one caller that has no choice** — one game, so its batch
-can only come from inside its own search, and it sets `batchSize = 16`.
+### Fresh tree per move
 
-Measured at 6 blocks / width 128 / 200 simulations, both runs from the same checkpoint file:
-
-| | games | wall clock | positions | positions/s | CPU |
-|---|---|---|---|---|---|
-| one game per thread, 64 leaves, virtual loss | 64 | 66 s | 2362 | 35.8 | 65% |
-| field of 64, 1 leaf each | 64 | 41 s | 2677 | 65.3 | 25% |
-| field of 256, 1 leaf each | 512 | 720 s | 25926 | 36.0 | 11% |
-
-**1.82× at a field of 64**, and the CPU load falls because ten threads are no longer each pushing
-their own small batch through MLX — one driver thread issues one call per network per round.
-
-**The field of 256 is the unexplained result, and `CONCURRENT` should not be trusted until it is
-settled.** It came out at baseline speed, not better, even though the evaluator on its own is
-measurably cheaper per position at 256 than at 64 (table under "Network" below). The two rows are not
-a controlled comparison — different games, and the field of 64 drains instead of refilling — so what
-they disagree about is *evaluations per ply*, not milliseconds per evaluation. The clean experiment,
-which has not been run: `GAMES=256` with `CONCURRENT=64` and then `CONCURRENT=256`. Same game ids,
-same seeds, therefore the same games and the same evaluation count, so the wall clock is the batching
-effect and nothing else. If 64 wins there, lower the default.
-
-### Tree reuse
-
-`advance()` re-roots on the move played and keeps that child's subtree; `keepSubtree()` copies it
-into scratch vectors, renumbering as it goes, so a 120-ply game does not accumulate 120 searches
-worth of dead nodes. It falls back to `restart()` when the move played was never expanded, which is
-what happens when the opponent plays something the search never looked at.
-
-`Config::simulations` counts simulations **through the root**, inherited ones included, so a re-rooted
-tree simply arrives with part of its budget already spent. Measured against the same games played
-with `restart()` every ply: **26.7% of evaluations saved at 200 simulations**, and 46-50% at toy
-counts where the tree is mostly one line deep.
-
-The reused subtree is not an approximation of the search you would have run — it *is* that search,
-paused. A descent inside a subtree reads only that subtree's own statistics, so the previous search's
-descents into it are exactly the first N descents a fresh search would make. Checked: with a
-deterministic evaluator, games played with reuse and without are the same game, move for move.
-
-- **Self-play keeps one tree per game, not per colour.** Both sides are the same network, so the tree
-  is re-rooted every ply instead of every other one and carries what both sides found. The gate keeps
-  two, because a tree's statistics are worth exactly what the network that produced them is.
-- **Path-dependence survives.** The path from the new root down is the path it always was, with one
-  more ply of it now living in the game history, so every node's repetition-dependent verdict stays
-  true. This is why there is still no transposition table.
-- **Fresh Dirichlet noise goes on each new root.** What the subtree inherited are the network's own
-  priors — noise only ever went on the root above it — and the handful of moves the last search was
-  told to promote should not go on being promoted.
-- **Fresh visit counts are not what the log reports.** `bot.cpp` prints the simulations behind the
-  move as the sum of the root's counts, and that sum is the full `kSimulations` — part of it inherited
-  from an earlier turn rather than run just now. Still 800 simulations behind the move, just not 800
-  new ones.
+After a real move, the bot and trainer construct a new `MCTS` with the resulting board and complete
+game history. No nodes, priors, values or visits survive from the previous position. Consequently every
+training sample receives exactly `MCTSConfig::simulations` fresh root visits,
+and the trainer supplies a fresh reproducible noise seed for every self-play position.
 
 ### Verification
 
-These numbers came from a `MODE=match` driver that no longer exists — the gate in `train.cpp` only
-plays network against network. Over 20 games at 200 simulations, alternating colours:
+The cheap invariants are that the root visit counts sum to exactly `simulations`, every illegal move
+has zero visits, a completed self-play position has a non-empty policy target, and noise-disabled
+search is deterministic. The repository does not currently contain a dedicated search test target,
+so a bounded miniature training run is the end-to-end check of the handshake and caller batching.
 
-```
-rollout vs random             : 100.0% +/- 0.0%   (20-0-0)
-network, 1 leaf   vs random   :  97.5% +/- 3.5%   (19-0-1)
-network, 64 leaves vs random  : 100.0% +/- 0.0%   (20-0-0)
-network, 64 leaves vs rollout :  40.0% +/- 11.0%  (6-10-4)
-```
+## Execution model
 
-Over **200** games, network at 64 leaves against rollout scores **44.0% ± 3.5%** (64-88-48). That is
-1.7 standard errors below parity — suggestive that the network is slightly weaker than its teacher, not
-conclusive. Whether the virtual loss was responsible would be worth rerunning now that self-play
-does not use it: those matches were played at 64 leaves out of one search.
-
-**Before restructuring the descent again, check the invariants rather than the strength.** ±11% over
-20 games cannot resolve a small regression, and the search has no offline test in the tree. What does
-have teeth, and was run on the tree-reuse change: the root's visit counts sum to exactly
-`simulations` at every ply of a whole game, they are zero on every move not legal in the position
-searched, and with a deterministic evaluator a game played with `advance()` matches one played with
-`restart()` move for move. All three fail loudly on a broken renumbering or a lost simulation.
-
-## The thread pool
-
-`ThreadPool` in `mcts.hpp`, one for the whole process, reached through `ThreadPool::global()`. It is
-`hardware_concurrency()` wide counting the caller, and its only operation is
-`forEach(count, body)` — run every index somewhere, return when they have all run.
-
-Everything here is a burst of identical independent work with nothing to own threads between bursts:
-advance 256 games one round, encode 256 boards, scatter 256 policies back. `train.cpp` no longer
-starts a thread per game.
-
-- **The calling thread takes indices too**, so a one-thread pool is a plain loop and no work waits on
-  a thread that does not exist.
-- **A `forEach` from inside a body runs serially.** The outer round already holds every thread, so
-  waiting for one here would deadlock; a `thread_local` flag catches it. This is what lets
-  `NetworkEvaluator::evaluate` use the pool without knowing who called it.
-- **An exception from a body is rethrown to the caller** after the round finishes. `makeBatch` throws
-  on a sample with no visits, from inside a body, and that has to reach the trainer rather than
-  terminate.
+All application-owned work is single-threaded. Tree traversal, board encoding, policy scattering and
+training-batch preparation use direct loops. MLX may manage its own device execution internally, but
+the program does not create threads or overlap CPU traversal with a network call.
 
 ## Trainer
 
@@ -356,43 +260,26 @@ One generation is three steps: play `GAMES` games of the current best against it
 buffer, train a candidate on batches from that buffer, then play the candidate against the current
 best and promote only if it wins.
 
-**`Field` is where the games are played**, both for self-play and for the gate. It keeps `slots` games
-in flight, refills a slot as its game ends, and drives them all in lockstep: one round is one
-simulation per game, gathered into one network call per network. The whole field runs on the global
-pool — one `forEach` over the slots per round — and the driver thread does the MLX call. See
-"Batching across games" above for why.
+**`GameBatchRunner` is where the games are played**, both for self-play and for the gate. It keeps
+games in flight, refills a slot as its game ends, and drives them in lockstep: one round gathers one
+pending leaf per game, evaluates one batch per network, distributes the answers, and continues.
 
-- **`CONCURRENT` is twice the batch size.** The field is walked in two halves that take turns, so a
-  field of 256 sends batches of 128. That costs 5% per position (0.163 ms against 0.155) and buys the
-  overlap below, which is worth ~1.3×. **The default of 256 measured no faster than the old code while 64 measured 1.82× faster** —
-  see "Batching across games" for the experiment that would explain it.
+- **`CONCURRENT` is the maximum inference batch width.** Each active game contributes at most one
+  position. In a gate the positions split between the two networks according to the side to move.
 - **`GAMES` is above `CONCURRENT`, so a slot takes on another game instead of going idle.** What a
-  game costs does not depend on when it is played: all 512 build their own tree from nothing and all
-  512 get their own cheap endgame, so refill buys games rather than adding overhead. Set `GAMES` for
-  how much data a generation should hold, not for scheduling — the schedule barely moves the number,
-  because the late plies of a long game inherit most of their 400 simulations and cost a fraction of
-  an opening ply, which is what makes a draining field far less wasteful than a naive
-  cost-per-ply estimate suggests.
-- **The tail is the one thing a full field does not fix.** A game can only take one simulation per
-  round, so once the field is down to a handful they are each paying 0.75 ms a position instead of
-  0.155 with nobody to share the call. `Config::batchSize` is the lever — `256 / games still playing`
-  rather than a fixed 1 would keep the batch full to the end, at the cost of virtual loss on those
-  last simulations. Not done.
+  game costs does not depend on which slot owns it, so refilling keeps network batches populated for
+  most of the run.
+- **The tail uses smaller batches.** Once only a few games remain, each still contributes one leaf
+  and the program accepts the lower device utilisation rather than complicating MCTS.
 - **The gate's field is smaller (`GATE_CONCURRENT`, 64)** because there the field size is also how long
   it takes to hear a verdict: `settled()` is only reconsulted as games come in, and 256 at once would
   spend most of `GATE_GAMES` before the first chance to stop. Once it does say stop, the games still in
   flight are abandoned rather than played out, so the tally is exactly what it was when it decided.
-- **The gate needs two trees per game and two batches per round**, one per network. Only one side is to
-  move at a time, so each batch is about half the field.
-- **`finished` is called under the field's lock**, once per game, so the callers' tallies need no
-  atomics. It is also where the one line a game gets is printed: how long it took, how many moves it
-  played, how many network calls it cost, and how many games are left. **There is no per-round
-  progress line, on purpose** — the games are never on the same move, so a field-wide "round" can only
-  be an average, and reporting one reads as though the games move in lockstep at the move level. They
-  do not: every game gets one simulation per round, so a game whose tree is nearly full plays its next
-  move in ~50 rounds while one in the opening needs 400.
-- **Everything random about a game comes from its id**, never from which slot or thread picked it up, so
-  a run stays reproducible from `SEED` however the field interleaves.
+- **The gate uses one tree per game.** The caller selects the candidate or champion evaluator from
+  the side to move; a fresh tree contains no statistics belonging to an earlier network.
+- **Completion is serial.** The callback updates its tally directly and can stop the field without
+  atomics or a lock. Per-game progress reports moves and evaluated positions.
+- **Everything random about a game comes from its id**, so a run stays reproducible from `SEED`.
 
 **The defaults are sized for a real overnight run**, not a smoke test: 6 blocks at width 128
 (~1.2M parameters), 400 simulations, 512 self-play games 256 at a time, and a 200-game gate 64 at a
@@ -406,7 +293,7 @@ BLOCKS=2 WIDTH=64 HEADS=4 GAMES=8 CONCURRENT=8 SIMULATIONS=50 STEPS=100 GATE_GAM
 ```
 
 Env vars, all optional: `BLOCKS WIDTH HEADS` (read only when starting from scratch — otherwise the
-shape comes out of the checkpoint), `SEED GAMES CONCURRENT SIMULATIONS LEAVES SAMPLING_PLIES NOISE`,
+shape comes out of the checkpoint), `SEED GAMES CONCURRENT SIMULATIONS SAMPLING_PLIES NOISE`,
 `STEPS BATCH RATE DECAY BUFFER`, `GATE_GAMES GATE_CONCURRENT GATE GATE_SIMULATIONS`.
 
 ### Things it gets right that are easy to get wrong
@@ -432,20 +319,9 @@ shape comes out of the checkpoint), `SEED GAMES CONCURRENT SIMULATIONS LEAVES SA
   own opinion.
 - **Progress output is flushed.** `std::println` block-buffers when stdout is not a terminal, so a
   redirected run showed an empty log for 100 s. Short runs hide this because exiting flushes.
-- **MLX is called from one thread at a time**, though not always the same one: the device call is task
-  0 of the same `forEach` round as the tree work, so whichever thread picks it up spends the round
-  inside MLX while the others walk trees. It used to be called from every game thread at once, which
-  worked but left ten threads each pushing a small batch.
-- **The device call and the tree work overlap.** A round used to be every descent with the device idle
-  (~15 ms) and then one network call with every core idle (~40 ms). Now half the field's batch is on
-  the device while the other half's trees are walked, so neither waits: ~42 ms per 256 positions
-  against 55, about **1.3×**. Each half is evaluated on one turn and stepped on the next, which is
-  what keeps an answer from being left unabsorbed. `NetworkEvaluator`'s own encode is a nested
-  `forEach` and so runs serially inside that task — 0.3 ms for 128 boards, measured, against a device
-  call of twenty.
-- **When one half empties, it degrades to the old behaviour rather than to something worse.** The
-  turns still alternate, but the empty half's turn costs nothing, so the surviving half pays
-  `evaluate + step` unoverlapped — exactly what every round used to cost.
+- **MLX calls are serial.** Each non-empty evaluator batch completes before the runner distributes
+  its results and resumes tree traversal. This is intentionally simple and makes the batching
+  boundary visible in one place.
 
 ### Deliberate gaps
 
@@ -473,25 +349,21 @@ queues game after game and only returns on error. Four callbacks, same shape as 
   `(pos, destination, splitting)`. `collectServerMoves()` turns the server's list into engine move
   ids, the search picks one, and `chooseMove()` finds it back in that list to recover the server's
   own strings.
-- **The bot keeps its own board, and the tree follows it.** `arena_game_state_t` carries a position
+- **The bot keeps its own board and history.** `arena_game_state_t` carries a position
   and nothing else — no ply count, no history — so `syncToServer()` works out which legal move the
-  opponent played and applies it locally. `advance()` re-roots the tree on it at the same time: a
-  reply the search already looked at is a subtree it gets to keep, so reuse pays on the opponent's
-  moves as well as our own. The resync fallback has to `restart()` instead, since the board it adopts
-  is not one the tree has. Re-parsing the server's board each turn instead would silently reset `ply` and
-  `staleness` to zero every ply, and would leave no hash history for the search to detect repetition
-  with.
+  opponent played and applies it locally. Every applied move constructs a fresh search with the full
+  accumulated hash history. Re-parsing the server's board each turn instead would silently reset
+  `ply` and `staleness` and would leave no history for search repetition detection.
 - **Two fallbacks, because forfeiting is worse than wrong bookkeeping.** If no legal move reaches the
   server's position, adopt that position and carry `ply` forward — that is a rules bug. If the search
   picks a move the server did not offer, play the server's first move.
 - **The model is loaded once per game**, in `on_game_start`. Between games is the only safe moment:
   one tree scoring its positions with two different networks is incoherent and would not show up in
   any log. It is also how a promotion by a trainer running alongside gets picked up.
-- **`kLeaves` is 16, not 1.** One game means the batch can only come from inside the one search, so
-  virtual loss earns its keep here and nowhere else.
-- **The search is count-bound, not deadline-bound.** `kSimulations` is 800 and there is no clock, so
-  the move logged is always the one 800 simulations chose. Those are simulations *through the root*,
-  so a re-rooted tree reaches 800 with fewer new evaluations and the reply lands sooner. Nothing
+- **The bot evaluates one leaf per call.** It has no independent games from which to form a batch;
+  single-game batching is deliberately absent from the baseline.
+- **The search is count-bound, not deadline-bound.** `searchSimulationCount` is 1000 and there is no
+  clock, so the move logged is always the one 1000 fresh simulations chose. Nothing
   enforces the server's 5 s — `on_move` times the whole reply, sync and translation included, and
   prints it next to the visit count and the root's legal-move count so a flat distribution can be
   told apart from a truncated one.
@@ -518,8 +390,8 @@ queues game after game and only returns on error. Four callbacks, same shape as 
 
 ## Network
 
-`amoeba/network.hpp` / `network.cpp`. `Network` holds the parameters, `forward()` is the
-prediction, `NetworkEvaluator` is the `bot::Evaluator` the search talks to. No training yet.
+`amoeba/network.hpp` / `network.cpp`. `Network` holds the parameters, `forward()` is the prediction,
+and `NetworkEvaluator` turns batches of boards into `Evaluation` values for the applications.
 
 - **Parameters are one flat `std::vector<mlx::core::array>`**, because that is what
   `mlx::core::value_and_grad` consumes and the shape it returns gradients in. `Network::layout()` is
@@ -563,13 +435,11 @@ fail to show, and why that row is still open.
 At 1.2M parameters over 37 tokens this is dispatch-bound, not compute-bound, so **CPU beats Metal at
 batch 1** and Metal wins from batch 8 up. It also flattens out early: 64 to 256 buys 6%, while 1 to 64
 buys 10×. That is why self-play batches across games — a field of 256 costs the same per position as
-a field of 64 but does four times as many games at once, and never leaves a game waiting on stale
-statistics — and why match play still batches leaves inside its one search rather than sending
-positions one at a time.
+a field of 64 but does four times as many games at once. Match play accepts batch-one inference to
+keep the search itself sequential and easy to reason about.
 
-Both `NetworkEvaluator::evaluate` and `makeBatch` encode their boards on the global thread pool. One
-slice per position, no sharing, and at 256 boards the encode is otherwise measurable next to the
-forward pass it feeds.
+`NetworkEvaluator::evaluate` and `makeTrainingBatch` encode and scatter their boards with direct
+loops. Their spans remain batched interfaces; only the application-owned CPU parallelism was removed.
 
 - **Attention over the 37 hex tokens, not convolution.** Amoeba's interactions are long-range by
   construction: a stack jumps over everything and lands at exactly its height. The neighbouring cell
@@ -677,17 +547,12 @@ entropy of the search's own disagreement with itself.
 
 ## Next steps
 
-1. **Settle `CONCURRENT`.** `GAMES=256` at `CONCURRENT=64` against `CONCURRENT=256` — same games,
-   same evaluation count, so the wall clock is the field size and nothing else. One measurement has
-   the 256-wide field running at old-code speed while the 64-wide one runs at 1.82×, and the
-   evaluator benchmark says that should be impossible. Something between the two is unaccounted for,
-   and it is worth an hour before it is worth a night of compute.
-2. **Fingerprint the search before touching it again.** There is no offline test of `Search` in the
-   tree, and the two things most likely to break silently are `keepSubtree()`'s renumbering and the
-   `pendingLeaves` / `absorb` handshake. The checks worth rerunning are cheap and were run on this
-   change: over a whole game, the root's visit counts must sum to exactly `simulations` and must be
-   zero on every move that is not legal in the position searched, and with a deterministic evaluator a
-   game played with `advance()` must match one played with `restart()` move for move.
+1. **Measure the simple baseline.** Compare `CONCURRENT=64` and `CONCURRENT=256` on the same seeded
+   games, and measure the bot's 1000 single-leaf simulations against the server's five-second limit.
+   Use those results to decide which optimisation, if any, deserves to return.
+2. **Add a permanent search fingerprint before optimising it again.** Over a whole game, the root's
+   visit counts must sum to exactly `simulations`, illegal moves must have zero visits, and repeated
+   noise-disabled runs must agree.
 3. **Play a practice game against the live server.** Nothing here has ever touched it, and the parity
    harness that would have caught a rules disagreement is gone. If the engine and the server disagree,
    `syncToServer()` silently resyncs and a bad rating cannot be told apart from a bad network. Do this

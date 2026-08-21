@@ -27,7 +27,7 @@
 //
 // Environment, all optional:
 //   network     BLOCKS WIDTH HEADS          (only read when starting from scratch)
-//   generating  SEED GAMES CONCURRENT SIMULATIONS LEAVES SAMPLING_PLIES NOISE
+//   generating  SEED GAMES CONCURRENT SIMULATIONS SAMPLING_PLIES NOISE
 //   training    STEPS BATCH RATE DECAY BUFFER
 //   gating      GATE_GAMES GATE_CONCURRENT GATE GATE_SIMULATIONS
 //
@@ -41,8 +41,6 @@
 #include <sys/resource.h>
 
 #include <algorithm>
-#include <array>
-#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -53,7 +51,6 @@
 #include <functional>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <numeric>
 #include <optional>
 #include <print>
@@ -143,14 +140,9 @@ struct TrainingSettings
 
     // 400 simulations is half of AlphaZero's 800, which is the usual trade on one
     // machine: the policy target is a distribution over visits, and doubling the
-    // visits sharpens it far less than doubling the games broadens it. It counts
-    // simulations through the root, so a re-rooted tree arrives with a good share
-    // of them already spent.
-    // One leaf per search, because the batch comes from the other games in flight
-    // and there is nothing to gain from guessing at a second leaf before hearing
-    // about the first.
-    Config searchConfig = {.simulations = readIntegerSetting("SIMULATIONS", 400),
-                           .batchSize = readIntegerSetting("LEAVES", 1)};
+    // visits sharpens it far less than doubling the games broadens it. Every move
+    // starts a fresh search and receives this full budget.
+    MCTSConfig searchConfig = {.simulations = readIntegerSetting("SIMULATIONS", 400)};
 
     // 512 games is roughly 60k positions. Fewer than that and each generation's
     // training set is mostly the previous generation's, so the gate compares two
@@ -253,6 +245,7 @@ struct ActiveGame
     std::vector<uint64_t> positionHistory;
     std::vector<TrainingSample> trainingSamples;
     std::mt19937_64 randomEngine;
+    std::mt19937_64 searchRandomEngine;
     NetworkPairing pairing{0, 0};
     int gameId = 0;
     bool isActive = false;
@@ -262,29 +255,23 @@ struct ActiveGame
     std::chrono::steady_clock::time_point startTime;
     long long evaluatedPositionCount = 0;
 
-    // One tree per network, not per colour. Self-play has a single network and so
-    // a single tree, which it re-roots after every ply instead of every other one -
-    // that is where most of the reuse comes from, since the tree keeps what both
-    // sides found. The gate has two, because a tree's statistics are worth exactly
-    // what the network that produced them is.
-    std::vector<Search> searches;
+    // One fresh tree for the current move. The caller chooses which network
+    // evaluates its leaves, so gate games do not need one tree per network.
+    std::optional<MCTS> search;
 
-    // Set fresh each round: the boards this game cannot go on without, which
-    // network owes it the answers, and where they sit in that network's batch.
-    std::span<const amoeba::Board* const> pendingBoards;
+    // Set fresh each round: the leaf this game cannot go on without, which
+    // network owes it the answer, and where it sits in that network's batch.
+    const amoeba::Board* pendingLeaf = nullptr;
     int evaluatorIndex = 0;
     size_t evaluationBatchOffset = 0;
 };
 
-// Plays a whole field of games at once, one simulation each per round, so that a
-// single network call answers every game in flight. The batch is the size of the
-// field rather than the size of whatever leaves one search could guess at, and
-// nothing is stale: each descent sees the statistics its own tree ended the last
-// round with, so no virtual loss is needed and none is applied.
+// Plays a field of independent games in lockstep. Each search offers one leaf per
+// round, and the runner batches those leaves by evaluator before continuing.
 class GameBatchRunner
 {
 public:
-    GameBatchRunner(std::span<Evaluator* const> evaluators, Config searchConfig, int samplingPlies)
+    GameBatchRunner(std::span<NetworkEvaluator* const> evaluators, MCTSConfig searchConfig, int samplingPlies)
         : m_evaluators(evaluators)
         , m_searchConfig(searchConfig)
         , m_samplingPlies(samplingPlies)
@@ -293,20 +280,19 @@ public:
 
     // Plays `games` games with `slots` of them in flight, refilling a slot as its
     // game ends so the batch stays full until the work runs out. `pairingFor(game)`
-    // says who plays which colour; `finished` is handed each game as it ends, under
-    // a lock, so its tally needs no synchronisation of its own. `finished` returning
-    // false stops the field there and then - the games still in flight are
-    // abandoned, so the tally is exactly what it was when it said stop.
+    // says who plays which colour. `finished` returning false stops the field there
+    // and then; the other games still in flight are abandoned.
     void playGames(int gameCount, int concurrentGameCount, uint64_t seed, const char* label,
                    const std::function<NetworkPairing(int)>& pairingFor,
                    const std::function<bool(int, std::vector<TrainingSample>&&)>& onGameFinished);
 
 private:
     void initializeGame(ActiveGame&, int gameId, NetworkPairing, uint64_t seed) const;
+    void startSearch(ActiveGame&) const;
     void advanceUntilEvaluation(ActiveGame&) const;
 
-    std::span<Evaluator* const> m_evaluators;
-    Config m_searchConfig;
+    std::span<NetworkEvaluator* const> m_evaluators;
+    MCTSConfig m_searchConfig;
     int m_samplingPlies;
 };
 
@@ -322,39 +308,37 @@ void GameBatchRunner::initializeGame(ActiveGame& game, int gameId, NetworkPairin
     game.outcome.reset();
     game.trainingSamples.clear();
     game.randomEngine.seed(seed ^ (0x9e3779b97f4a7c15ULL * (static_cast<uint64_t>(gameId) + 1)));
+    game.searchRandomEngine.seed(seed + static_cast<uint64_t>(gameId));
 
-    // Everything random about a game comes from its id, never from which slot or
-    // thread happened to pick it up, so a whole run stays reproducible from SEED
-    // however the field interleaves.
-    game.searches.clear();
-    for (size_t evaluatorIndex = 0; evaluatorIndex < m_evaluators.size(); ++evaluatorIndex)
-    {
-        Config config = m_searchConfig;
-        config.noiseSeed = seed + static_cast<uint64_t>(gameId);
-        game.searches.emplace_back(config);
-    }
-    for (Search& search : game.searches)
-        search.restart(game.board, game.positionHistory);
+    // The caller owns noise-seed progression because each MCTS exists for one
+    // position only. It stays separate from move sampling so changing one random
+    // process does not perturb the other.
+    startSearch(game);
+    game.pendingLeaf = nullptr;
 }
 
-// Plays as far as it can without an evaluation, leaving the boards it is waiting
-// on in `pendingBoards` - or leaving it empty, which means the game is over.
+void GameBatchRunner::startSearch(ActiveGame& game) const
+{
+    MCTSConfig config = m_searchConfig;
+    config.noiseSeed = game.searchRandomEngine();
+    game.search.emplace(game.board, game.positionHistory, config);
+}
+
+// Plays as far as it can without an evaluation, leaving the leaf it is waiting on
+// in `pendingLeaf` - or leaving it null, which means the game is over.
 void GameBatchRunner::advanceUntilEvaluation(ActiveGame& game) const
 {
     while (!game.outcome.has_value())
     {
         const int evaluatorIndex = game.board.whiteToMove ? game.pairing.whiteEvaluator : game.pairing.blackEvaluator;
-        Search& search = game.searches[static_cast<size_t>(evaluatorIndex)];
-
-        const std::span<const amoeba::Board* const> pendingBoards = search.pendingLeaves();
-        if (!pendingBoards.empty())
+        if (const amoeba::Board* leaf = game.search->pendingLeaf())
         {
             game.evaluatorIndex = evaluatorIndex;
-            game.pendingBoards = pendingBoards;
+            game.pendingLeaf = leaf;
             return;
         }
 
-        const VisitCounts visitCounts = search.visits();
+        const VisitCounts visitCounts = game.search->visits();
         game.trainingSamples.push_back({game.board, visitCounts, 0.0f, game.gameId});
 
         const uint16_t chosenMoveId =
@@ -369,13 +353,9 @@ void GameBatchRunner::advanceUntilEvaluation(ActiveGame& game) const
 
         game.board = std::get<amoeba::Board>(std::move(result));
         game.positionHistory.push_back(game.board.positionHash);
-
-        // Every tree follows the game, not just the one that was searching: a tree
-        // can only keep a subtree while its root is where the game is.
-        for (Search& searchToAdvance : game.searches)
-            searchToAdvance.advance(chosenMoveId, game.board, game.positionHistory);
+        startSearch(game);
     }
-    game.pendingBoards = {};
+    game.pendingLeaf = nullptr;
 }
 
 void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t seed, const char* label,
@@ -387,53 +367,24 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
 
     std::vector<ActiveGame> activeGames(static_cast<size_t>(std::max(1, std::min(gameCount, concurrentGameCount))));
 
-    std::mutex completionMutex;
-    std::atomic<bool> shouldContinue{true};
+    bool shouldContinue = true;
     int completedGameCount = 0;
     int startedGameCount = 0;
 
-    // The field is walked in two halves that take turns: while one half's batch is on
-    // the device, the other half's trees are walked on the pool. A round used to be
-    // every descent with the device idle and then one network call with every core
-    // idle - 15 ms and 40 ms of a 55 ms round, neither overlapping the other.
-    struct Half
-    {
-        size_t firstGameIndex = 0;
-        size_t gameCount = 0;
-        std::vector<std::vector<const amoeba::Board*>> pendingBoardsByEvaluator;
-        std::vector<std::vector<Evaluation>> evaluationsByEvaluator;
-        size_t gatheredBoardCount = 0;
-    };
+    std::vector<std::vector<const amoeba::Board*>> pendingBoardsByEvaluator(m_evaluators.size());
+    std::vector<std::vector<Evaluation>> evaluationsByEvaluator(m_evaluators.size());
 
-    std::array<Half, 2> halves;
-    halves[0].gameCount = activeGames.size() - activeGames.size() / 2;
-    halves[1].firstGameIndex = halves[0].gameCount;
-    halves[1].gameCount = activeGames.size() / 2;
-    for (Half& half : halves)
-    {
-        half.pendingBoardsByEvaluator.resize(m_evaluators.size());
-        half.evaluationsByEvaluator.resize(m_evaluators.size());
-    }
-
-    report("[{}] {} games, {} in flight in halves of {} and {}, at {} simulations, {} leaves per search", label,
-           gameCount, activeGames.size(), halves[0].gameCount, halves[1].gameCount, m_searchConfig.simulations,
-           m_searchConfig.batchSize);
+    report("[{}] {} games, {} in flight, at {} simulations", label, gameCount, activeGames.size(),
+           m_searchConfig.simulations);
 
     for (ActiveGame& game : activeGames)
     {
         initializeGame(game, startedGameCount, pairingFor(startedGameCount), seed);
         ++startedGameCount;
+        advanceUntilEvaluation(game);
     }
 
-    // Hands a finished game over and takes on the next one, under one lock: it is
-    // where the caller keeps its tally and decides whether any more games are worth
-    // playing, and where the one line a game gets is printed. Once per game rather
-    // than once per round, so the lock is never contended for long.
-    //
-    // The line reports the game's own numbers because the field's do not mean much:
-    // the games are never on the same move, so there is no shared round to report.
-    // A game's moves and evaluations together say what its tree reuse was worth -
-    // 400 simulations a move, minus whatever it inherited.
+    // Hands a finished game over and refills its slot if more work remains.
     const auto handOver = [&](ActiveGame& game)
     {
         for (TrainingSample& sample : game.trainingSamples)
@@ -442,8 +393,6 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
             sample.outcome = outcomeFor(*game.outcome, sample.board.whiteToMove);
         }
 
-        const std::lock_guard guard{completionMutex};
-
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - game.startTime).count();
         const size_t moves = game.trainingSamples.size();
 
@@ -451,7 +400,8 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
             shouldContinue = false;
         ++completedGameCount;
 
-        report("[{}] game {}: {:.0f}s, {} moves, {} network calls -- {} games left", label, game.gameId, seconds, moves,
+        report("[{}] game {}: {:.0f}s, {} moves, {} evaluated positions -- {} games left", label, game.gameId,
+               seconds, moves,
                game.evaluatedPositionCount, gameCount - completedGameCount);
 
         if (!shouldContinue || startedGameCount >= gameCount)
@@ -461,113 +411,67 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
         }
         initializeGame(game, startedGameCount, pairingFor(startedGameCount), seed);
         ++startedGameCount;
-    };
-
-    // Absorbs what the device returned for this slot last time round, then takes the
-    // game as far as it can before it needs an answer again.
-    const auto stepOne = [&](Half& half, size_t slot)
-    {
-        ActiveGame& game = activeGames[slot];
-        if (!game.isActive)
-            return;
-
-        if (!game.pendingBoards.empty())
-        {
-            game.evaluatedPositionCount += static_cast<long long>(game.pendingBoards.size());
-            game.searches[static_cast<size_t>(game.evaluatorIndex)].absorb(
-                std::span{half.evaluationsByEvaluator[static_cast<size_t>(game.evaluatorIndex)]}.subspan(
-                    game.evaluationBatchOffset, game.pendingBoards.size()));
-        }
-
         advanceUntilEvaluation(game);
-        while (game.isActive && game.pendingBoards.empty())
-        {
-            handOver(game);
-            if (game.isActive)
-                advanceUntilEvaluation(game);
-        }
     };
 
-    // Collects one half's waiting boards into one batch per network, remembering
-    // where each game's own boards landed so absorb() can find them again.
-    const auto gather = [&](Half& half)
+    for (;;)
     {
-        half.gatheredBoardCount = 0;
-        for (std::vector<const amoeba::Board*>& evaluatorBatch : half.pendingBoardsByEvaluator)
-        {
-            evaluatorBatch.clear();
-        }
+        size_t gatheredBoardCount = 0;
+        for (std::vector<const amoeba::Board*>& batch : pendingBoardsByEvaluator)
+            batch.clear();
 
-        for (size_t slot = half.firstGameIndex; slot < half.firstGameIndex + half.gameCount; ++slot)
+        for (ActiveGame& game : activeGames)
         {
-            ActiveGame& game = activeGames[slot];
-            if (!game.isActive || game.pendingBoards.empty())
+            if (!game.isActive || game.pendingLeaf == nullptr)
                 continue;
 
-            std::vector<const amoeba::Board*>& evaluatorBatch =
-                half.pendingBoardsByEvaluator[static_cast<size_t>(game.evaluatorIndex)];
-            game.evaluationBatchOffset = evaluatorBatch.size();
-            evaluatorBatch.insert(evaluatorBatch.end(), game.pendingBoards.begin(), game.pendingBoards.end());
-            half.gatheredBoardCount += game.pendingBoards.size();
+            std::vector<const amoeba::Board*>& batch =
+                pendingBoardsByEvaluator[static_cast<size_t>(game.evaluatorIndex)];
+            game.evaluationBatchOffset = batch.size();
+            batch.push_back(game.pendingLeaf);
+            ++gatheredBoardCount;
         }
-    };
 
-    Half* stepping = nullptr;
-    Half* evaluating = nullptr;
+        if (gatheredBoardCount == 0)
+            return;
 
-    // Task 0 is the device call, tasks 1.. are the other half's trees, all in one
-    // round of the pool. No extra thread, and only ever one thread inside MLX: its
-    // own encode is a nested forEach and so runs serially there, which costs 0.3 ms
-    // against a call of twenty.
-    const std::function<void(size_t)> round = [&](size_t index)
-    {
-        if (index == 0)
+        for (size_t evaluatorIndex = 0; evaluatorIndex < m_evaluators.size(); ++evaluatorIndex)
         {
-            for (size_t evaluatorIndex = 0; evaluatorIndex < m_evaluators.size(); ++evaluatorIndex)
-            {
-                if (evaluating->pendingBoardsByEvaluator[evaluatorIndex].empty())
-                    continue;
-                evaluating->evaluationsByEvaluator[evaluatorIndex].resize(
-                    evaluating->pendingBoardsByEvaluator[evaluatorIndex].size());
-                m_evaluators[evaluatorIndex]->evaluate(evaluating->pendingBoardsByEvaluator[evaluatorIndex],
-                                                       evaluating->evaluationsByEvaluator[evaluatorIndex]);
-            }
-            return;
+            if (pendingBoardsByEvaluator[evaluatorIndex].empty())
+                continue;
+            evaluationsByEvaluator[evaluatorIndex].resize(pendingBoardsByEvaluator[evaluatorIndex].size());
+            m_evaluators[evaluatorIndex]->evaluate(pendingBoardsByEvaluator[evaluatorIndex],
+                                                   evaluationsByEvaluator[evaluatorIndex]);
         }
-        stepOne(*stepping, stepping->firstGameIndex + index - 1);
-    };
 
-    // One half has to have something to evaluate before the two can start taking
-    // turns; there is nothing to overlap this once.
-    ThreadPool::global().forEach(halves[0].gameCount,
-                                 [&](size_t gameOffset) { stepOne(halves[0], halves[0].firstGameIndex + gameOffset); });
-    gather(halves[0]);
+        for (ActiveGame& game : activeGames)
+        {
+            if (!game.isActive || game.pendingLeaf == nullptr)
+                continue;
 
-    for (size_t turn = 0;; turn ^= 1)
-    {
-        evaluating = &halves[turn];
-        stepping = &halves[turn ^ 1];
+            game.search->absorb(
+                evaluationsByEvaluator[static_cast<size_t>(game.evaluatorIndex)][game.evaluationBatchOffset]);
+            game.pendingLeaf = nullptr;
+            ++game.evaluatedPositionCount;
+            advanceUntilEvaluation(game);
 
-        ThreadPool::global().forEach(1 + stepping->gameCount, round);
-        if (!shouldContinue)
-            return;
-
-        gather(*stepping);
-
-        // Each half is evaluated on one turn and stepped on the next, so nothing is
-        // left holding an answer nobody absorbed when both come up empty.
-        if (halves[0].gatheredBoardCount == 0 && halves[1].gatheredBoardCount == 0)
-            return;
+            if (game.pendingLeaf == nullptr)
+            {
+                handOver(game);
+                if (!shouldContinue)
+                    return;
+            }
+        }
     }
 }
 
 std::vector<TrainingSample> generateSelfPlaySamples(const Network& champion, const TrainingSettings& settings, uint64_t seed)
 {
-    Config searchConfig = settings.searchConfig;
+    MCTSConfig searchConfig = settings.searchConfig;
     searchConfig.rootNoise = settings.rootNoise;
 
     NetworkEvaluator evaluator{champion};
-    Evaluator* const evaluators[]{&evaluator};
+    NetworkEvaluator* const evaluators[]{&evaluator};
 
     std::vector<TrainingSample> trainingSamples;
     int whiteWins = 0, blackWins = 0, draws = 0;
@@ -773,13 +677,13 @@ bool gateResultIsSettled(int played, double score, float threshold)
 // read here - the visit counts that needed the deeper search are discarded.
 double evaluateCandidate(const Network& candidate, const Network& champion, const TrainingSettings& settings, uint64_t seed)
 {
-    Config searchConfig = settings.searchConfig;
+    MCTSConfig searchConfig = settings.searchConfig;
     searchConfig.simulations = settings.gateSimulationCount;
     searchConfig.rootNoise = 0.0f; // competition keeps the network's own opinion
 
     NetworkEvaluator candidateEval{candidate};
     NetworkEvaluator championEval{champion};
-    Evaluator* const evaluators[]{&candidateEval, &championEval};
+    NetworkEvaluator* const evaluators[]{&candidateEval, &championEval};
 
     int wins = 0, draws = 0, losses = 0;
 
