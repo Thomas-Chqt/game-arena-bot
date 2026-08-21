@@ -8,7 +8,8 @@
 // The path is required and must exist: this program never trains and never
 // writes weights, so there is nothing sensible to do without them, and guessing
 // at which file to load is how you end up playing rated games with a network you
-// did not mean to. Point it at the file amoeba_train is writing to.
+// did not mean to. The file is loaded once at startup and that model is used
+// until the program exits.
 //
 // Credentials come from BOT1_ID and BOT1_KEY; ROOM_ID picks a practice room, and
 // without it the bot queues for ranked games back to back.
@@ -90,11 +91,9 @@ struct TranslatedMove
     bool serverSplittingFlag;
 };
 
-// The model is loaded once per game and held for the whole of it. Reloading it
-// mid-game would mean one tree scoring its positions with two different
-// networks, which is incoherent and would not show up in any log; between games
-// is the only safe moment, and it is how a promotion by a trainer running
-// alongside gets picked up.
+// The model is loaded once at startup and held for the process lifetime. Each
+// game gets a fresh search root, but changes to the checkpoint on disk are not
+// picked up until the bot is restarted.
 struct BotContext
 {
     std::filesystem::path checkpointPath;
@@ -280,7 +279,6 @@ void onGameStart(const arena_game_state_t* state, void* userData)
 {
     runGuardedCallback("on_game_start", [&] {
         BotContext& context = *static_cast<BotContext*>(userData);
-        loadCheckpoint(context);
 
         context.board = amoeba::parseBoard(state->board, state->current_turn == ARENA_SIDE_WHITE);
         context.positionHistory.assign(1, context.board.positionHash);
