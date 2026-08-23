@@ -118,7 +118,7 @@ std::vector<mlx::core::array> computeLoss(const AmoebaNetwork& network,
                                           const std::vector<mlx::core::array>& parameters,
                                           const TrainingBatch& batch, float weightDecay)
 {
-    const std::vector<mlx::core::array> networkOutput = network(batch.input, parameters);
+    const std::vector<mlx::core::array> networkOutput = network.evaluate(batch.input, parameters);
     assert(networkOutput.size() == 2);
     const Prediction prediction{networkOutput[0], networkOutput[1]};
 

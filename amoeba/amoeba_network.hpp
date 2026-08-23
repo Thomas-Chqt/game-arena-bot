@@ -67,8 +67,8 @@ template<size_t Width, size_t HeadCount>
 class TransformerBlock
 {
 public:
-    template<typename NetworkType>
-    TransformerBlock(NetworkType& network, std::string_view name)
+    template<NetworkType N>
+    TransformerBlock(N& network, std::string_view name)
         : m_norm1(network, childName(name, "norm1"))
         , m_attention(network, childName(name, "attention"))
         , m_norm2(network, childName(name, "norm2"))
@@ -99,31 +99,57 @@ struct Prediction
     mlx::core::array value;  // Expected outcome for the side to move: [batch].
 };
 
-// This header-only root describes how reusable modules are connected for Amoeba.
-// Changing any template argument creates a different C++ network type.
-template<size_t BlockCount, size_t Width, size_t HeadCount>
-class AmoebaRoot
-{
-    static_assert(BlockCount > 0, "an Amoeba network needs at least one transformer block");
-    static_assert(Width > 0, "an Amoeba network width must be positive");
-    static_assert(HeadCount > 0, "an Amoeba network needs at least one attention head");
-    static_assert(Width % HeadCount == 0, "network width must be divisible by its attention-head count");
+class AmoebaNetwork;
 
+template<>
+struct NetworkName<AmoebaNetwork>
+{
+    inline static constexpr const char* value = "amoeba-relation-transformer-v2-6x128x8";
+};
+
+// The concrete network is the top-level module. It owns its module tree while
+// Network supplies parameter storage, checkpoints, and compiled execution.
+class AmoebaNetwork final : public Network
+{
 public:
-    template<typename NetworkType>
-    AmoebaRoot(NetworkType& network, std::string_view)
-        : m_embed(network, "embed")
-        , m_positionIndex(network.addParameter(
-              "position", {hexCount, static_cast<int>(Width)}, Initialization::Normal(0.02f)))
-        , m_blocks(network, "blocks")
-        , m_finalNorm(network, "final_norm")
-        , m_policy(network, "policy")
-        , m_value(network, "value")
+    inline static constexpr const char* name = NetworkName<AmoebaNetwork>::value;
+
+    explicit AmoebaNetwork(uint64_t seed)
+        : Network(name, seed)
+        , m_embed(*this, "embed")
+        , m_positionIndex(addParameter(
+              "position", mlx::core::random::normal(
+                              {hexCount, embeddingWidth}, mlx::core::float32, 0.0f, 0.02f)))
+        , m_blocks(*this, "blocks")
+        , m_finalNorm(*this, "final_norm")
+        , m_policy(*this, "policy")
+        , m_value(*this, "value")
     {
+        materializeParameters();
     }
 
-    std::vector<mlx::core::array> operator()(
+    explicit AmoebaNetwork(const std::filesystem::path& checkpoint)
+        : Network(name, 0)
+        , m_embed(*this, "embed")
+        , m_positionIndex(addParameter(
+              "position", mlx::core::random::normal(
+                              {hexCount, embeddingWidth}, mlx::core::float32, 0.0f, 0.02f)))
+        , m_blocks(*this, "blocks")
+        , m_finalNorm(*this, "final_norm")
+        , m_policy(*this, "policy")
+        , m_value(*this, "value")
+    {
+        load(checkpoint);
+    }
+
+private:
+    static constexpr int blockCount = 6;
+    static constexpr int embeddingWidth = 128;
+    static constexpr int attentionHeadCount = 8;
+
+    std::vector<mlx::core::array> forward(
         mlx::core::array inputBatch, std::span<const mlx::core::array> parameters) const
+        override
     {
         assert(inputBatch.ndim() == 2);
         assert(inputBatch.shape(1) == encodedBoardSize);
@@ -156,23 +182,12 @@ public:
         return {policy, value};
     }
 
-private:
-    Linear<featuresPerHex + globalFeatureCount, Width> m_embed;
+    Linear<featuresPerHex + globalFeatureCount, embeddingWidth> m_embed;
     size_t m_positionIndex;
-    Repeat<BlockCount, TransformerBlock<Width, HeadCount>> m_blocks;
-    LayerNorm<Width> m_finalNorm;
-    Linear<Width, policyOutputsPerHex> m_policy;
-    Sequential<Linear<Width, Width>, Gelu, Linear<Width, 1>, Tanh> m_value;
-};
-
-using AmoebaNetwork = Network<AmoebaRoot<6, 128, 8>>;
-
-// The name is external to Network and may be chosen freely. A differently sized
-// AmoebaRoot is a different type and therefore requires its own specialization.
-template<>
-struct NetworkName<AmoebaNetwork>
-{
-    inline static constexpr const char* value = "amoeba-relation-transformer-v2-6x128x8";
+    Repeat<blockCount, TransformerBlock<embeddingWidth, attentionHeadCount>> m_blocks;
+    LayerNorm<embeddingWidth> m_finalNorm;
+    Linear<embeddingWidth, policyOutputsPerHex> m_policy;
+    Sequential<Linear<embeddingWidth, embeddingWidth>, Gelu, Linear<embeddingWidth, 1>, Tanh> m_value;
 };
 
 class NetworkEvaluator

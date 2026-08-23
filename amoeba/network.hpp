@@ -7,6 +7,7 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -26,23 +27,6 @@
 namespace amoeba
 {
 
-// Describes how a parameter tensor gets its initial values. Initialization is
-// performed once, when Network constructs its root module. FanInNormal scales
-// random weights by the input width so that early activations do not explode as
-// they pass through several layers.
-struct Initialization
-{
-    enum class Kind { zeros, ones, fanInNormal, normal };
-
-    static constexpr Initialization Zeros() { return {Kind::zeros, 0.0f}; }
-    static constexpr Initialization Ones() { return {Kind::ones, 0.0f}; }
-    static constexpr Initialization FanInNormal() { return {Kind::fanInNormal, 0.0f}; }
-    static constexpr Initialization Normal(float standardDeviation) { return {Kind::normal, standardDeviation}; }
-
-    Kind kind;
-    float standardDeviation;
-};
-
 std::string childName(std::string_view parent, std::string_view child);
 std::string indexedName(std::string_view parent, size_t index);
 
@@ -55,13 +39,11 @@ concept Module = requires(const T& module, mlx::core::array input, std::span<con
     module(std::move(input), parameters);
 };
 
-// A concrete Network type must specialize this trait. Keeping the name outside
-// Network lets two different Root template specializations choose independent
-// checkpoint identifiers without making the string part of Network's type.
-template<typename NetworkType>
+// A concrete Network subclass must specialize this trait. Keeping the name
+// outside the class lets the user choose the checkpoint identifier.
+template<typename T>
 struct NetworkName;
 
-template<Module Root>
 class Network
 {
     struct ParameterDefinition
@@ -74,23 +56,11 @@ class Network
         std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)>;
 
 public:
-    // This exact name is written into the checkpoint. It identifies both the
-    // architecture and its dimensions, not a particular set of trained values.
-    inline static constexpr const char* name = NetworkName<Network>::value;
+    virtual ~Network() = default;
 
-    // Constructing Root recursively constructs every child module. Each module
-    // calls addParameter(), so construction also defines the complete parameter
-    // layout and initializes the tensors in that same stable order.
-    explicit Network(uint64_t seed) : Network(seed, true) {}
-
-    explicit Network(const std::filesystem::path& checkpoint) : Network(0, false)
-    {
-        load(checkpoint);
-    }
-
-    // Training uses this overload. MLX supplies a replacement parameter vector
-    // to value_and_grad, and the same module tree evaluates with those values.
-    std::vector<mlx::core::array> operator()(
+    // Training uses this function. MLX supplies a parameter vector to
+    // value_and_grad, and the same module tree evaluates with those values.
+    std::vector<mlx::core::array> evaluate(
         mlx::core::array input, std::span<const mlx::core::array> parameters) const
     {
         assert(parameters.size() == m_parameters.size());
@@ -107,41 +77,30 @@ public:
         inputs.reserve(parameters.size() + 1);
         inputs.push_back(std::move(input));
         inputs.insert(inputs.end(), parameters.begin(), parameters.end());
+
+        // The derived object and all its module members now exist, so invoking
+        // the virtual forward function is safe. MLX traces it on the first call.
+        if (!m_compiledForward)
+            createCompiledForward();
         return m_compiledForward(inputs);
     }
 
     // Inference uses the parameters currently owned by this Network.
     std::vector<mlx::core::array> operator()(mlx::core::array input) const
     {
-        return (*this)(std::move(input), m_parameters);
+        return evaluate(std::move(input), m_parameters);
     }
 
     // Modules call this from their constructors and retain the returned index.
     // The actual tensor stays here in Network; a module owns only its structure.
-    size_t addParameter(std::string parameterName, mlx::core::Shape shape, Initialization initialization)
+    size_t addParameter(std::string parameterName, mlx::core::array value)
     {
         assert(std::ranges::find(m_layout, parameterName, &ParameterDefinition::name) == m_layout.end());
-        assert(!shape.empty());
-
-        mlx::core::array value = [&]
-        {
-            switch (initialization.kind)
-            {
-                case Initialization::Kind::zeros:
-                    return mlx::core::zeros(shape, mlx::core::float32);
-                case Initialization::Kind::ones:
-                    return mlx::core::ones(shape, mlx::core::float32);
-                case Initialization::Kind::fanInNormal:
-                    return mlx::core::random::normal(shape, mlx::core::float32, 0.0f, 1.0f / std::sqrt(static_cast<float>(shape.front())));
-                case Initialization::Kind::normal:
-                    assert(initialization.standardDeviation > 0.0f);
-                    return mlx::core::random::normal(shape, mlx::core::float32, 0.0f, initialization.standardDeviation);
-            }
-            std::unreachable();
-        }();
+        assert(value.ndim() > 0);
+        assert(value.dtype() == mlx::core::float32);
 
         const size_t index = m_parameters.size();
-        m_layout.push_back({std::move(parameterName), std::move(shape)});
+        m_layout.push_back({std::move(parameterName), value.shape()});
         m_parameters.push_back(std::move(value));
         return index;
     }
@@ -192,52 +151,50 @@ public:
         std::unordered_map<std::string, mlx::core::array> tensors;
         for (size_t index = 0; index < m_layout.size(); ++index)
             tensors.emplace(m_layout[index].name, m_parameters[index]);
-        mlx::core::save_safetensors(checkpoint.string(), tensors, {{"network", name}});
+        mlx::core::save_safetensors(checkpoint.string(), tensors, {{"network", m_name}});
     }
 
-private:
-    Network(uint64_t seed, bool materializeRandomParameters)
-        : m_root(createRoot(*this, seed))
-        , m_compiledForward(compileForward(m_root))
+protected:
+    // The base is constructed before the derived module members, so setting the
+    // seed here makes their subsequent parameter initialization reproducible.
+    Network(const char* name, uint64_t seed)
+        : m_name(name)
     {
-        // A newly initialized network should own concrete values immediately.
-        // The checkpoint constructor skips this because load() replaces every
-        // random tensor before any of those temporary values are needed.
-        if (materializeRandomParameters)
-            mlx::core::eval(m_parameters);
-    }
-
-    // The random seed must be set before Root registers and initializes its first
-    // parameter. A helper is needed because member construction precedes the
-    // Network constructor body.
-    static Root createRoot(Network& network, uint64_t seed)
-    {
+        assert(name != nullptr);
+        assert(*name != '\0');
         mlx::core::random::seed(seed);
-        return Root{network, ""};
     }
 
-    static CompiledForward compileForward(Root root)
+    // A compiled callable captures `this`, so copies retain parameter state but
+    // deliberately compile their own callable on first use.
+    Network(const Network& other)
+        : m_name(other.m_name)
+        , m_layout(other.m_layout)
+        , m_parameters(other.m_parameters)
     {
-        // Store this function once for the lifetime of the Network. Its first
-        // real call traces and compiles the graph; later calls with the same
-        // number, shapes and dtypes reuse MLX's cached executable. Root is copied
-        // into the lambda so copying a Network never leaves a dangling `this`.
-        std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)> forward =
-            [root = std::move(root)](const std::vector<mlx::core::array>& inputs)
-        {
-            assert(!inputs.empty());
-            return root(inputs.front(), std::span{inputs}.subspan(1));
-        };
-        return mlx::core::compile(std::move(forward));
     }
+
+    Network& operator=(const Network& other)
+    {
+        if (this != &other)
+        {
+            m_name = other.m_name;
+            m_layout = other.m_layout;
+            m_parameters = other.m_parameters;
+            m_compiledForward = {};
+        }
+        return *this;
+    }
+
+    void materializeParameters() { mlx::core::eval(m_parameters); }
 
     void load(const std::filesystem::path& checkpoint)
     {
         auto [tensors, metadata] = mlx::core::load_safetensors(checkpoint.string());
 
         const auto storedName = metadata.find("network");
-        if (storedName == metadata.end() || storedName->second != name)
-            throw std::runtime_error(std::format("{}: checkpoint is not for network {}", checkpoint.string(), name));
+        if (storedName == metadata.end() || storedName->second != m_name)
+            throw std::runtime_error(std::format("{}: checkpoint is not for network {}", checkpoint.string(), m_name));
         if (tensors.size() != m_layout.size())
             throw std::runtime_error(std::format("{}: expected {} tensors, found {}", checkpoint.string(),
                                                  m_layout.size(), tensors.size()));
@@ -259,12 +216,41 @@ private:
         mlx::core::eval(m_parameters);
     }
 
+    virtual std::vector<mlx::core::array> forward(
+        mlx::core::array input, std::span<const mlx::core::array> parameters) const = 0;
+
+private:
+    void createCompiledForward() const
+    {
+        std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)> function =
+            [this](const std::vector<mlx::core::array>& inputs)
+        {
+            assert(!inputs.empty());
+            return forward(inputs.front(), std::span{inputs}.subspan(1));
+        };
+        m_compiledForward = mlx::core::compile(std::move(function));
+    }
+
     // Metadata that belongs together is one structure. Values remain a flat
     // vector because MLX transformations exchange parameters in that format.
+    const char* m_name;
     std::vector<ParameterDefinition> m_layout;
     std::vector<mlx::core::array> m_parameters;
-    Root m_root;
-    CompiledForward m_compiledForward;
+    mutable CompiledForward m_compiledForward;
+};
+
+// Modules use this concept for their construction-time dependency. A network
+// owns parameters, supports normal inference with operator(), and can evaluate
+// an explicit parameter vector while MLX differentiates it.
+template<typename T>
+concept NetworkType = requires(
+    T& network, const T& constNetwork, mlx::core::array input,
+    std::span<const mlx::core::array> parameters, std::string name,
+    mlx::core::array parameter)
+{
+    { constNetwork(std::move(input)) } -> std::same_as<std::vector<mlx::core::array>>;
+    { constNetwork.evaluate(std::move(input), parameters) } -> std::same_as<std::vector<mlx::core::array>>;
+    { network.addParameter(std::move(name), std::move(parameter)) } -> std::same_as<size_t>;
 };
 
 // A fully connected layer. For every vector on the input's last axis it computes
@@ -273,9 +259,13 @@ template<size_t Input, size_t Output, bool Bias = true>
 class Linear
 {
 public:
-    template<typename NetworkType>
-    Linear(NetworkType& network, std::string_view name)
-        : m_weightIndex(network.addParameter(childName(name, "weight"), {static_cast<int>(Input), static_cast<int>(Output)}, Initialization::FanInNormal()))
+    template<NetworkType N>
+    Linear(N& network, std::string_view name)
+        : m_weightIndex(network.addParameter(
+              childName(name, "weight"),
+              mlx::core::random::normal(
+                  {static_cast<int>(Input), static_cast<int>(Output)}, mlx::core::float32,
+                  0.0f, 1.0f / std::sqrt(static_cast<float>(Input)))))
         , m_biasIndex(addBias(network, name))
     {
     }
@@ -297,12 +287,13 @@ public:
     }
 
 private:
-    template<typename NetworkType>
-    static size_t addBias(NetworkType& network, std::string_view name)
+    template<NetworkType N>
+    static size_t addBias(N& network, std::string_view name)
     {
         if constexpr (Bias)
-            return network.addParameter(childName(name, "bias"), {static_cast<int>(Output)},
-                                        Initialization::Zeros());
+            return network.addParameter(
+                childName(name, "bias"),
+                mlx::core::zeros({static_cast<int>(Output)}, mlx::core::float32));
         else
             return 0;
     }
@@ -318,12 +309,14 @@ template<size_t Width>
 class LayerNorm
 {
 public:
-    template<typename NetworkType>
-    LayerNorm(NetworkType& network, std::string_view name)
-        : m_scaleIndex(network.addParameter(childName(name, "scale"), {static_cast<int>(Width)},
-                                            Initialization::Ones()))
-        , m_shiftIndex(network.addParameter(childName(name, "shift"), {static_cast<int>(Width)},
-                                            Initialization::Zeros()))
+    template<NetworkType N>
+    LayerNorm(N& network, std::string_view name)
+        : m_scaleIndex(network.addParameter(
+              childName(name, "scale"),
+              mlx::core::ones({static_cast<int>(Width)}, mlx::core::float32)))
+        , m_shiftIndex(network.addParameter(
+              childName(name, "shift"),
+              mlx::core::zeros({static_cast<int>(Width)}, mlx::core::float32)))
     {
     }
 
@@ -347,7 +340,7 @@ private:
 struct Relu
 {
     Relu() = default;
-    template<typename NetworkType> Relu(NetworkType&, std::string_view) {}
+    template<NetworkType N> Relu(N&, std::string_view) {}
     mlx::core::array operator()(mlx::core::array input, std::span<const mlx::core::array>) const
     {
         return mlx::core::maximum(input, mlx::core::array(0.0f));
@@ -357,7 +350,7 @@ struct Relu
 struct Gelu
 {
     Gelu() = default;
-    template<typename NetworkType> Gelu(NetworkType&, std::string_view) {}
+    template<NetworkType N> Gelu(N&, std::string_view) {}
     mlx::core::array operator()(mlx::core::array input, std::span<const mlx::core::array>) const
     {
         return input * 0.5f * (mlx::core::erf(input * 0.70710678118654752f) + 1.0f);
@@ -367,7 +360,7 @@ struct Gelu
 struct Sigmoid
 {
     Sigmoid() = default;
-    template<typename NetworkType> Sigmoid(NetworkType&, std::string_view) {}
+    template<NetworkType N> Sigmoid(N&, std::string_view) {}
     mlx::core::array operator()(mlx::core::array input, std::span<const mlx::core::array>) const
     {
         return mlx::core::sigmoid(input);
@@ -377,7 +370,7 @@ struct Sigmoid
 struct Tanh
 {
     Tanh() = default;
-    template<typename NetworkType> Tanh(NetworkType&, std::string_view) {}
+    template<NetworkType N> Tanh(N&, std::string_view) {}
     mlx::core::array operator()(mlx::core::array input, std::span<const mlx::core::array>) const
     {
         return mlx::core::tanh(input);
@@ -388,7 +381,7 @@ template<int Axis>
 struct Softmax
 {
     Softmax() = default;
-    template<typename NetworkType> Softmax(NetworkType&, std::string_view) {}
+    template<NetworkType N> Softmax(N&, std::string_view) {}
     mlx::core::array operator()(mlx::core::array input, std::span<const mlx::core::array>) const
     {
         return mlx::core::softmax(input, Axis);
@@ -402,8 +395,8 @@ template<typename... Modules>
 class Sequential
 {
 public:
-    template<typename NetworkType>
-    Sequential(NetworkType& network, std::string_view name)
+    template<NetworkType N>
+    Sequential(N& network, std::string_view name)
         : Sequential(network, name, std::index_sequence_for<Modules...>{})
     {
     }
@@ -415,8 +408,8 @@ public:
     }
 
 private:
-    template<typename NetworkType, size_t... Indices>
-    Sequential(NetworkType& network, std::string_view name, std::index_sequence<Indices...>)
+    template<NetworkType N, size_t... Indices>
+    Sequential(N& network, std::string_view name, std::index_sequence<Indices...>)
         : m_modules{Modules{network, indexedName(name, Indices)}...}
     {
     }
@@ -441,8 +434,8 @@ template<size_t Count, typename ModuleType>
 class Repeat
 {
 public:
-    template<typename NetworkType>
-    Repeat(NetworkType& network, std::string_view name)
+    template<NetworkType N>
+    Repeat(N& network, std::string_view name)
         : m_modules(makeModules(network, name, std::make_index_sequence<Count>{}))
     {
     }
@@ -454,8 +447,8 @@ public:
     }
 
 private:
-    template<typename NetworkType, size_t... Indices>
-    static std::array<ModuleType, Count> makeModules(NetworkType& network, std::string_view name,
+    template<NetworkType N, size_t... Indices>
+    static std::array<ModuleType, Count> makeModules(N& network, std::string_view name,
                                                       std::index_sequence<Indices...>)
     {
         return {ModuleType{network, indexedName(name, Indices)}...};
@@ -480,8 +473,8 @@ template<typename ModuleType>
 class Residual
 {
 public:
-    template<typename NetworkType>
-    Residual(NetworkType& network, std::string_view name)
+    template<NetworkType N>
+    Residual(N& network, std::string_view name)
         : m_module(network, name)
     {
     }
@@ -511,16 +504,17 @@ class RelationSelfAttention
     static_assert(RelationMap::tokenCount == TokenCount, "relation map token count does not match attention");
 
 public:
-    template<typename NetworkType>
-    RelationSelfAttention(NetworkType& network, std::string_view name)
+    template<NetworkType N>
+    RelationSelfAttention(N& network, std::string_view name)
         : m_query(network, childName(name, "query"))
         , m_key(network, childName(name, "key"))
         , m_value(network, childName(name, "value"))
         , m_output(network, childName(name, "output"))
         , m_relationBiasIndex(network.addParameter(
               childName(name, "relation_bias"),
-              {static_cast<int>(HeadCount), static_cast<int>(RelationMap::bucketCount)},
-              Initialization::Zeros()))
+              mlx::core::zeros(
+                  {static_cast<int>(HeadCount), static_cast<int>(RelationMap::bucketCount)},
+                  mlx::core::float32)))
     {
     }
 
