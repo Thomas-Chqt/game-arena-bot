@@ -36,7 +36,7 @@
 // gateResultIsSettled. Both run to the cap only when the extra work is actually buying
 // something.
 
-#include "network.hpp"
+#include "amoeba_network.hpp"
 
 #include <sys/resource.h>
 

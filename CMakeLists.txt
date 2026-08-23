@@ -12,6 +12,7 @@ find_package(MLX 0.32 CONFIG REQUIRED HINTS "${MLX_ROOT}")
 # links the Game Arena SDK; the trainer never communicates with the server.
 set(AMOEBA_SOURCES
     amoeba/amoeba.cpp
+    amoeba/amoeba_network.cpp
     amoeba/mcts.cpp
     amoeba/network.cpp
 )

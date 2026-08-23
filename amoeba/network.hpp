@@ -1,8 +1,6 @@
 #ifndef NETWORK_HPP
 #define NETWORK_HPP
 
-#include "mcts.hpp"
-
 #include <mlx/mlx.h>
 
 #include <algorithm>
@@ -57,7 +55,13 @@ concept Module = requires(const T& module, mlx::core::array input, std::span<con
     module(std::move(input), parameters);
 };
 
-template<const char* Name, Module Root>
+// A concrete Network type must specialize this trait. Keeping the name outside
+// Network lets two different Root template specializations choose independent
+// checkpoint identifiers without making the string part of Network's type.
+template<typename NetworkType>
+struct NetworkName;
+
+template<Module Root>
 class Network
 {
     struct ParameterDefinition
@@ -72,7 +76,7 @@ class Network
 public:
     // This exact name is written into the checkpoint. It identifies both the
     // architecture and its dimensions, not a particular set of trained values.
-    inline static constexpr const char* name = Name;
+    inline static constexpr const char* name = NetworkName<Network>::value;
 
     // Constructing Root recursively constructs every child module. Each module
     // calls addParameter(), so construction also defines the complete parameter
@@ -498,9 +502,8 @@ private:
 // (what information should I send?). Dot products between queries and keys decide
 // how strongly every token reads every other token.
 //
-// RelationMap adds game geometry to those scores. For Amoeba it tells attention
-// whether two tokens are the same hex, unrelated, or separated by a particular
-// direction and distance.
+// RelationMap adds application-specific relationships to those scores, such as
+// whether two board positions are identical, unrelated, or a known distance apart.
 template<size_t TokenCount, size_t Width, size_t HeadCount, typename RelationMap>
 class RelationSelfAttention
 {
@@ -604,227 +607,6 @@ private:
     std::vector<mlx::core::array> m_variance;
     int m_steps = 0;
 };
-
-// Every hex produces six move logits and six sow/split logits. Flattening the
-// resulting [37, 12] tensor gives exactly the game's 444 policy indices.
-inline constexpr int policyOutputsPerHex = directionCount * 2;
-
-// One relation number for every ordered pair of board hexes:
-//   0      same hex
-//   1      different hexes that do not share a straight line
-//   2..37  one of six directions and one of six distances
-// Attention uses this fixed table to select a learned score bias.
-struct AmoebaRelationMap
-{
-    static constexpr size_t tokenCount = hexCount;
-    static constexpr size_t bucketCount = 2 + directionCount * maximumMovableStackHeight;
-
-    inline static constexpr auto buckets = []
-    {
-        std::array<std::array<uint8_t, tokenCount>, tokenCount> table{};
-        for (auto& row : table)
-            row.fill(1); // Different hexes that do not share a line.
-
-        for (size_t source = 0; source < tokenCount; ++source)
-        {
-            table[source][source] = 0;
-            for (uint8_t direction = 0; direction < directionCount; ++direction)
-            {
-                for (uint8_t distance = 1; distance <= maximumMovableStackHeight; ++distance)
-                {
-                    const int8_t destination =
-                        destinationHex(static_cast<uint8_t>(source), direction, distance);
-                    if (destination >= 0)
-                    {
-                        table[source][destination] = static_cast<uint8_t>(
-                            2 + direction * maximumMovableStackHeight + distance - 1);
-                    }
-                }
-            }
-        }
-        return table;
-    }();
-
-    // MLX's take() consumes a one-dimensional index tensor, so flatten the
-    // compile-time [source][destination] table once in source-major order.
-    inline static constexpr auto flattened = []
-    {
-        std::array<int32_t, tokenCount * tokenCount> result{};
-        for (size_t source = 0; source < tokenCount; ++source)
-        {
-            for (size_t destination = 0; destination < tokenCount; ++destination)
-                result[source * tokenCount + destination] = buckets[source][destination];
-        }
-        return result;
-    }();
-
-    static const mlx::core::array& indices()
-    {
-        static const mlx::core::array value(flattened.data(),
-                                     mlx::core::Shape{static_cast<int>(flattened.size())}, mlx::core::int32);
-        return value;
-    }
-};
-
-template<size_t Width, size_t HeadCount>
-class TransformerBlock
-{
-public:
-    template<typename NetworkType>
-    TransformerBlock(NetworkType& network, std::string_view name)
-        : m_norm1(network, childName(name, "norm1"))
-        , m_attention(network, childName(name, "attention"))
-        , m_norm2(network, childName(name, "norm2"))
-        , m_feedForward(network, childName(name, "feed_forward"))
-    {
-    }
-
-    mlx::core::array operator()(mlx::core::array input,
-                                std::span<const mlx::core::array> parameters) const
-    {
-        // First let every hex read information from the complete board.
-        input = input + m_attention(m_norm1(input, parameters), parameters);
-
-        // Then independently transform each hex's resulting feature vector.
-        input = input + m_feedForward(m_norm2(input, parameters), parameters);
-        return input;
-    }
-
-private:
-    // This is the pre-normalization transformer form:
-    // x = x + attention(norm(x)); x = x + mlp(norm(x)). The residual additions
-    // preserve the old representation while each submodule learns a correction.
-    LayerNorm<Width> m_norm1;
-    RelationSelfAttention<hexCount, Width, HeadCount, AmoebaRelationMap> m_attention;
-    LayerNorm<Width> m_norm2;
-    Sequential<Linear<Width, Width * 4>, Gelu, Linear<Width * 4, Width>> m_feedForward;
-};
-
-struct Prediction
-{
-    mlx::core::array policy; // Raw move logits: [batch, 444].
-    mlx::core::array value;  // Expected outcome for the side to move: [batch].
-};
-
-// The game-specific root module. Network owns the tensors; this class defines
-// how those tensors are connected into a computation from encoded boards to a
-// policy and a value.
-template<size_t BlockCount, size_t Width, size_t HeadCount>
-class AmoebaRoot
-{
-    static_assert(BlockCount > 0, "an Amoeba network needs at least one transformer block");
-    static_assert(Width > 0, "an Amoeba network width must be positive");
-    static_assert(HeadCount > 0, "an Amoeba network needs at least one attention head");
-    static_assert(Width % HeadCount == 0, "network width must be divisible by its attention-head count");
-
-public:
-    template<typename NetworkType>
-    AmoebaRoot(NetworkType& network, std::string_view)
-        : m_embed(network, "embed")
-        , m_positionIndex(network.addParameter(
-              "position", {hexCount, static_cast<int>(Width)}, Initialization::Normal(0.02f)))
-        , m_blocks(network, "blocks")
-        , m_finalNorm(network, "final_norm")
-        , m_policy(network, "policy")
-        , m_value(network, "value")
-    {
-    }
-
-    std::vector<mlx::core::array> operator()(
-        mlx::core::array inputBatch, std::span<const mlx::core::array> parameters) const
-    {
-        assert(inputBatch.ndim() == 2);
-        assert(inputBatch.shape(1) == encodedBoardSize);
-        assert(inputBatch.dtype() == mlx::core::float32);
-        assert(m_positionIndex < parameters.size());
-
-        const int batchSize = inputBatch.shape(0);
-        constexpr int hexFeatureCount = hexCount * featuresPerHex;
-
-        // The encoder's first section contains 59 features for each of 37 hexes.
-        // Reshape it so each hex becomes a token in the sequence.
-        const mlx::core::array perHexFeatures = mlx::core::reshape(
-            mlx::core::slice(inputBatch, {0, 0}, {batchSize, hexFeatureCount}),
-            {batchSize, hexCount, featuresPerHex});
-
-        // The remaining 8 values describe the whole position. Copy them onto
-        // every token because side-to-move and history affect every board hex.
-        const mlx::core::array globalFeatures = mlx::core::broadcast_to(
-            mlx::core::reshape(
-                mlx::core::slice(inputBatch, {0, hexFeatureCount}, {batchSize, encodedBoardSize}),
-                {batchSize, 1, globalFeatureCount}),
-            {batchSize, hexCount, globalFeatureCount});
-
-        // Each of the 37 board hexes becomes one Width-element token. Attention
-        // then lets every token read every other token before the two task heads
-        // turn the shared representation into move logits and a position value.
-        mlx::core::array tokens = m_embed(
-            mlx::core::concatenate({perHexFeatures, globalFeatures}, 2), parameters);
-
-        // A learned vector identifies each physical hex. Without it, attention
-        // would see the tokens as an unordered collection.
-        tokens = tokens + parameters[m_positionIndex];
-        tokens = m_blocks(std::move(tokens), parameters);
-        tokens = m_finalNorm(std::move(tokens), parameters);
-
-        // One 12-value policy block per token; reshape preserves the Move::id
-        // ordering described by policyOutputsPerHex.
-        const mlx::core::array policy = mlx::core::reshape(m_policy(tokens, parameters),
-                                                            {batchSize, moveIdCount});
-
-        // Value concerns the entire position, so average the 37 token vectors
-        // into one vector before mapping it to a scalar in [-1, 1].
-        const mlx::core::array pooled = mlx::core::mean(tokens, std::vector<int>{1}, false);
-        const mlx::core::array value = mlx::core::reshape(m_value(pooled, parameters), {batchSize});
-        // MLX's C++ compile API represents every compiled function's outputs as
-        // a vector. Entry 0 is the policy and entry 1 is the value.
-        return {policy, value};
-    }
-
-private:
-    Linear<featuresPerHex + globalFeatureCount, Width> m_embed;
-    size_t m_positionIndex;
-    Repeat<BlockCount, TransformerBlock<Width, HeadCount>> m_blocks;
-    LayerNorm<Width> m_finalNorm;
-    Linear<Width, policyOutputsPerHex> m_policy;
-    Sequential<Linear<Width, Width>, Gelu, Linear<Width, 1>, Tanh> m_value;
-};
-
-// This is the active concrete architecture. Its name includes every dimension
-// that changes checkpoint shapes; changing its size deliberately creates an
-// incompatible network and therefore requires a new name.
-inline constexpr char networkName[] = "amoeba-relation-transformer-v2-6x128x8";
-using AmoebaNetwork = Network<networkName, AmoebaRoot<6, 128, 8>>;
-
-class NetworkEvaluator
-{
-public:
-    explicit NetworkEvaluator(const AmoebaNetwork& network)
-        : m_network(network)
-    {
-    }
-
-    void evaluate(std::span<const Board* const> boards, std::span<Evaluation> outputs);
-
-private:
-    const AmoebaNetwork& m_network;
-};
-
-struct TrainingBatch
-{
-    mlx::core::array input;        // Encoded boards: [batch, encodedBoardSize].
-    mlx::core::array legal;        // 1 for legal policy entries, otherwise 0.
-    mlx::core::array policyTarget; // Normalized MCTS visit counts: [batch, 444].
-    mlx::core::array valueTarget;  // Final outcomes from side-to-move viewpoint.
-};
-
-TrainingBatch makeTrainingBatch(std::span<const Board* const> boards,
-                                std::span<const VisitCounts> visits,
-                                std::span<const float> outcomes);
-
-std::vector<mlx::core::array> computeLoss(const AmoebaNetwork& network,
-                                   const std::vector<mlx::core::array>& parameters,
-                                   const TrainingBatch& batch, float weightDecay);
 
 } // namespace amoeba
 

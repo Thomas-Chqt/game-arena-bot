@@ -24,7 +24,7 @@
 // needs all three to see draws and adjudications coming.
 
 #include "mcts.hpp"
-#include "network.hpp"
+#include "amoeba_network.hpp"
 
 #include <arena/arena.h>
 
