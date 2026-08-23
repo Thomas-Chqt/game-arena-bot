@@ -6,7 +6,7 @@
 #include <random>
 #include <ranges>
 
-namespace bot
+namespace amoeba_bot
 {
 
 namespace
@@ -14,9 +14,9 @@ namespace
 
 // Seen by whoever is to move in it - which, at a terminal position, is the side
 // that was just mated or ran out of moves.
-float terminalValue(const amoeba::Board& board)
+float terminalValue(const Board& board)
 {
-    assert(board.state != amoeba::State::ongoing);
+    assert(board.state != State::ongoing);
     return outcomeFor(board.state, board.whiteToMove);
 }
 
@@ -24,12 +24,12 @@ float terminalValue(const amoeba::Board& board)
 
 // ---------------------------------------------------------------------------
 
-float outcomeFor(amoeba::State state, bool whiteToMove)
+float outcomeFor(State state, bool whiteToMove)
 {
-    assert(state != amoeba::State::ongoing);
-    if (state == amoeba::State::draw)
+    assert(state != State::ongoing);
+    if (state == State::draw)
         return 0.0f;
-    return (state == amoeba::State::whiteWins) == whiteToMove ? 1.0f : -1.0f;
+    return (state == State::whiteWins) == whiteToMove ? 1.0f : -1.0f;
 }
 
 uint16_t bestMove(const VisitCounts& counts)
@@ -41,12 +41,12 @@ uint16_t bestMove(const VisitCounts& counts)
 
 // Appends the node and its outgoing edges from an evaluation already in hand. A
 // terminal board gets a node with no edges and its Evaluation is ignored.
-uint32_t MCTS::addNode(const amoeba::Board& board, const Evaluation& evaluation)
+uint32_t MCTS::addNode(const Board& board, const Evaluation& evaluation)
 {
     const uint32_t index = static_cast<uint32_t>(m_nodes.size());
     m_nodes.push_back(Node{board, static_cast<uint32_t>(m_edges.size()), 0, 0});
 
-    if (board.state != amoeba::State::ongoing)
+    if (board.state != State::ongoing)
         return index;
 
     float totalPrior = 0.0f;
@@ -88,7 +88,7 @@ void MCTS::addExplorationNoise()
 
     std::mt19937_64 randomEngine{m_config.noiseSeed};
     std::gamma_distribution<float> gamma{m_config.noiseAlpha, 1.0f};
-    std::array<float, amoeba::moveIdCount> noiseValues;
+    std::array<float, moveIdCount> noiseValues;
     float total = 0.0f;
     for (uint32_t i = 0; i < root.edgeCount; ++i)
     {
@@ -113,7 +113,7 @@ void MCTS::addExplorationNoise()
 // value, so they are expanded and backed up here.
 bool MCTS::descend()
 {
-    std::array<uint64_t, amoeba::moveLimit + 1> positionHistory;
+    std::array<uint64_t, moveLimit + 1> positionHistory;
     std::ranges::copy_n(m_gameHistory.begin(), m_gameHistorySize, positionHistory.begin());
     size_t positionHistorySize = m_gameHistorySize;
     m_edgeTrailSize = 0;
@@ -135,11 +135,11 @@ bool MCTS::descend()
 
         if (m_edges[edgeIndex].childNode < 0)
         {
-            const amoeba::Move move = amoeba::Move::fromId(m_edges[edgeIndex].moveId);
-            m_pendingLeaf = amoeba::applyMove(
+            const Move move = Move::fromId(m_edges[edgeIndex].moveId);
+            m_pendingLeaf = applyMove(
                 m_nodes[node].board, move, std::span{positionHistory.data(), positionHistorySize});
 
-            if (m_pendingLeaf->state == amoeba::State::ongoing)
+            if (m_pendingLeaf->state == State::ongoing)
                 return true;
 
             m_edges[edgeIndex].childNode = static_cast<int32_t>(addNode(*m_pendingLeaf, Evaluation{}));
@@ -164,7 +164,7 @@ void MCTS::backpropagate(float value)
     }
 }
 
-MCTS::MCTS(const amoeba::Board& root, std::span<const uint64_t> history, MCTSConfig config)
+MCTS::MCTS(const Board& root, std::span<const uint64_t> history, MCTSConfig config)
     : m_config(config)
     , m_gameHistorySize(history.size())
 {
@@ -176,13 +176,13 @@ MCTS::MCTS(const amoeba::Board& root, std::span<const uint64_t> history, MCTSCon
 
     // Nothing worth asking about a position the rules have already settled, and
     // nothing to search from it either.
-    if (root.state != amoeba::State::ongoing)
+    if (root.state != State::ongoing)
         addNode(root, Evaluation{});
     else
         m_pendingLeaf = root;
 }
 
-const amoeba::Board* MCTS::pendingLeaf()
+const Board* MCTS::pendingLeaf()
 {
     if (m_pendingLeaf.has_value())
         return &*m_pendingLeaf;
@@ -228,4 +228,4 @@ VisitCounts MCTS::visits() const
     return counts;
 }
 
-} // namespace bot
+} // namespace amoeba_bot

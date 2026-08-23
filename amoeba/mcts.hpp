@@ -28,7 +28,7 @@
 #include <span>
 #include <vector>
 
-namespace bot
+namespace amoeba_bot
 {
 
 // What the search wants to know about a position it has just reached.
@@ -38,7 +38,7 @@ namespace bot
 // read, and they are renormalised to sum to one, so the rest may be anything.
 struct Evaluation
 {
-    std::array<float, amoeba::moveIdCount> policy;
+    std::array<float, moveIdCount> policy;
     float value;
 };
 
@@ -68,22 +68,22 @@ struct MCTSConfig
 
 // Simulations spent on each move id. The argmax is the move to play; normalised
 // it is the policy target the network trains on.
-using VisitCounts = std::array<uint32_t, amoeba::moveIdCount>;
+using VisitCounts = std::array<uint32_t, moveIdCount>;
 
 class MCTS
 {
 public:
     // `history` is the hash of every position the real game has passed through,
-    // ending with `root`'s own; amoeba::applyMove() needs it to see repetitions
+    // ending with `root`'s own; applyMove() needs it to see repetitions
     // that the search walks into. One MCTS searches this one root only.
-    MCTS(const amoeba::Board& root, std::span<const uint64_t> history, MCTSConfig config = {});
+    MCTS(const Board& root, std::span<const uint64_t> history, MCTSConfig config = {});
 
     // Descends once and returns the leaf that needs a network evaluation. A null
     // pointer means the budget is spent and visits() is ready. Terminal leaves are
     // backed up immediately because their value comes from the rules.
     //
     // The pointer stays valid until absorb() or this MCTS is destroyed.
-    const amoeba::Board* pendingLeaf();
+    const Board* pendingLeaf();
 
     // Expands and backs up the leaf returned by pendingLeaf().
     void absorb(const Evaluation&);
@@ -102,13 +102,13 @@ private:
 
     struct Node
     {
-        amoeba::Board board;
+        Board board;
         uint32_t firstEdgeIndex;
         uint32_t edgeCount; // 0 at a terminal position
         uint32_t visits;
     };
 
-    uint32_t addNode(const amoeba::Board&, const Evaluation&);
+    uint32_t addNode(const Board&, const Evaluation&);
     uint32_t selectEdgeToExplore(uint32_t node) const;
     void addExplorationNoise();
     bool descend();
@@ -119,13 +119,13 @@ private:
     std::vector<Node> m_nodes; // node 0 is always the root
     std::vector<Edge> m_edges;
 
-    std::array<uint64_t, amoeba::moveLimit + 1> m_gameHistory;
+    std::array<uint64_t, moveLimit + 1> m_gameHistory;
     size_t m_gameHistorySize;
 
-    std::array<uint32_t, amoeba::moveLimit> m_edgeTrail;
+    std::array<uint32_t, moveLimit> m_edgeTrail;
     size_t m_edgeTrailSize = 0;
 
-    std::optional<amoeba::Board> m_pendingLeaf;
+    std::optional<Board> m_pendingLeaf;
 };
 
 uint16_t bestMove(const VisitCounts&);
@@ -134,8 +134,8 @@ uint16_t bestMove(const VisitCounts&);
 // every training target is signed this way - from the point of view of the side
 // to move - and inverting it trains a bot that reliably plays badly while every
 // loss curve looks healthy.
-float outcomeFor(amoeba::State, bool whiteToMove);
+float outcomeFor(State, bool whiteToMove);
 
-} // namespace bot
+} // namespace amoeba_bot
 
 #endif // MCTS_HPP

@@ -7,7 +7,7 @@
 #include <span>
 #include <utility>
 
-namespace amoeba
+namespace amoeba_bot
 {
 
 namespace
@@ -560,4 +560,4 @@ void encodeBoard(const Board& board, std::span<float, encodedBoardSize> output)
     assert(std::ranges::all_of(output, [](float value) { return value >= 0.0f && value <= 1.0f; }));
 }
 
-} // namespace amoeba
+} // namespace amoeba_bot

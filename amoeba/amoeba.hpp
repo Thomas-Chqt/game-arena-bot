@@ -8,7 +8,7 @@
 #include <span>
 #include <string>
 
-namespace amoeba
+namespace amoeba_bot
 {
 
 // ---------------------------------------------------------------------------
@@ -547,6 +547,6 @@ constexpr std::span<const uint16_t, moveIdCount> policyIndicesToMoveIds(bool whi
                        : std::span<const uint16_t, moveIdCount>{rotatedPolicyMapping};
 }
 
-} // namespace amoeba
+} // namespace amoeba_bot
 
 #endif // AMOEBA_HPP
