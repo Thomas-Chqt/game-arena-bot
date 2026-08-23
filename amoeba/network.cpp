@@ -5,7 +5,7 @@
 #include <numeric>
 #include <stdexcept>
 
-namespace amoeba_bot
+namespace amoeba
 {
 
 // Module composition produces names such as blocks.2.attention.query.weight.
@@ -201,4 +201,4 @@ std::vector<mlx::core::array> computeLoss(const AmoebaNetwork& network,
     return {total, policyLoss, valueLoss};
 }
 
-} // namespace amoeba_bot
+} // namespace amoeba

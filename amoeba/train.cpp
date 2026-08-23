@@ -22,10 +22,11 @@
 // The defaults are meant for a real overnight run, not a smoke test. To check
 // the wiring quickly instead:
 //
-//   GAMES=8 CONCURRENT=8 SIMULATIONS=50 STEPS=100
+//   BLOCKS=2 WIDTH=64 HEADS=4 GAMES=8 CONCURRENT=8 SIMULATIONS=50 STEPS=100
 //   GATE_GAMES=8 GATE_CONCURRENT=8
 //
 // Environment, all optional:
+//   network     BLOCKS WIDTH HEADS          (only read when starting from scratch)
 //   generating  SEED GAMES CONCURRENT SIMULATIONS SAMPLING_PLIES NOISE
 //   training    STEPS BATCH RATE DECAY BUFFER
 //   gating      GATE_GAMES GATE_CONCURRENT GATE GATE_SIMULATIONS
@@ -60,7 +61,7 @@
 #include <string>
 #include <vector>
 
-namespace amoeba_bot
+namespace amoeba
 {
 
 namespace
@@ -194,7 +195,7 @@ struct TrainingSettings
 
 struct TrainingSample
 {
-    Board board;
+    amoeba::Board board;
     VisitCounts visits;
     float outcome = 0.0f;
     int gameId = 0; // unique across generations, so whole games can be held out
@@ -213,7 +214,7 @@ uint16_t selectMoveFromVisits(const VisitCounts& visitCounts, int plyCount, int 
     assert(totalVisits > 0);
 
     uint64_t remaining = std::uniform_int_distribution<uint64_t>{0, totalVisits - 1}(randomEngine);
-    for (uint16_t moveId = 0; moveId < moveIdCount; ++moveId)
+    for (uint16_t moveId = 0; moveId < amoeba::moveIdCount; ++moveId)
     {
         if (visitCounts[moveId] > remaining)
             return moveId;
@@ -232,7 +233,8 @@ struct NetworkPairing
 // One game in flight.
 struct ActiveGame
 {
-    Board board;
+    amoeba::Board board;
+    std::optional<amoeba::Outcome> outcome;
     std::vector<uint64_t> positionHistory;
     std::vector<TrainingSample> trainingSamples;
     std::mt19937_64 randomEngine;
@@ -252,7 +254,7 @@ struct ActiveGame
 
     // Set fresh each round: the leaf this game cannot go on without, which
     // network owes it the answer, and where it sits in that network's batch.
-    const Board* pendingLeaf = nullptr;
+    const amoeba::Board* pendingLeaf = nullptr;
     int evaluatorIndex = 0;
     size_t evaluationBatchOffset = 0;
 };
@@ -290,12 +292,13 @@ private:
 void GameBatchRunner::initializeGame(ActiveGame& game, int gameId, NetworkPairing pairing, uint64_t seed) const
 {
     game.gameId = gameId;
-    game.board = createStartingBoard();
+    game.board = amoeba::createStartingBoard();
     game.pairing = pairing;
     game.isActive = true;
     game.startTime = std::chrono::steady_clock::now();
     game.evaluatedPositionCount = 0;
     game.positionHistory.assign(1, game.board.positionHash);
+    game.outcome.reset();
     game.trainingSamples.clear();
     game.randomEngine.seed(seed ^ (0x9e3779b97f4a7c15ULL * (static_cast<uint64_t>(gameId) + 1)));
     game.searchRandomEngine.seed(seed + static_cast<uint64_t>(gameId));
@@ -318,10 +321,10 @@ void GameBatchRunner::startSearch(ActiveGame& game) const
 // in `pendingLeaf` - or leaving it null, which means the game is over.
 void GameBatchRunner::advanceUntilEvaluation(ActiveGame& game) const
 {
-    while (game.board.state == State::ongoing)
+    while (!game.outcome.has_value())
     {
         const int evaluatorIndex = game.board.whiteToMove ? game.pairing.whiteEvaluator : game.pairing.blackEvaluator;
-        if (const Board* leaf = game.search->pendingLeaf())
+        if (const amoeba::Board* leaf = game.search->pendingLeaf())
         {
             game.evaluatorIndex = evaluatorIndex;
             game.pendingLeaf = leaf;
@@ -333,7 +336,15 @@ void GameBatchRunner::advanceUntilEvaluation(ActiveGame& game) const
 
         const uint16_t chosenMoveId =
             selectMoveFromVisits(visitCounts, game.board.plyCount, m_samplingPlies, game.randomEngine);
-        game.board = applyMove(game.board, Move::fromId(chosenMoveId), game.positionHistory);
+        amoeba::MoveResult result =
+            amoeba::applyMove(game.board, amoeba::Move::fromId(chosenMoveId), game.positionHistory);
+        if (const auto* outcome = std::get_if<amoeba::Outcome>(&result))
+        {
+            game.outcome = *outcome;
+            break;
+        }
+
+        game.board = std::get<amoeba::Board>(std::move(result));
         game.positionHistory.push_back(game.board.positionHash);
         startSearch(game);
     }
@@ -353,7 +364,7 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
     int completedGameCount = 0;
     int startedGameCount = 0;
 
-    std::vector<std::vector<const Board*>> pendingBoardsByEvaluator(m_evaluators.size());
+    std::vector<std::vector<const amoeba::Board*>> pendingBoardsByEvaluator(m_evaluators.size());
     std::vector<std::vector<Evaluation>> evaluationsByEvaluator(m_evaluators.size());
 
     report("[{}] {} games, {} in flight, at {} simulations", label, gameCount, activeGames.size(),
@@ -371,7 +382,8 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
     {
         for (TrainingSample& sample : game.trainingSamples)
         {
-            sample.outcome = outcomeFor(game.board.state, sample.board.whiteToMove);
+            assert(game.outcome.has_value());
+            sample.outcome = outcomeFor(*game.outcome, sample.board.whiteToMove);
         }
 
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - game.startTime).count();
@@ -398,7 +410,7 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
     for (;;)
     {
         size_t gatheredBoardCount = 0;
-        for (std::vector<const Board*>& batch : pendingBoardsByEvaluator)
+        for (std::vector<const amoeba::Board*>& batch : pendingBoardsByEvaluator)
             batch.clear();
 
         for (ActiveGame& game : activeGames)
@@ -406,7 +418,7 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
             if (!game.isActive || game.pendingLeaf == nullptr)
                 continue;
 
-            std::vector<const Board*>& batch =
+            std::vector<const amoeba::Board*>& batch =
                 pendingBoardsByEvaluator[static_cast<size_t>(game.evaluatorIndex)];
             game.evaluationBatchOffset = batch.size();
             batch.push_back(game.pendingLeaf);
@@ -446,7 +458,8 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
     }
 }
 
-std::vector<TrainingSample> generateSelfPlaySamples(const AmoebaNetwork& champion, const TrainingSettings& settings, uint64_t seed)
+std::vector<TrainingSample> generateSelfPlaySamples(
+    const AmoebaNetwork& champion, const TrainingSettings& settings, uint64_t seed)
 {
     MCTSConfig searchConfig = settings.searchConfig;
     searchConfig.rootNoise = settings.rootNoise;
@@ -488,7 +501,7 @@ std::vector<TrainingSample> generateSelfPlaySamples(const AmoebaNetwork& champio
 
 TrainingBatch createBatchFromSamples(const std::vector<TrainingSample>& samples, std::span<const size_t> picks)
 {
-    std::vector<const Board*> boards;
+    std::vector<const amoeba::Board*> boards;
     std::vector<VisitCounts> visits;
     std::vector<float> outcomes;
     boards.reserve(picks.size());
@@ -539,8 +552,8 @@ DatasetSplit splitDatasetByGame(const std::vector<TrainingSample>& samples, std:
 // Leaves `candidate` holding the weights from the best step, not the last. Held-out loss
 // turns back up well before training ends, so keeping the final parameters ships a
 // network measurably worse than one already in hand.
-void trainCandidate(AmoebaNetwork& candidate, const std::vector<TrainingSample>& samples, const TrainingSettings& settings,
-                    uint64_t seed)
+void trainCandidate(AmoebaNetwork& candidate, const std::vector<TrainingSample>& samples,
+                    const TrainingSettings& settings, uint64_t seed)
 {
     std::mt19937_64 randomEngine{seed};
     const DatasetSplit split = splitDatasetByGame(samples, randomEngine);
@@ -617,12 +630,14 @@ void trainCandidate(AmoebaNetwork& candidate, const std::vector<TrainingSample>&
 
         if (checksWithoutImprovement >= validationPatience)
         {
-            report("[train] held-out loss has not improved in {} checks, stopping at step {}", validationPatience, step);
+            report("[train] held-out loss has not improved in {} checks, stopping at step {}", validationPatience,
+                   step);
             break;
         }
     }
 
-    report("[train] best held-out loss {:.4f} at step {} of {}, keeping those weights", lowestValidationLoss, bestStep, settings.maximumTrainingSteps);
+    report("[train] best held-out loss {:.4f} at step {} of {}, keeping those weights", lowestValidationLoss, bestStep,
+           settings.maximumTrainingSteps);
     candidate.replaceParameters(bestParameters);
 }
 
@@ -655,7 +670,8 @@ bool gateResultIsSettled(int played, double score, float threshold)
 //
 // Ranks with fewer simulations than self-play used, because only the result is
 // read here - the visit counts that needed the deeper search are discarded.
-double evaluateCandidate(const AmoebaNetwork& candidate, const AmoebaNetwork& champion, const TrainingSettings& settings, uint64_t seed)
+double evaluateCandidate(const AmoebaNetwork& candidate, const AmoebaNetwork& champion,
+                         const TrainingSettings& settings, uint64_t seed)
 {
     MCTSConfig searchConfig = settings.searchConfig;
     searchConfig.simulations = settings.gateSimulationCount;
@@ -704,7 +720,7 @@ double evaluateCandidate(const AmoebaNetwork& candidate, const AmoebaNetwork& ch
 
 } // namespace
 
-} // namespace amoeba_bot
+} // namespace amoeba
 
 int main(int argc, char** argv)
 {
@@ -716,69 +732,72 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    const amoeba_bot::TrainingSettings settings;
+    const amoeba::TrainingSettings settings;
     const std::filesystem::path weights{argv[1]};
 
     // Generation 0 is random weights, written straight away so that amoeba_bot has
     // something to load while the first generation is still being played.
-    std::unique_ptr<amoeba_bot::AmoebaNetwork> champion;
+    std::unique_ptr<amoeba::AmoebaNetwork> champion;
     if (std::filesystem::exists(weights))
     {
-        champion = std::make_unique<amoeba_bot::AmoebaNetwork>(weights);
-        amoeba_bot::report("[train] resuming from {}: {}, {} parameters", weights.string(),
-                       amoeba_bot::AmoebaNetwork::name, champion->parameterCount());
+        champion = std::make_unique<amoeba::AmoebaNetwork>(weights);
+        amoeba::report("[train] resuming from {}: {}, {} parameters", weights.string(),
+                       amoeba::AmoebaNetwork::name, champion->parameterCount());
     }
     else
     {
-        champion = std::make_unique<amoeba_bot::AmoebaNetwork>(settings.seed);
+        champion = std::make_unique<amoeba::AmoebaNetwork>(settings.seed);
         champion->save(weights);
-        amoeba_bot::report("[train] {} did not exist: started from random weights, {} parameters, saved", weights.string(), champion->parameterCount());
+        amoeba::report("[train] {} did not exist: started from random weights, {} parameters, saved",
+                       weights.string(), champion->parameterCount());
     }
 
-    std::vector<amoeba_bot::TrainingSample> replay;
+    std::vector<amoeba::TrainingSample> replay;
     int gameIdBase = 0;
 
     for (int generation = 1;; ++generation)
     {
-        amoeba_bot::report("");
-        amoeba_bot::report("======== generation {} ========", generation);
+        amoeba::report("");
+        amoeba::report("======== generation {} ========", generation);
 
-        std::vector<amoeba_bot::TrainingSample> fresh = generateSelfPlaySamples(
+        std::vector<amoeba::TrainingSample> fresh = amoeba::generateSelfPlaySamples(
             *champion, settings, settings.seed + static_cast<uint64_t>(generation) * 1000);
 
         // Game ids have to stay unique across generations, or splitDatasetByGame will hold
         // out a game from this generation and train on a different one with the same
         // id from the last.
-        for (amoeba_bot::TrainingSample& sample : fresh)
+        for (amoeba::TrainingSample& sample : fresh)
             sample.gameId += gameIdBase;
         gameIdBase += settings.selfPlayGameCount;
 
-        amoeba_bot::reportMemory("self-play");
+        amoeba::reportMemory("self-play");
 
         replay.insert(replay.end(), std::make_move_iterator(fresh.begin()), std::make_move_iterator(fresh.end()));
         if (replay.size() > settings.replayBufferCapacity)
             replay.erase(replay.begin(), replay.begin() + static_cast<long>(replay.size() - settings.replayBufferCapacity));
-        amoeba_bot::report("[train] replay buffer holds {} positions", replay.size());
+        amoeba::report("[train] replay buffer holds {} positions", replay.size());
 
         // The candidate starts from the best weights rather than from scratch: each
         // generation is meant to refine, not to relearn the game.
-        amoeba_bot::AmoebaNetwork candidate = *champion;
-        trainCandidate(candidate, replay, settings, settings.seed + static_cast<uint64_t>(generation));
-        amoeba_bot::reportMemory("training");
+        amoeba::AmoebaNetwork candidate = *champion;
+        amoeba::trainCandidate(candidate, replay, settings, settings.seed + static_cast<uint64_t>(generation));
+        amoeba::reportMemory("training");
 
-        const double score = evaluateCandidate(
+        const double score = amoeba::evaluateCandidate(
             candidate, *champion, settings, settings.seed + 7777 + static_cast<uint64_t>(generation));
-        amoeba_bot::reportMemory("the gate");
+        amoeba::reportMemory("the gate");
 
         if (score < settings.promotionThreshold)
         {
-            amoeba_bot::report("[train] generation {} rejected at {:.1f}%, keeping the previous weights", generation, 100.0 * score);
+            amoeba::report("[train] generation {} rejected at {:.1f}%, keeping the previous weights",
+                           generation, 100.0 * score);
         }
         else
         {
             *champion = candidate;
             champion->save(weights);
-            amoeba_bot::report("[train] generation {} PROMOTED at {:.1f}%, wrote {}", generation, 100.0 * score, weights.string());
+            amoeba::report("[train] generation {} PROMOTED at {:.1f}%, wrote {}",
+                           generation, 100.0 * score, weights.string());
         }
     }
 }

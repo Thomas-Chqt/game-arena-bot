@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-namespace amoeba_bot
+namespace amoeba
 {
 
 // Describes how a parameter tensor gets its initial values. Initialization is
@@ -826,6 +826,6 @@ std::vector<mlx::core::array> computeLoss(const AmoebaNetwork& network,
                                    const std::vector<mlx::core::array>& parameters,
                                    const TrainingBatch& batch, float weightDecay);
 
-} // namespace amoeba_bot
+} // namespace amoeba
 
 #endif // NETWORK_HPP

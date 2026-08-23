@@ -44,7 +44,7 @@
 #include <string_view>
 #include <vector>
 
-namespace amoeba_bot
+namespace amoeba
 {
 
 namespace
@@ -76,7 +76,7 @@ template <typename Callback> void runGuardedCallback(const char* callbackName, C
 
 struct TranslatedMove
 {
-    Move move;
+    amoeba::Move move;
     const char* sourcePosition;
     const char* destinationPosition;
     bool serverSplittingFlag;
@@ -91,7 +91,9 @@ struct BotContext
     std::unique_ptr<AmoebaNetwork> network;
     std::unique_ptr<NetworkEvaluator> evaluator;
     std::optional<MCTS> search;
-    Board board;
+    amoeba::Board board;
+    std::optional<amoeba::Outcome> outcome;
+    uint16_t plyCount = 0;
     std::vector<uint64_t> positionHistory;
 };
 
@@ -111,21 +113,21 @@ int8_t parseHexIndex(std::string_view coordinate)
         return -1;
     if (std::from_chars(coordinate.data() + comma + 1, coordinate.data() + coordinate.size(), r).ec != std::errc{})
         return -1;
-    return hexIndex(q, r);
+    return amoeba::hexIndex(q, r);
 }
 
 // The engine indexes a move by direction, the server names its destination.
 std::optional<uint8_t> findMoveDirection(uint8_t sourceHex, uint8_t destinationHex, uint8_t distance)
 {
-    for (uint8_t direction = 0; direction < directionCount; ++direction)
+    for (uint8_t direction = 0; direction < amoeba::directionCount; ++direction)
     {
-        if (amoeba_bot::destinationHex(sourceHex, direction, distance) == static_cast<int8_t>(destinationHex))
+        if (amoeba::destinationHex(sourceHex, direction, distance) == static_cast<int8_t>(destinationHex))
             return direction;
     }
     return std::nullopt;
 }
 
-std::vector<TranslatedMove> translateServerMoves(const arena_game_state_t& state, const Board& board)
+std::vector<TranslatedMove> translateServerMoves(const arena_game_state_t& state, const amoeba::Board& board)
 {
     std::vector<TranslatedMove> translatedMoves;
     for (const arena_piece_moves_t& piece : std::span(state.legal_moves, state.legal_moves_count))
@@ -153,7 +155,7 @@ std::vector<TranslatedMove> translateServerMoves(const arena_game_state_t& state
             if (!direction.has_value())
                 continue;
 
-            translatedMoves.push_back({Move{static_cast<uint8_t>(sourceHex), *direction, splitsStack},
+            translatedMoves.push_back({amoeba::Move{static_cast<uint8_t>(sourceHex), *direction, splitsStack},
                                        piece.pos, destination, piece.splitting});
         }
     }
@@ -164,7 +166,7 @@ std::vector<TranslatedMove> translateServerMoves(const arena_game_state_t& state
 // Keeping the local board in step with the server's
 // ---------------------------------------------------------------------------
 
-bool hasSamePosition(const Board& left, const Board& right)
+bool hasSamePosition(const amoeba::Board& left, const amoeba::Board& right)
 {
     return left.whiteToMove == right.whiteToMove && std::ranges::equal(left.hexes, right.hexes);
 }
@@ -177,9 +179,9 @@ void startSearch(BotContext& context)
 
 VisitCounts finishSearch(MCTS& search, NetworkEvaluator& evaluator)
 {
-    while (const Board* leaf = search.pendingLeaf())
+    while (const amoeba::Board* leaf = search.pendingLeaf())
     {
-        const Board* boards[]{leaf};
+        const amoeba::Board* boards[]{leaf};
         Evaluation evaluation;
         evaluator.evaluate(boards, std::span{&evaluation, 1});
         search.absorb(evaluation);
@@ -188,28 +190,39 @@ VisitCounts finishSearch(MCTS& search, NetworkEvaluator& evaluator)
 }
 
 // Plays a move locally and creates a fresh search for the resulting position.
-void advanceLocalGame(BotContext& context, Move move)
+void advanceLocalGame(BotContext& context, amoeba::Move move)
 {
-    context.board = applyMove(context.board, move, context.positionHistory);
+    amoeba::MoveResult result = amoeba::applyMove(context.board, move, context.positionHistory);
+    if (const auto* outcome = std::get_if<amoeba::Outcome>(&result))
+    {
+        context.outcome = *outcome;
+        context.plyCount = static_cast<uint16_t>(context.board.plyCount + 1);
+        return;
+    }
+
+    context.board = std::get<amoeba::Board>(std::move(result));
+    context.plyCount = context.board.plyCount;
     context.positionHistory.push_back(context.board.positionHash);
     startSearch(context);
 }
 
 void synchronizeWithServer(BotContext& context, const char* serializedServerBoard, arena_side_t currentTurn)
 {
-    const Board serverBoard = parseBoard(serializedServerBoard, currentTurn == ARENA_SIDE_WHITE);
+    const amoeba::Board serverBoard = amoeba::parseBoard(serializedServerBoard, currentTurn == ARENA_SIDE_WHITE);
     if (hasSamePosition(context.board, serverBoard))
         return;
 
     // Between two of our turns the opponent plays exactly one move; find which.
-    std::optional<Move> opponentMove;
+    std::optional<amoeba::Move> opponentMove;
     context.board.forEachLegal(
         [&](uint16_t moveId)
         {
             if (opponentMove.has_value())
                 return;
-            const Move move = Move::fromId(moveId);
-            if (hasSamePosition(applyMoveWithoutUpdatingState(context.board, move), serverBoard))
+            const amoeba::Move move = amoeba::Move::fromId(moveId);
+            const amoeba::MoveResult result = amoeba::applyMove(context.board, move, context.positionHistory);
+            const amoeba::Board* nextBoard = std::get_if<amoeba::Board>(&result);
+            if (nextBoard != nullptr && hasSamePosition(*nextBoard, serverBoard))
                 opponentMove = move;
         });
 
@@ -227,6 +240,8 @@ void synchronizeWithServer(BotContext& context, const char* serializedServerBoar
     const uint16_t plyCount = context.board.plyCount;
     context.board = serverBoard;
     context.board.plyCount = static_cast<uint16_t>(plyCount + 1);
+    context.outcome.reset();
+    context.plyCount = context.board.plyCount;
     context.positionHistory.assign(1, context.board.positionHash);
     startSearch(context);
 }
@@ -239,9 +254,9 @@ void synchronizeWithServer(BotContext& context, const char* serializedServerBoar
 // times the whole reply, so sync and translation count against the budget too.
 const TranslatedMove& selectMove(BotContext& context, const std::vector<TranslatedMove>& serverMoves, std::chrono::steady_clock::time_point turnStart)
 {
-    if (context.board.state != State::ongoing)
+    if (context.outcome.has_value())
     {
-        std::println(stderr, "[bot] engine calls the game over at ply {}, deferring to the server", context.board.plyCount);
+        std::println(stderr, "[bot] engine calls the game over at ply {}, deferring to the server", context.plyCount);
         return serverMoves.front();
     }
 
@@ -284,7 +299,9 @@ void onGameStart(const arena_game_state_t* state, void* userData)
     runGuardedCallback("on_game_start", [&] {
         BotContext& context = *static_cast<BotContext*>(userData);
 
-        context.board = parseBoard(state->board, state->current_turn == ARENA_SIDE_WHITE);
+        context.board = amoeba::parseBoard(state->board, state->current_turn == ARENA_SIDE_WHITE);
+        context.outcome.reset();
+        context.plyCount = context.board.plyCount;
         context.positionHistory.assign(1, context.board.positionHash);
         startSearch(context);
 
@@ -331,7 +348,7 @@ void onGameEnd(const arena_game_end_t* state, void* userData)
     runGuardedCallback("on_game_end", [&] {
         const BotContext& context = *static_cast<BotContext*>(userData);
         const char* result = !state->has_winner ? "draw" : state->winner == state->my_side ? "won" : "lost";
-        std::println("[bot] {} after {} plies", result, context.board.plyCount);
+        std::println("[bot] {} after {} plies", result, context.plyCount);
     });
 }
 
@@ -342,7 +359,7 @@ void onDisconnect(const char* reason, void*)
 
 } // namespace
 
-} // namespace amoeba_bot
+} // namespace amoeba
 
 int main(int argc, char** argv)
 {
@@ -361,13 +378,13 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    amoeba_bot::BotContext context;
+    amoeba::BotContext context;
     try
     {
         context.checkpointPath = std::filesystem::path{argv[1]};
         if (!std::filesystem::exists(context.checkpointPath))
             throw std::runtime_error(std::format("{} does not exist", context.checkpointPath.string()));
-        loadCheckpoint(context);
+        amoeba::loadCheckpoint(context);
     }
     catch (const std::exception& error)
     {
@@ -380,10 +397,10 @@ int main(int argc, char** argv)
         .api_key = apiKey,
         .callbacks =
             {
-                .on_move = amoeba_bot::onMove,
-                .on_game_start = amoeba_bot::onGameStart,
-                .on_game_end = amoeba_bot::onGameEnd,
-                .on_disconnect = amoeba_bot::onDisconnect,
+                .on_move = amoeba::onMove,
+                .on_game_start = amoeba::onGameStart,
+                .on_game_end = amoeba::onGameEnd,
+                .on_disconnect = amoeba::onDisconnect,
             },
         .user_data = &context,
     };
