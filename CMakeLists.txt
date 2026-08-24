@@ -8,19 +8,14 @@ find_package(arena 0.1.0 CONFIG REQUIRED HINTS "${GAME_ARENA_SDK_ROOT}")
 set(MLX_ROOT "/opt/homebrew" CACHE PATH "Prefix where MLX is installed")
 find_package(MLX 0.32 CONFIG REQUIRED HINTS "${MLX_ROOT}")
 
-# Both executables share the game engine, search, and network. Only the match bot
-# links the Game Arena SDK; the trainer never communicates with the server.
+# One executable selects online play or training from its command line.
 set(AMOEBA_SOURCES
     amoeba/amoeba.cpp
-    amoeba/amoeba_network.cpp
     amoeba/mcts.cpp
     amoeba/network.cpp
+    amoeba/training.cpp
 )
 
-add_executable(amoeba_bot amoeba/bot.cpp ${AMOEBA_SOURCES})
+add_executable(amoeba_bot amoeba/main.cpp ${AMOEBA_SOURCES})
 target_compile_features(amoeba_bot PRIVATE cxx_std_23)
 target_link_libraries(amoeba_bot PRIVATE arena::arena mlx)
-
-add_executable(amoeba_train amoeba/train.cpp ${AMOEBA_SOURCES})
-target_compile_features(amoeba_train PRIVATE cxx_std_23)
-target_link_libraries(amoeba_train PRIVATE mlx)

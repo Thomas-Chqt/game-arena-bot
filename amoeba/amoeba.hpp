@@ -1,6 +1,8 @@
 #ifndef AMOEBA_HPP
 #define AMOEBA_HPP
 
+#include <arena/arena.h>
+
 #include <array>
 #include <bit>
 #include <cassert>
@@ -8,6 +10,7 @@
 #include <span>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace amoeba
 {
@@ -381,6 +384,22 @@ MoveResult applyMove(const Board& board, Move move, std::span<const uint64_t> po
 // ---------------------------------------------------------------------------
 
 Board parseBoard(const std::string& serializedBoard, bool whiteToMove = true);
+
+// Keeps the engine move together with the SDK-owned strings required to submit
+// it. The strings remain valid for the duration of the Arena callback.
+struct ArenaMove
+{
+    Move move;
+    const char* sourcePosition;
+    const char* destinationPosition;
+    bool serverSplittingFlag;
+};
+
+// Conversion between the Game Arena SDK representation and the engine types.
+// Game/search code should not need to understand SDK coordinates or flags.
+Board boardFromArena(const arena_game_state_t& state);
+std::vector<ArenaMove> movesFromArena(const arena_game_state_t& state, const Board& board);
+arena_move_t moveToArena(const ArenaMove& move);
 
 // The opening from section 3 of amoeba-reference.md, White to move. Self-play and
 // the encoder test both need it, and two copies of a 22-piece board string would

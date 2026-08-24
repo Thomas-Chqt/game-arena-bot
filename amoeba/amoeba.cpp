@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cstdlib>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <utility>
 
 namespace amoeba
@@ -404,6 +407,94 @@ Board parseBoard(const std::string& serializedBoard, bool whiteToMove)
     board.positionHash = computeHash(board);
     generateLegalMoves(board);
     return board;
+}
+
+namespace
+{
+
+int8_t parseArenaHexIndex(std::string_view coordinate)
+{
+    const size_t comma = coordinate.find(',');
+    if (comma == std::string_view::npos)
+        return -1;
+
+    int q{};
+    int r{};
+    if (std::from_chars(coordinate.data(), coordinate.data() + comma, q).ec != std::errc{})
+        return -1;
+    if (std::from_chars(coordinate.data() + comma + 1,
+                        coordinate.data() + coordinate.size(), r).ec != std::errc{})
+        return -1;
+    return hexIndex(q, r);
+}
+
+// The engine indexes a move by direction while the SDK names its destination.
+std::optional<uint8_t> directionToArenaDestination(
+    uint8_t sourceHex, uint8_t destinationIndex, uint8_t distance)
+{
+    for (uint8_t direction = 0; direction < directionCount; ++direction)
+    {
+        if (destinationHex(sourceHex, direction, distance)
+            == static_cast<int8_t>(destinationIndex))
+            return direction;
+    }
+    return std::nullopt;
+}
+
+} // namespace
+
+Board boardFromArena(const arena_game_state_t& state)
+{
+    return parseBoard(state.board, state.current_turn == ARENA_SIDE_WHITE);
+}
+
+std::vector<ArenaMove> movesFromArena(const arena_game_state_t& state, const Board& board)
+{
+    std::vector<ArenaMove> moves;
+    for (const arena_piece_moves_t& piece :
+         std::span(state.legal_moves, state.legal_moves_count))
+    {
+        const int8_t sourceHex = parseArenaHexIndex(piece.pos);
+        if (sourceHex < 0)
+            continue;
+
+        const uint8_t stackHeight = board.hexes[sourceHex].height();
+        if (stackHeight == 0)
+            continue;
+
+        // A one-piece stack sows and moves identically, so the engine only uses
+        // the whole-stack form even if the SDK includes a splitting flag.
+        const bool splitsStack = piece.splitting && stackHeight >= 2;
+
+        for (const char* destination :
+             std::span(piece.valid_moves, piece.valid_moves_count))
+        {
+            const int8_t destinationIndex = parseArenaHexIndex(destination);
+            if (destinationIndex < 0)
+                continue;
+
+            const std::optional<uint8_t> direction = directionToArenaDestination(
+                static_cast<uint8_t>(sourceHex), static_cast<uint8_t>(destinationIndex),
+                stackHeight);
+            if (!direction.has_value())
+                continue;
+
+            moves.push_back(ArenaMove{
+                Move{static_cast<uint8_t>(sourceHex), *direction, splitsStack},
+                piece.pos, destination, piece.splitting});
+        }
+    }
+    return moves;
+}
+
+arena_move_t moveToArena(const ArenaMove& move)
+{
+    return arena_move_t{
+        .from_pos = move.sourcePosition,
+        .to_pos = move.destinationPosition,
+        .side = nullptr,
+        .splitting = move.serverSplittingFlag,
+    };
 }
 
 // ===========================================================================

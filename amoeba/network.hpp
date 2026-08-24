@@ -1,6 +1,8 @@
 #ifndef NETWORK_HPP
 #define NETWORK_HPP
 
+#include "mcts.hpp"
+
 #include <mlx/mlx.h>
 
 #include <algorithm>
@@ -44,6 +46,39 @@ concept Module = requires(const T& module, mlx::core::array input, std::span<con
 template<typename T>
 struct NetworkName;
 
+// The two tensors produced by every Amoeba network. Policy contains one raw
+// score per policy index; value estimates the outcome for the side to move.
+struct Prediction
+{
+    mlx::core::array policy; // [batch, moveIdCount]
+    mlx::core::array value;  // [batch]
+};
+
+// Training keeps its data as MLX arrays so the complete forward-and-loss graph
+// remains differentiable. Batch construction itself stays in training.cpp.
+struct TrainingBatch
+{
+    mlx::core::array input;
+    mlx::core::array legal;
+    mlx::core::array policyTarget;
+    mlx::core::array valueTarget;
+};
+
+struct Loss
+{
+    mlx::core::array total;
+    mlx::core::array policy;
+    mlx::core::array value;
+};
+
+struct LossAndGrad
+{
+    Loss loss;
+    // There is one gradient tensor for each tensor in the supplied parameter
+    // vector, in exactly the same order.
+    std::vector<mlx::core::array> gradients;
+};
+
 class Network
 {
     struct ParameterDefinition
@@ -58,38 +93,18 @@ class Network
 public:
     virtual ~Network() = default;
 
-    // Training uses this function. MLX supplies a parameter vector to
-    // value_and_grad, and the same module tree evaluates with those values.
-    std::vector<mlx::core::array> evaluate(
-        mlx::core::array input, std::span<const mlx::core::array> parameters) const
-    {
-        assert(parameters.size() == m_parameters.size());
-        for (size_t index = 0; index < parameters.size(); ++index)
-        {
-            assert(parameters[index].shape() == m_layout[index].shape);
-            assert(parameters[index].dtype() == mlx::core::float32);
-        }
+    // MCTS-facing inference. This fixed Amoeba adapter batches Board objects,
+    // masks illegal moves, and returns probabilities indexed by absolute move id.
+    void operator()(std::span<const Board* const> boards,
+                    std::span<Evaluation> outputs) const;
 
-        // MLX compile accepts one flat vector. The board is entry 0 and every
-        // parameter follows in the layout order. Making parameters inputs is
-        // essential: captured arrays would be frozen as constants by compile().
-        std::vector<mlx::core::array> inputs;
-        inputs.reserve(parameters.size() + 1);
-        inputs.push_back(std::move(input));
-        inputs.insert(inputs.end(), parameters.begin(), parameters.end());
-
-        // The derived object and all its module members now exist, so invoking
-        // the virtual forward function is safe. MLX traces it on the first call.
-        if (!m_compiledForward)
-            createCompiledForward();
-        return m_compiledForward(inputs);
-    }
-
-    // Inference uses the parameters currently owned by this Network.
-    std::vector<mlx::core::array> operator()(mlx::core::array input) const
-    {
-        return evaluate(std::move(input), m_parameters);
-    }
+    // Validation only needs the losses and therefore avoids calculating
+    // gradients. Training calls valueAndGrad with the parameter values that the
+    // optimizer is currently updating.
+    Loss loss(const std::vector<mlx::core::array>& parameters,
+              const TrainingBatch& batch, float weightDecay) const;
+    LossAndGrad valueAndGrad(const std::vector<mlx::core::array>& parameters,
+                             const TrainingBatch& batch, float weightDecay) const;
 
     // Modules call this from their constructors and retain the returned index.
     // The actual tensor stays here in Network; a module owns only its structure.
@@ -216,20 +231,16 @@ protected:
         mlx::core::eval(m_parameters);
     }
 
-    virtual std::vector<mlx::core::array> forward(
+    virtual Prediction forward(
         mlx::core::array input, std::span<const mlx::core::array> parameters) const = 0;
 
 private:
-    void createCompiledForward() const
-    {
-        std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array>&)> function =
-            [this](const std::vector<mlx::core::array>& inputs)
-        {
-            assert(!inputs.empty());
-            return forward(inputs.front(), std::span{inputs}.subspan(1));
-        };
-        m_compiledForward = mlx::core::compile(std::move(function));
-    }
+    Prediction evaluate(mlx::core::array input,
+                        std::span<const mlx::core::array> parameters) const;
+    std::vector<mlx::core::array> computeLoss(
+        const std::vector<mlx::core::array>& parameters,
+        const TrainingBatch& batch, float weightDecay) const;
+    void createCompiledForward() const;
 
     // Metadata that belongs together is one structure. Values remain a flat
     // vector because MLX transformations exchange parameters in that format.
@@ -239,17 +250,12 @@ private:
     mutable CompiledForward m_compiledForward;
 };
 
-// Modules use this concept for their construction-time dependency. A network
-// owns parameters, supports normal inference with operator(), and can evaluate
-// an explicit parameter vector while MLX differentiates it.
+// Modules only need their construction-time dependency to accept new parameter
+// tensors. The inference and training API belongs to the Network base itself.
 template<typename T>
-concept NetworkType = requires(
-    T& network, const T& constNetwork, mlx::core::array input,
-    std::span<const mlx::core::array> parameters, std::string name,
-    mlx::core::array parameter)
+concept NetworkType = requires(T& network, std::string name,
+                               mlx::core::array parameter)
 {
-    { constNetwork(std::move(input)) } -> std::same_as<std::vector<mlx::core::array>>;
-    { constNetwork.evaluate(std::move(input), parameters) } -> std::same_as<std::vector<mlx::core::array>>;
     { network.addParameter(std::move(name), std::move(parameter)) } -> std::same_as<size_t>;
 };
 

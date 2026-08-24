@@ -1,7 +1,6 @@
 #ifndef AMOEBA_NETWORK_HPP
 #define AMOEBA_NETWORK_HPP
 
-#include "mcts.hpp"
 #include "network.hpp"
 
 namespace amoeba
@@ -93,12 +92,6 @@ private:
     Sequential<Linear<Width, Width * 4>, Gelu, Linear<Width * 4, Width>> m_feedForward;
 };
 
-struct Prediction
-{
-    mlx::core::array policy; // Raw move logits: [batch, 444].
-    mlx::core::array value;  // Expected outcome for the side to move: [batch].
-};
-
 class AmoebaNetwork;
 
 template<>
@@ -147,7 +140,7 @@ private:
     static constexpr int embeddingWidth = 128;
     static constexpr int attentionHeadCount = 8;
 
-    std::vector<mlx::core::array> forward(
+    Prediction forward(
         mlx::core::array inputBatch, std::span<const mlx::core::array> parameters) const
         override
     {
@@ -179,7 +172,7 @@ private:
             m_policy(tokens, parameters), {batchSize, moveIdCount});
         const mlx::core::array pooled = mlx::core::mean(tokens, std::vector<int>{1}, false);
         const mlx::core::array value = mlx::core::reshape(m_value(pooled, parameters), {batchSize});
-        return {policy, value};
+        return Prediction{policy, value};
     }
 
     Linear<featuresPerHex + globalFeatureCount, embeddingWidth> m_embed;
@@ -189,36 +182,6 @@ private:
     Linear<embeddingWidth, policyOutputsPerHex> m_policy;
     Sequential<Linear<embeddingWidth, embeddingWidth>, Gelu, Linear<embeddingWidth, 1>, Tanh> m_value;
 };
-
-class NetworkEvaluator
-{
-public:
-    explicit NetworkEvaluator(const AmoebaNetwork& network)
-        : m_network(network)
-    {
-    }
-
-    void evaluate(std::span<const Board* const> boards, std::span<Evaluation> outputs);
-
-private:
-    const AmoebaNetwork& m_network;
-};
-
-struct TrainingBatch
-{
-    mlx::core::array input;
-    mlx::core::array legal;
-    mlx::core::array policyTarget;
-    mlx::core::array valueTarget;
-};
-
-TrainingBatch makeTrainingBatch(std::span<const Board* const> boards,
-                                std::span<const VisitCounts> visits,
-                                std::span<const float> outcomes);
-
-std::vector<mlx::core::array> computeLoss(const AmoebaNetwork& network,
-                                          const std::vector<mlx::core::array>& parameters,
-                                          const TrainingBatch& batch, float weightDecay);
 
 } // namespace amoeba
 

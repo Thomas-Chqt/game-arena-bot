@@ -1,15 +1,11 @@
-// amoeba_bot: plays Amoeba on Game Arena with a trained network, and does
-// nothing else. Training lives in amoeba_train; the two programs only ever meet
-// in a .safetensors file, so either can be killed and restarted without the
-// other noticing.
+// amoeba_bot either plays Amoeba on Game Arena or trains the same network:
 //
 //   amoeba_bot <weights.safetensors>
+//   amoeba_bot --train <weights.safetensors>
 //
-// The path is required and must exist: this program never trains and never
-// writes weights, so there is nothing sensible to do without them, and guessing
-// at which file to load is how you end up playing rated games with a network you
-// did not mean to. The file is loaded once at startup and that model is used
-// until the program exits.
+// Bot mode requires an existing checkpoint and keeps it for the process lifetime.
+// Training mode creates a missing checkpoint and replaces it whenever a candidate
+// defeats the current champion.
 //
 // Credentials come from BOT1_ID and BOT1_KEY; ROOM_ID picks a practice room, and
 // without it the bot queues for ranked games back to back.
@@ -25,12 +21,13 @@
 
 #include "mcts.hpp"
 #include "amoeba_network.hpp"
+#include "training.hpp"
 
 #include <arena/arena.h>
 
 #include <algorithm>
-#include <charconv>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -74,14 +71,6 @@ template <typename Callback> void runGuardedCallback(const char* callbackName, C
     }
 }
 
-struct TranslatedMove
-{
-    amoeba::Move move;
-    const char* sourcePosition;
-    const char* destinationPosition;
-    bool serverSplittingFlag;
-};
-
 // The model is loaded once at startup and held for the process lifetime. Each
 // game gets a fresh search root, but changes to the checkpoint on disk are not
 // picked up until the bot is restarted.
@@ -89,78 +78,12 @@ struct BotContext
 {
     std::filesystem::path checkpointPath;
     std::unique_ptr<AmoebaNetwork> network;
-    std::unique_ptr<NetworkEvaluator> evaluator;
     std::optional<MCTS> search;
     amoeba::Board board;
     std::optional<amoeba::Outcome> outcome;
     uint16_t plyCount = 0;
     std::vector<uint64_t> positionHistory;
 };
-
-// ---------------------------------------------------------------------------
-// Translation between the server's strings and the engine's move ids
-// ---------------------------------------------------------------------------
-
-int8_t parseHexIndex(std::string_view coordinate)
-{
-    const size_t comma = coordinate.find(',');
-    if (comma == std::string_view::npos)
-        return -1;
-
-    int q{};
-    int r{};
-    if (std::from_chars(coordinate.data(), coordinate.data() + comma, q).ec != std::errc{})
-        return -1;
-    if (std::from_chars(coordinate.data() + comma + 1, coordinate.data() + coordinate.size(), r).ec != std::errc{})
-        return -1;
-    return amoeba::hexIndex(q, r);
-}
-
-// The engine indexes a move by direction, the server names its destination.
-std::optional<uint8_t> findMoveDirection(uint8_t sourceHex, uint8_t destinationHex, uint8_t distance)
-{
-    for (uint8_t direction = 0; direction < amoeba::directionCount; ++direction)
-    {
-        if (amoeba::destinationHex(sourceHex, direction, distance) == static_cast<int8_t>(destinationHex))
-            return direction;
-    }
-    return std::nullopt;
-}
-
-std::vector<TranslatedMove> translateServerMoves(const arena_game_state_t& state, const amoeba::Board& board)
-{
-    std::vector<TranslatedMove> translatedMoves;
-    for (const arena_piece_moves_t& piece : std::span(state.legal_moves, state.legal_moves_count))
-    {
-        const int8_t sourceHex = parseHexIndex(piece.pos);
-        if (sourceHex < 0)
-            continue;
-
-        const uint8_t stackHeight = board.hexes[sourceHex].height();
-        if (stackHeight == 0)
-            continue;
-
-        // A one-piece stack sows and moves identically, so the engine only ever
-        // emits the whole-stack form of it.
-        const bool splitsStack = piece.splitting && stackHeight >= 2;
-
-        for (const char* destination : std::span(piece.valid_moves, piece.valid_moves_count))
-        {
-            const int8_t destinationHex = parseHexIndex(destination);
-            if (destinationHex < 0)
-                continue;
-
-            const std::optional<uint8_t> direction =
-                findMoveDirection(static_cast<uint8_t>(sourceHex), static_cast<uint8_t>(destinationHex), stackHeight);
-            if (!direction.has_value())
-                continue;
-
-            translatedMoves.push_back({amoeba::Move{static_cast<uint8_t>(sourceHex), *direction, splitsStack},
-                                       piece.pos, destination, piece.splitting});
-        }
-    }
-    return translatedMoves;
-}
 
 // ---------------------------------------------------------------------------
 // Keeping the local board in step with the server's
@@ -177,13 +100,13 @@ void startSearch(BotContext& context)
                            MCTSConfig{.simulations = searchSimulationCount});
 }
 
-VisitCounts finishSearch(MCTS& search, NetworkEvaluator& evaluator)
+VisitCounts finishSearch(MCTS& search, const Network& network)
 {
     while (const amoeba::Board* leaf = search.pendingLeaf())
     {
         const amoeba::Board* boards[]{leaf};
         Evaluation evaluation;
-        evaluator.evaluate(boards, std::span{&evaluation, 1});
+        network(boards, std::span{&evaluation, 1});
         search.absorb(evaluation);
     }
     return search.visits();
@@ -206,9 +129,9 @@ void advanceLocalGame(BotContext& context, amoeba::Move move)
     startSearch(context);
 }
 
-void synchronizeWithServer(BotContext& context, const char* serializedServerBoard, arena_side_t currentTurn)
+void synchronizeWithServer(BotContext& context, const arena_game_state_t& state)
 {
-    const amoeba::Board serverBoard = amoeba::parseBoard(serializedServerBoard, currentTurn == ARENA_SIDE_WHITE);
+    const amoeba::Board serverBoard = boardFromArena(state);
     if (hasSamePosition(context.board, serverBoard))
         return;
 
@@ -236,7 +159,7 @@ void synchronizeWithServer(BotContext& context, const char* serializedServerBoar
     // server's position costs the staleness and repetition counters, but that
     // beats playing out the rest of the game from a board that never existed.
     std::println(stderr, "[bot] resync at ply {}: no legal move reaches {}", context.board.plyCount,
-                 serializedServerBoard);
+                 state.board);
     const uint16_t plyCount = context.board.plyCount;
     context.board = serverBoard;
     context.board.plyCount = static_cast<uint16_t>(plyCount + 1);
@@ -252,7 +175,8 @@ void synchronizeWithServer(BotContext& context, const char* serializedServerBoar
 
 // The clock starts when the callback does, not when the search does: the server
 // times the whole reply, so sync and translation count against the budget too.
-const TranslatedMove& selectMove(BotContext& context, const std::vector<TranslatedMove>& serverMoves, std::chrono::steady_clock::time_point turnStart)
+const ArenaMove& selectMove(BotContext& context, const std::vector<ArenaMove>& serverMoves,
+                            std::chrono::steady_clock::time_point turnStart)
 {
     if (context.outcome.has_value())
     {
@@ -260,10 +184,11 @@ const TranslatedMove& selectMove(BotContext& context, const std::vector<Translat
         return serverMoves.front();
     }
 
-    const VisitCounts visitCounts = finishSearch(*context.search, *context.evaluator);
+    const VisitCounts visitCounts = finishSearch(*context.search, *context.network);
     const uint16_t chosenMoveId = bestMove(visitCounts);
 
-    const auto chosenMove = std::ranges::find_if(serverMoves, [chosenMoveId](const TranslatedMove& move) { return move.move.id() == chosenMoveId; });
+    const auto chosenMove = std::ranges::find_if(
+        serverMoves, [chosenMoveId](const ArenaMove& move) { return move.move.id() == chosenMoveId; });
     if (chosenMove == serverMoves.end())
     {
         std::println(stderr, "[bot] search picked a move the server did not offer, falling back");
@@ -288,7 +213,6 @@ const TranslatedMove& selectMove(BotContext& context, const std::vector<Translat
 void loadCheckpoint(BotContext& context)
 {
     context.network = std::make_unique<AmoebaNetwork>(context.checkpointPath);
-    context.evaluator = std::make_unique<NetworkEvaluator>(*context.network);
 
     std::println("[bot] {}: {}, {} parameters", context.checkpointPath.filename().string(),
                  AmoebaNetwork::name, context.network->parameterCount());
@@ -299,7 +223,7 @@ void onGameStart(const arena_game_state_t* state, void* userData)
     runGuardedCallback("on_game_start", [&] {
         BotContext& context = *static_cast<BotContext*>(userData);
 
-        context.board = amoeba::parseBoard(state->board, state->current_turn == ARENA_SIDE_WHITE);
+        context.board = boardFromArena(*state);
         context.outcome.reset();
         context.plyCount = context.board.plyCount;
         context.positionHistory.assign(1, context.board.positionHash);
@@ -321,23 +245,20 @@ void onMove(const arena_game_state_t* state, arena_move_t* output, void* userDat
             return;
         }
 
-        synchronizeWithServer(context, state->board, state->current_turn);
+        synchronizeWithServer(context, *state);
 
-        const std::vector<TranslatedMove> serverMoves = translateServerMoves(*state, context.board);
+        const std::vector<ArenaMove> serverMoves = movesFromArena(*state, context.board);
         if (serverMoves.empty())
         {
             std::println(stderr, "[bot] no usable move in the server's list for {}", state->board);
             return;
         }
 
-        const TranslatedMove& chosenMove = selectMove(context, serverMoves, turnStart);
+        const ArenaMove& chosenMove = selectMove(context, serverMoves, turnStart);
 
         // The SDK owns these strings for the duration of the callback, and they
         // carry the server's own spelling of the move.
-        output->from_pos = chosenMove.sourcePosition;
-        output->to_pos = chosenMove.destinationPosition;
-        output->side = nullptr;
-        output->splitting = chosenMove.serverSplittingFlag;
+        *output = moveToArena(chosenMove);
 
         advanceLocalGame(context, chosenMove.move);
     });
@@ -357,19 +278,92 @@ void onDisconnect(const char* reason, void*)
     std::println(stderr, "[bot] disconnected: {}", reason == nullptr ? "unknown reason" : reason);
 }
 
-} // namespace
-
-} // namespace amoeba
-
-int main(int argc, char** argv)
+// Flush high-level training progress even when stdout is redirected to a file.
+template <typename... Args> void report(std::format_string<Args...> format, Args&&... args)
 {
-    if (argc != 2)
+    std::println(format, std::forward<Args>(args)...);
+    std::fflush(stdout);
+}
+
+void runTraining(const std::filesystem::path& weights)
+{
+    const TrainingSettings settings;
+
+    // Generation zero is saved immediately so bot mode has a checkpoint while
+    // the first generation is still being produced.
+    std::unique_ptr<AmoebaNetwork> champion;
+    if (std::filesystem::exists(weights))
     {
-        std::println(stderr, "usage: amoeba_bot <weights.safetensors>");
-        std::println(stderr, "  the file must exist - this program only ever reads it");
-        return EXIT_FAILURE;
+        champion = std::make_unique<AmoebaNetwork>(weights);
+        report("[train] resuming from {}: {}, {} parameters", weights.string(),
+               AmoebaNetwork::name, champion->parameterCount());
+    }
+    else
+    {
+        champion = std::make_unique<AmoebaNetwork>(settings.seed);
+        champion->save(weights);
+        report("[train] {} did not exist: started from random weights, {} parameters, saved",
+               weights.string(), champion->parameterCount());
     }
 
+    std::vector<TrainingSample> replay;
+    int gameIdBase = 0;
+
+    for (int generation = 1;; ++generation)
+    {
+        report("");
+        report("======== generation {} ========", generation);
+
+        std::vector<TrainingSample> fresh = generateSelfPlaySamples(
+            *champion, settings,
+            settings.seed + static_cast<uint64_t>(generation) * 1000);
+
+        // IDs stay unique across generations so holding out one game cannot
+        // accidentally retain positions from an older game with the same ID.
+        for (TrainingSample& sample : fresh)
+            sample.gameId += gameIdBase;
+        gameIdBase += settings.selfPlayGameCount;
+
+        reportMemory("self-play");
+
+        replay.insert(replay.end(), std::make_move_iterator(fresh.begin()),
+                      std::make_move_iterator(fresh.end()));
+        if (replay.size() > settings.replayBufferCapacity)
+        {
+            replay.erase(replay.begin(), replay.begin() + static_cast<long>(
+                replay.size() - settings.replayBufferCapacity));
+        }
+        report("[train] replay buffer holds {} positions", replay.size());
+
+        // Training refines a copy; the champion remains unchanged until the
+        // candidate proves itself in games.
+        AmoebaNetwork candidate = *champion;
+        trainCandidate(candidate, replay, settings,
+                       settings.seed + static_cast<uint64_t>(generation));
+        reportMemory("training");
+
+        const double score = evaluateCandidate(
+            candidate, *champion, settings,
+            settings.seed + 7777 + static_cast<uint64_t>(generation));
+        reportMemory("the gate");
+
+        if (score < settings.promotionThreshold)
+        {
+            report("[train] generation {} rejected at {:.1f}%, keeping the previous weights",
+                   generation, 100.0 * score);
+        }
+        else
+        {
+            *champion = candidate;
+            champion->save(weights);
+            report("[train] generation {} PROMOTED at {:.1f}%, wrote {}",
+                   generation, 100.0 * score, weights.string());
+        }
+    }
+}
+
+int runBot(const std::filesystem::path& weights)
+{
     const char* botId = std::getenv("BOT1_ID");
     const char* apiKey = std::getenv("BOT1_KEY");
     if (botId == nullptr || apiKey == nullptr)
@@ -378,13 +372,13 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 
-    amoeba::BotContext context;
+    BotContext context;
     try
     {
-        context.checkpointPath = std::filesystem::path{argv[1]};
+        context.checkpointPath = weights;
         if (!std::filesystem::exists(context.checkpointPath))
             throw std::runtime_error(std::format("{} does not exist", context.checkpointPath.string()));
-        amoeba::loadCheckpoint(context);
+        loadCheckpoint(context);
     }
     catch (const std::exception& error)
     {
@@ -397,10 +391,10 @@ int main(int argc, char** argv)
         .api_key = apiKey,
         .callbacks =
             {
-                .on_move = amoeba::onMove,
-                .on_game_start = amoeba::onGameStart,
-                .on_game_end = amoeba::onGameEnd,
-                .on_disconnect = amoeba::onDisconnect,
+                .on_move = onMove,
+                .on_game_start = onGameStart,
+                .on_game_end = onGameEnd,
+                .on_disconnect = onDisconnect,
             },
         .user_data = &context,
     };
@@ -413,4 +407,24 @@ int main(int argc, char** argv)
     const int status = arena_start_continuous(&config, ARENA_GAME_AMOEBA);
     std::println(stderr, "[bot] continuous play stopped with status {}", status);
     return status;
+}
+
+} // namespace
+
+} // namespace amoeba
+
+int main(int argc, char** argv)
+{
+    if (argc == 3 && std::string_view{argv[1]} == "--train")
+    {
+        amoeba::runTraining(std::filesystem::path{argv[2]});
+        return EXIT_SUCCESS;
+    }
+
+    if (argc == 2 && std::string_view{argv[1]} != "--train")
+        return amoeba::runBot(std::filesystem::path{argv[1]});
+
+    std::println(stderr, "usage: amoeba_bot <weights.safetensors>");
+    std::println(stderr, "       amoeba_bot --train <weights.safetensors>");
+    return EXIT_FAILURE;
 }
