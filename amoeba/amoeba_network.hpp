@@ -3,7 +3,7 @@
 
 #include "network.hpp"
 
-namespace amoeba
+namespace amoeba_bot
 {
 
 // Every hex produces six move logits and six sow/split logits. Flattening the
@@ -30,11 +30,11 @@ struct AmoebaRelationMap
             {
                 for (uint8_t distance = 1; distance <= maximumMovableStackHeight; ++distance)
                 {
-                    const int8_t destination =
-                        destinationHex(static_cast<uint8_t>(source), direction, distance);
-                    if (destination >= 0)
+                    const std::optional<uint8_t> destination =
+                        destinationHex(static_cast<uint8_t>(source), directions[direction], distance);
+                    if (destination.has_value())
                     {
-                        table[source][destination] = static_cast<uint8_t>(
+                        table[source][destination.value()] = static_cast<uint8_t>(
                             2 + direction * maximumMovableStackHeight + distance - 1);
                     }
                 }
@@ -183,6 +183,6 @@ private:
     Sequential<Linear<embeddingWidth, embeddingWidth>, Gelu, Linear<embeddingWidth, 1>, Tanh> m_value;
 };
 
-} // namespace amoeba
+} // namespace amoeba_bot
 
 #endif // AMOEBA_NETWORK_HPP

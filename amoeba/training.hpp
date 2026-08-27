@@ -7,7 +7,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace amoeba
+namespace amoeba_bot
 {
 
 // Settings are read from the existing environment variables by the constructor.
@@ -71,6 +71,6 @@ double evaluateCandidate(const AmoebaNetwork& candidate,
 
 void reportMemory(const char* phase);
 
-} // namespace amoeba
+} // namespace amoeba_bot
 
 #endif // TRAINING_HPP

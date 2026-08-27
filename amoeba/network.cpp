@@ -5,8 +5,24 @@
 #include <numeric>
 #include <stdexcept>
 
-namespace amoeba
+namespace amoeba_bot
 {
+
+namespace
+{
+
+uint16_t policyIndexToMoveId(uint16_t policyIndex, bool whiteToMove)
+{
+    Move move = Move::fromId(policyIndex);
+    if (!whiteToMove)
+    {
+        move.sourceCoord = rotatedHex(move.sourceCoord);
+        move.direction = oppositeDirection(move.direction);
+    }
+    return move.id();
+}
+
+} // namespace
 
 Prediction Network::evaluate(mlx::core::array input,
                              std::span<const mlx::core::array> parameters) const
@@ -55,29 +71,27 @@ void Network::operator()(std::span<const Board* const> boards,
 
     // Collect several MCTS leaves into one tensor so MLX evaluates them in one
     // GPU batch instead of launching one network call per position.
-    std::vector<float> encodedBoards(static_cast<size_t>(batchSize) * encodedBoardSize);
+    std::vector<mlx::core::array> encodedBoards;
+    encodedBoards.reserve(boards.size());
     std::vector<float> legalMoveMask(static_cast<size_t>(batchSize) * moveIdCount);
 
     for (size_t boardIndex = 0; boardIndex < boards.size(); ++boardIndex)
     {
         assert(boards[boardIndex] != nullptr);
-        const size_t encodedBoardOffset = boardIndex * encodedBoardSize;
         const size_t maskOffset = boardIndex * moveIdCount;
 
-        encodeBoard(*boards[boardIndex], std::span<float, encodedBoardSize>(
-                                                  encodedBoards.data() + encodedBoardOffset,
-                                                  encodedBoardSize));
+        encodedBoards.push_back(boards[boardIndex]->tensorEncoding());
 
-        const std::span<const uint16_t, moveIdCount> moveIdsByPolicyIndex =
-            policyIndicesToMoveIds(boards[boardIndex]->whiteToMove);
         for (int policyIndex = 0; policyIndex < moveIdCount; ++policyIndex)
+        {
+            const uint16_t moveId = policyIndexToMoveId(
+                static_cast<uint16_t>(policyIndex), boards[boardIndex]->whiteToMove);
             legalMoveMask[maskOffset + policyIndex] =
-                boards[boardIndex]->isLegal(moveIdsByPolicyIndex[policyIndex]) ? 1.0f : 0.0f;
+                boards[boardIndex]->isLegal(moveId) ? 1.0f : 0.0f;
+        }
     }
 
-    const mlx::core::array input(encodedBoards.data(),
-                                 mlx::core::Shape{batchSize, encodedBoardSize},
-                                 mlx::core::float32);
+    const mlx::core::array input = mlx::core::stack(encodedBoards);
     const Prediction prediction = evaluate(input, m_parameters);
 
     const mlx::core::array legal(legalMoveMask.data(),
@@ -95,14 +109,13 @@ void Network::operator()(std::span<const Board* const> boards,
     const float* valueData = prediction.value.data<float>();
     for (size_t boardIndex = 0; boardIndex < boards.size(); ++boardIndex)
     {
-        const std::span<const uint16_t, moveIdCount> moveIdsByPolicyIndex =
-            policyIndicesToMoveIds(boards[boardIndex]->whiteToMove);
         const size_t policyOffset = boardIndex * moveIdCount;
 
-        // encodeBoard rotates into the side-to-move perspective. Convert the
+        // tensorEncoding rotates into the side-to-move perspective. Convert the
         // policy indices back to absolute Move::id values before MCTS sees them.
         for (int policyIndex = 0; policyIndex < moveIdCount; ++policyIndex)
-            outputs[boardIndex].policy[moveIdsByPolicyIndex[policyIndex]] =
+            outputs[boardIndex].policy[policyIndexToMoveId(
+                static_cast<uint16_t>(policyIndex), boards[boardIndex]->whiteToMove)] =
                 policyData[policyOffset + policyIndex];
         outputs[boardIndex].value = valueData[boardIndex];
     }
@@ -226,4 +239,4 @@ std::vector<mlx::core::array> Adam::updateParameters(const std::vector<mlx::core
     return updated;
 }
 
-} // namespace amoeba
+} // namespace amoeba_bot

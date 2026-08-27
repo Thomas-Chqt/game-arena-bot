@@ -1,5 +1,4 @@
-#ifndef NETWORK_HPP
-#define NETWORK_HPP
+#pragma once
 
 #include "mcts.hpp"
 
@@ -26,28 +25,24 @@
 #include <utility>
 #include <vector>
 
-namespace amoeba
+namespace amoeba_bot
 {
 
 std::string childName(std::string_view parent, std::string_view child);
 std::string indexedName(std::string_view parent, size_t index);
 
-// There is no Module base class. A type is a module when it can be called with
-// an input tensor and the parameter tensors used for this particular forward
-// pass. This keeps every internal call statically typed and inlineable.
 template<typename T>
 concept Module = requires(const T& module, mlx::core::array input, std::span<const mlx::core::array> parameters)
 {
     module(std::move(input), parameters);
 };
 
-// A concrete Network subclass must specialize this trait. Keeping the name
-// outside the class lets the user choose the checkpoint identifier.
 template<typename T>
-struct NetworkName;
+struct NetworkName
+{
+    static_assert(false, "");
+};
 
-// The two tensors produced by every Amoeba network. Policy contains one raw
-// score per policy index; value estimates the outcome for the side to move.
 struct Prediction
 {
     mlx::core::array policy; // [batch, moveIdCount]
@@ -59,7 +54,7 @@ struct Prediction
 struct TrainingBatch
 {
     mlx::core::array input;
-    mlx::core::array legal;
+    mlx::core::array legal; // [batchSize, moveIdCount]
     mlx::core::array policyTarget;
     mlx::core::array valueTarget;
 };
@@ -608,6 +603,4 @@ private:
     int m_steps = 0;
 };
 
-} // namespace amoeba
-
-#endif // NETWORK_HPP
+} // namespace amoeba_bot

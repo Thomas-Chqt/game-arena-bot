@@ -41,7 +41,7 @@
 #include <string_view>
 #include <vector>
 
-namespace amoeba
+namespace amoeba_bot
 {
 
 namespace
@@ -79,8 +79,8 @@ struct BotContext
     std::filesystem::path checkpointPath;
     std::unique_ptr<AmoebaNetwork> network;
     std::optional<MCTS> search;
-    amoeba::Board board;
-    std::optional<amoeba::Outcome> outcome;
+    Board board;
+    std::optional<Outcome> outcome;
     uint16_t plyCount = 0;
     std::vector<uint64_t> positionHistory;
 };
@@ -89,7 +89,7 @@ struct BotContext
 // Keeping the local board in step with the server's
 // ---------------------------------------------------------------------------
 
-bool hasSamePosition(const amoeba::Board& left, const amoeba::Board& right)
+bool hasSamePosition(const Board& left, const Board& right)
 {
     return left.whiteToMove == right.whiteToMove && std::ranges::equal(left.hexes, right.hexes);
 }
@@ -102,9 +102,9 @@ void startSearch(BotContext& context)
 
 VisitCounts finishSearch(MCTS& search, const Network& network)
 {
-    while (const amoeba::Board* leaf = search.pendingLeaf())
+    while (const Board* leaf = search.pendingLeaf())
     {
-        const amoeba::Board* boards[]{leaf};
+        const Board* boards[]{leaf};
         Evaluation evaluation;
         network(boards, std::span{&evaluation, 1});
         search.absorb(evaluation);
@@ -113,17 +113,24 @@ VisitCounts finishSearch(MCTS& search, const Network& network)
 }
 
 // Plays a move locally and creates a fresh search for the resulting position.
-void advanceLocalGame(BotContext& context, amoeba::Move move)
+void advanceLocalGame(BotContext& context, Move move, const Board* serverBoard = nullptr)
 {
-    amoeba::MoveResult result = amoeba::applyMove(context.board, move, context.positionHistory);
-    if (const auto* outcome = std::get_if<amoeba::Outcome>(&result))
+    MoveResult result = applyMove(context.board, move, context.positionHistory);
+    if (const auto* outcome = std::get_if<Outcome>(&result))
     {
         context.outcome = *outcome;
         context.plyCount = static_cast<uint16_t>(context.board.plyCount + 1);
         return;
     }
 
-    context.board = std::get<amoeba::Board>(std::move(result));
+    context.board = std::get<Board>(std::move(result));
+    if (serverBoard != nullptr)
+    {
+        assert(hasSamePosition(context.board, *serverBoard));
+        for (int word = 0; word < legalMoveWordCount; ++word)
+            context.board.legalMoveBits[word] = serverBoard->legalMoveBits[word];
+        context.board.legalMoveCount = serverBoard->legalMoveCount;
+    }
     context.plyCount = context.board.plyCount;
     context.positionHistory.push_back(context.board.positionHash);
     startSearch(context);
@@ -131,27 +138,27 @@ void advanceLocalGame(BotContext& context, amoeba::Move move)
 
 void synchronizeWithServer(BotContext& context, const arena_game_state_t& state)
 {
-    const amoeba::Board serverBoard = boardFromArena(state);
+    const Board serverBoard{state};
     if (hasSamePosition(context.board, serverBoard))
         return;
 
     // Between two of our turns the opponent plays exactly one move; find which.
-    std::optional<amoeba::Move> opponentMove;
+    std::optional<Move> opponentMove;
     context.board.forEachLegal(
         [&](uint16_t moveId)
         {
             if (opponentMove.has_value())
                 return;
-            const amoeba::Move move = amoeba::Move::fromId(moveId);
-            const amoeba::MoveResult result = amoeba::applyMove(context.board, move, context.positionHistory);
-            const amoeba::Board* nextBoard = std::get_if<amoeba::Board>(&result);
+            const Move move = Move::fromId(moveId);
+            const MoveResult result = applyMove(context.board, move, context.positionHistory);
+            const Board* nextBoard = std::get_if<Board>(&result);
             if (nextBoard != nullptr && hasSamePosition(*nextBoard, serverBoard))
                 opponentMove = move;
         });
 
     if (opponentMove.has_value())
     {
-        advanceLocalGame(context, *opponentMove);
+        advanceLocalGame(context, *opponentMove, &serverBoard);
         return;
     }
 
@@ -175,39 +182,51 @@ void synchronizeWithServer(BotContext& context, const arena_game_state_t& state)
 
 // The clock starts when the callback does, not when the search does: the server
 // times the whole reply, so sync and translation count against the budget too.
-const ArenaMove& selectMove(BotContext& context, const std::vector<ArenaMove>& serverMoves,
-                            std::chrono::steady_clock::time_point turnStart)
+Move selectMove(BotContext& context, std::chrono::steady_clock::time_point turnStart)
 {
     if (context.outcome.has_value())
     {
         std::println(stderr, "[bot] engine calls the game over at ply {}, deferring to the server", context.plyCount);
-        return serverMoves.front();
+        std::optional<Move> firstMove;
+        context.board.forEachLegal([&](uint16_t id) {
+            if (!firstMove.has_value())
+                firstMove = Move::fromId(id);
+        });
+        assert(firstMove.has_value());
+        return firstMove.value();
     }
 
     const VisitCounts visitCounts = finishSearch(*context.search, *context.network);
     const uint16_t chosenMoveId = bestMove(visitCounts);
 
-    const auto chosenMove = std::ranges::find_if(
-        serverMoves, [chosenMoveId](const ArenaMove& move) { return move.move.id() == chosenMoveId; });
-    if (chosenMove == serverMoves.end())
+    if (!context.board.isLegal(chosenMoveId))
     {
         std::println(stderr, "[bot] search picked a move the server did not offer, falling back");
-        return serverMoves.front();
+        std::optional<Move> firstMove;
+        context.board.forEachLegal([&](uint16_t id) {
+            if (!firstMove.has_value())
+                firstMove = Move::fromId(id);
+        });
+        assert(firstMove.has_value());
+        return firstMove.value();
     }
+
+    const Move chosenMove = Move::fromId(chosenMoveId);
+    const arena_move_t arenaMove = chosenMove.toArena(context.board.hexes[chosenMove.sourceCoord].height());
 
     const std::chrono::duration<double, std::milli> elapsed = std::chrono::steady_clock::now() - turnStart;
     const uint32_t totalVisits = std::accumulate(visitCounts.begin(), visitCounts.end(), uint32_t{0});
     std::println("[bot] ply {}: {} -> {}{}  {}/{} visits over {} moves in {:.0f} ms ({:.2f} s)",
         context.board.plyCount,
-        chosenMove->sourcePosition,
-        chosenMove->destinationPosition,
-        chosenMove->move.splitsStack ? " sow" : "",
+        arenaMove.from_pos,
+        arenaMove.to_pos,
+        chosenMove.splitsStack ? " sow" : "",
         visitCounts[chosenMoveId], totalVisits,
         context.board.legalMoveCount,
         elapsed.count(),
         elapsed.count() / 1000.0
     );
-    return *chosenMove;
+    return chosenMove;
 }
 
 void loadCheckpoint(BotContext& context)
@@ -223,7 +242,7 @@ void onGameStart(const arena_game_state_t* state, void* userData)
     runGuardedCallback("on_game_start", [&] {
         BotContext& context = *static_cast<BotContext*>(userData);
 
-        context.board = boardFromArena(*state);
+        context.board = Board(*state);
         context.outcome.reset();
         context.plyCount = context.board.plyCount;
         context.positionHistory.assign(1, context.board.positionHash);
@@ -247,20 +266,17 @@ void onMove(const arena_game_state_t* state, arena_move_t* output, void* userDat
 
         synchronizeWithServer(context, *state);
 
-        const std::vector<ArenaMove> serverMoves = movesFromArena(*state, context.board);
-        if (serverMoves.empty())
+        if (context.board.legalMoveCount == 0)
         {
             std::println(stderr, "[bot] no usable move in the server's list for {}", state->board);
             return;
         }
 
-        const ArenaMove& chosenMove = selectMove(context, serverMoves, turnStart);
+        const Move chosenMove = selectMove(context, turnStart);
 
-        // The SDK owns these strings for the duration of the callback, and they
-        // carry the server's own spelling of the move.
-        *output = moveToArena(chosenMove);
+        *output = chosenMove.toArena(context.board.hexes[chosenMove.sourceCoord].height());
 
-        advanceLocalGame(context, chosenMove.move);
+        advanceLocalGame(context, chosenMove);
     });
 }
 
@@ -411,18 +427,18 @@ int runBot(const std::filesystem::path& weights)
 
 } // namespace
 
-} // namespace amoeba
+} // namespace amoeba_bot
 
 int main(int argc, char** argv)
 {
     if (argc == 3 && std::string_view{argv[1]} == "--train")
     {
-        amoeba::runTraining(std::filesystem::path{argv[2]});
+        amoeba_bot::runTraining(std::filesystem::path{argv[2]});
         return EXIT_SUCCESS;
     }
 
     if (argc == 2 && std::string_view{argv[1]} != "--train")
-        return amoeba::runBot(std::filesystem::path{argv[1]});
+        return amoeba_bot::runBot(std::filesystem::path{argv[1]});
 
     std::println(stderr, "usage: amoeba_bot <weights.safetensors>");
     std::println(stderr, "       amoeba_bot --train <weights.safetensors>");

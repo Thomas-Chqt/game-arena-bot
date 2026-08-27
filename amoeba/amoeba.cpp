@@ -6,10 +6,11 @@
 #include <cstdlib>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 
-namespace amoeba
+namespace amoeba_bot
 {
 
 namespace
@@ -62,13 +63,6 @@ constexpr uint64_t zobristValue(uint8_t hex, uint8_t depth, Piece piece)
     return zobristTable.pieces[hex][depth][static_cast<uint8_t>(piece)];
 }
 
-} // namespace
-
-// ---------------------------------------------------------------------------
-
-namespace
-{
-
 uint64_t computeHash(const Board& board)
 {
     uint64_t hash = 0;
@@ -99,7 +93,17 @@ void refreshKernelPositions(Board& board)
     }
 }
 
-// ---------------------------------------------------------------------------
+constexpr bool isControlledBy(const Board& board, uint8_t hexIdx, bool white)
+{
+    assert(hexIdx < hexCount);
+    const Piece topPiece = board.hexes[hexIdx].topPiece();
+    return topPiece != Piece::empty && isWhitePiece(topPiece) == white;
+}
+
+constexpr bool isControlledByMover(const Board& board, uint8_t hexIdx)
+{
+    return isControlledBy(board, hexIdx, board.whiteToMove);
+}
 
 bool isKernelAttacked(const Board& board, uint8_t kernelHex, bool attackerIsWhite)
 {
@@ -109,18 +113,18 @@ bool isKernelAttacked(const Board& board, uint8_t kernelHex, bool attackerIsWhit
     // along the opposite direction.
     for (uint8_t outwardDirection = 0; outwardDirection < directionCount; ++outwardDirection)
     {
-        int8_t attackerHex = static_cast<int8_t>(kernelHex);
+        std::optional<uint8_t> attackerHex = kernelHex;
         for (uint8_t distance = 1; distance <= maximumMovableStackHeight; ++distance)
         {
-            attackerHex = neighboringHexes[attackerHex][outwardDirection];
-            if (attackerHex < 0)
+            attackerHex = neighboringHex(attackerHex.value(), directions[outwardDirection]);
+            if (!attackerHex.has_value())
                 break;
 
-            const Hex& attacker = board.hexes[attackerHex];
+            const Hex& attacker = board.hexes[attackerHex.value()];
             const uint8_t attackerHeight = attacker.height();
             if (attackerHeight == 0)
                 continue;
-            if (!board.isControlledBy(static_cast<uint8_t>(attackerHex), attackerIsWhite))
+            if (!isControlledBy(board, attackerHex.value(), attackerIsWhite))
                 continue;
 
             const uint8_t attackDirection = oppositeDirection(outwardDirection);
@@ -134,7 +138,7 @@ bool isKernelAttacked(const Board& board, uint8_t kernelHex, bool attackerIsWhit
             // encountered earlier on its path.
             const bool canSplitOverKernel =
                 attackerHeight >= 2 && attackerHeight >= distance &&
-                destinationHex(static_cast<uint8_t>(attackerHex), attackDirection, attackerHeight) >= 0;
+                destinationHex(attackerHex.value(), directions[attackDirection], attackerHeight).has_value();
             if (canSplitOverKernel)
             {
                 const Piece landingPiece = attacker.pieceAt(static_cast<uint8_t>(distance - 1));
@@ -146,34 +150,33 @@ bool isKernelAttacked(const Board& board, uint8_t kernelHex, bool attackerIsWhit
     return false;
 }
 
-// ---------------------------------------------------------------------------
-
 Board applyMoveWithoutDeterminingOutcome(const Board& board, Move move)
 {
-    assert(move.sourceHex < hexCount);
+    assert(move.sourceCoord < hexCount);
     assert(move.direction < directionCount);
-    assert(!board.hexes[move.sourceHex].isEmpty());
-    assert(board.controls(move.sourceHex));
+    assert(!board.hexes[move.sourceCoord].isEmpty());
+    assert(isControlledByMover(board, move.sourceCoord));
 
-    const uint8_t stackHeight = board.hexes[move.sourceHex].height();
-    const int8_t destination = destinationHex(move.sourceHex, move.direction, stackHeight);
-    assert(destination >= 0);
+    const uint8_t stackHeight = board.hexes[move.sourceCoord].height();
+    const std::optional<uint8_t> destination =
+        destinationHex(move.sourceCoord, directions[move.direction], stackHeight);
+    assert(destination.has_value());
     assert(!move.splitsStack || stackHeight >= 2);
 
     Board result = board;
     result.clearLegal();
-    Hex& sourceStack = result.hexes[move.sourceHex];
+    Hex& sourceStack = result.hexes[move.sourceCoord];
 
     // Only the last hex of the path counts: intermediate captures made during a
     // sow do not reset the staleness counter.
-    const Piece previousTopPiece = board.hexes[destination].topPiece();
+    const Piece previousTopPiece = board.hexes[destination.value()].topPiece();
     const bool capturedStack = previousTopPiece != Piece::empty && isWhitePiece(previousTopPiece) != board.whiteToMove;
 
     Piece movedPieces[maximumStackHeight];
     for (uint8_t depth = 0; depth < stackHeight; ++depth)
     {
         movedPieces[depth] = sourceStack.pieceAt(depth);
-        result.positionHash ^= zobristValue(move.sourceHex, depth, movedPieces[depth]);
+        result.positionHash ^= zobristValue(move.sourceCoord, depth, movedPieces[depth]);
     }
     sourceStack.clear();
 
@@ -191,15 +194,15 @@ Board applyMoveWithoutDeterminingOutcome(const Board& board, Move move)
     if (!move.splitsStack)
     {
         for (uint8_t depth = 0; depth < stackHeight; ++depth)
-            placePiece(static_cast<uint8_t>(destination), movedPieces[depth]);
+            placePiece(destination.value(), movedPieces[depth]);
     }
     else
     {
-        int8_t currentHex = static_cast<int8_t>(move.sourceHex);
+        uint8_t currentHex = move.sourceCoord;
         for (uint8_t depth = 0; depth < stackHeight; ++depth)
         {
-            currentHex = neighboringHexes[currentHex][move.direction];
-            placePiece(static_cast<uint8_t>(currentHex), movedPieces[depth]);
+            currentHex = neighboringHex(currentHex, directions[move.direction]).value();
+            placePiece(currentHex, movedPieces[depth]);
         }
     }
 
@@ -219,7 +222,7 @@ void generateLegalMoves(Board& board)
 
     for (uint8_t sourceHex = 0; sourceHex < hexCount; ++sourceHex)
     {
-        if (!board.controls(sourceHex))
+        if (!isControlledByMover(board, sourceHex))
             continue;
 
         const uint8_t stackHeight = board.hexes[sourceHex].height();
@@ -228,7 +231,7 @@ void generateLegalMoves(Board& board)
         {
             // Both move types have the same endpoint. A stack taller than six can
             // never have a valid endpoint on this board and is permanently frozen.
-            if (destinationHex(sourceHex, direction, stackHeight) < 0)
+            if (!destinationHex(sourceHex, directions[direction], stackHeight).has_value())
                 continue;
 
             for (bool splitsStack : {false, true})
@@ -245,7 +248,7 @@ void generateLegalMoves(Board& board)
 
                 // A split can expose an opposing piece above the mover's own
                 // kernel. That is an immediate loss of control, not merely check.
-                if (nextBoard.isControlledBy(moverKernel, !moverIsWhite))
+                if (isControlledBy(nextBoard, moverKernel, !moverIsWhite))
                     continue;
 
                 // The server requires the mover's kernel to be safe even if this
@@ -259,13 +262,6 @@ void generateLegalMoves(Board& board)
         }
     }
 }
-
-} // namespace
-
-// ---------------------------------------------------------------------------
-
-namespace
-{
 
 // Both adjudicated endings score the same way: most controlled stacks, then most
 // enemy pieces held inside those stacks, then a draw.
@@ -299,6 +295,41 @@ Outcome adjudicate(const Board& board)
     return Outcome::draw;
 }
 
+std::optional<uint8_t> parseArenaHexIndex(std::string_view coordinate)
+{
+    const size_t comma = coordinate.find(',');
+    if (comma == std::string_view::npos)
+        return std::nullopt;
+
+    int q{};
+    int r{};
+    if (std::from_chars(coordinate.data(), coordinate.data() + comma, q).ec != std::errc{})
+        return std::nullopt;
+    if (std::from_chars(coordinate.data() + comma + 1,
+                        coordinate.data() + coordinate.size(), r).ec != std::errc{})
+        return std::nullopt;
+    return hexIndex(Coordinate{static_cast<int8_t>(q), static_cast<int8_t>(r)});
+}
+
+// The engine indexes a move by direction while the SDK names its destination.
+std::optional<uint8_t> directionToArenaDestination(uint8_t sourceHex, uint8_t destinationIndex, uint8_t distance)
+{
+    for (uint8_t direction = 0; direction < directionCount; ++direction)
+    {
+        if (destinationHex(sourceHex, directions[direction], distance) == destinationIndex)
+            return direction;
+    }
+    return std::nullopt;
+}
+
+// Swapping colours for Black lands exactly on the Piece enum's own numbering, so
+// the perspective code is just the swapped enum value: 0 empty, 1 my normal,
+// 2 my kernel, 3 their normal, 4 their kernel.
+constexpr int perspectiveCode(Piece piece, bool whiteToMove)
+{
+    return static_cast<int>(whiteToMove ? piece : colorSpwaped(piece));
+}
+
 } // namespace
 
 MoveResult applyMove(const Board& board, Move move, std::span<const uint64_t> positionHistory)
@@ -311,8 +342,8 @@ MoveResult applyMove(const Board& board, Move move, std::span<const uint64_t> po
     // Kernel capture. Check both: a split can lose you your own kernel.
     const uint8_t opponentKernel = moverIsWhite ? result.blackKernelIndex : result.whiteKernelIndex;
     const uint8_t moverKernel = moverIsWhite ? result.whiteKernelIndex : result.blackKernelIndex;
-    const bool opponentKernelCaptured = result.isControlledBy(opponentKernel, moverIsWhite);
-    const bool moverKernelCaptured = result.isControlledBy(moverKernel, !moverIsWhite);
+    const bool opponentKernelCaptured = isControlledBy(result, opponentKernel, moverIsWhite);
+    const bool moverKernelCaptured = isControlledBy(result, moverKernel, !moverIsWhite);
 
     if (opponentKernelCaptured || moverKernelCaptured)
     {
@@ -352,18 +383,11 @@ MoveResult applyMove(const Board& board, Move move, std::span<const uint64_t> po
     return result;
 }
 
-// ---------------------------------------------------------------------------
-
-Board createStartingBoard()
+Board::Board(const arena_game_state_t& state)
 {
-    return parseBoard("-3,1:W;-3,3:W;-2,-1:B;-2,1:W;-2,3:W;-1,-1:B;-1,1:W;-1,2:WK;-1,3:W;0,-3:B;0,-1:B;0,1:W;"
-                      "0,3:W;1,-3:B;1,-2:BK;1,-1:B;1,1:W;2,-3:B;2,-1:B;2,1:W;3,-3:B;3,-1:B");
-}
-
-Board parseBoard(const std::string& serializedBoard, bool whiteToMove)
-{
-    Board board{};
-    board.whiteToMove = whiteToMove;
+    assert(state.board != nullptr);
+    whiteToMove = state.current_turn == ARENA_SIDE_WHITE;
+    const std::string_view serializedBoard{state.board};
 
     size_t entryStart = 0;
     while (entryStart < serializedBoard.size())
@@ -372,18 +396,26 @@ Board parseBoard(const std::string& serializedBoard, bool whiteToMove)
         if (entryEnd == std::string::npos)
             entryEnd = serializedBoard.size();
 
-        const std::string entry = serializedBoard.substr(entryStart, entryEnd - entryStart);
+        const std::string_view entry = serializedBoard.substr(entryStart, entryEnd - entryStart);
         const size_t colon = entry.find(':');
         const size_t comma = entry.find(',');
         if (colon != std::string::npos && comma != std::string::npos && comma < colon)
         {
-            const int q = std::atoi(entry.substr(0, comma).c_str());
-            const int r = std::atoi(entry.substr(comma + 1, colon - comma - 1).c_str());
-            const int8_t hex = hexIndex(q, r);
-            if (hex >= 0)
+            int q{};
+            int r{};
+            const std::string_view qText = entry.substr(0, comma);
+            const std::string_view rText = entry.substr(comma + 1, colon - comma - 1);
+            const bool validQ = std::from_chars(qText.data(), qText.data() + qText.size(), q).ec == std::errc{};
+            const bool validR = std::from_chars(rText.data(), rText.data() + rText.size(), r).ec == std::errc{};
+            const bool coordinateInRange = q >= -boardRadius && q <= boardRadius
+                && r >= -boardRadius && r <= boardRadius;
+            const std::optional<uint8_t> hex = validQ && validR && coordinateInRange
+                ? hexIndex(Coordinate{static_cast<int8_t>(q), static_cast<int8_t>(r)})
+                : std::nullopt;
+            if (hex.has_value())
             {
                 // Stack letters run bottom to top: W, B, WK, BK.
-                const std::string stackText = entry.substr(colon + 1);
+                const std::string_view stackText = entry.substr(colon + 1);
                 for (size_t character = 0; character < stackText.size(); ++character)
                 {
                     const bool isKernel = character + 1 < stackText.size() && stackText[character + 1] == 'K';
@@ -394,7 +426,7 @@ Board parseBoard(const std::string& serializedBoard, bool whiteToMove)
                         piece = isKernel ? Piece::blackKernel : Piece::black;
 
                     if (piece != Piece::empty)
-                        board.hexes[hex].pushPiece(piece);
+                        hexes[hex.value()].pushPiece(piece);
                     if (isKernel)
                         ++character;
                 }
@@ -403,123 +435,59 @@ Board parseBoard(const std::string& serializedBoard, bool whiteToMove)
         entryStart = entryEnd + 1;
     }
 
-    refreshKernelPositions(board);
-    board.positionHash = computeHash(board);
-    generateLegalMoves(board);
-    return board;
-}
+    refreshKernelPositions(*this);
+    positionHash = computeHash(*this);
 
-namespace
-{
-
-int8_t parseArenaHexIndex(std::string_view coordinate)
-{
-    const size_t comma = coordinate.find(',');
-    if (comma == std::string_view::npos)
-        return -1;
-
-    int q{};
-    int r{};
-    if (std::from_chars(coordinate.data(), coordinate.data() + comma, q).ec != std::errc{})
-        return -1;
-    if (std::from_chars(coordinate.data() + comma + 1,
-                        coordinate.data() + coordinate.size(), r).ec != std::errc{})
-        return -1;
-    return hexIndex(q, r);
-}
-
-// The engine indexes a move by direction while the SDK names its destination.
-std::optional<uint8_t> directionToArenaDestination(
-    uint8_t sourceHex, uint8_t destinationIndex, uint8_t distance)
-{
-    for (uint8_t direction = 0; direction < directionCount; ++direction)
+    if (state.legal_moves == nullptr)
     {
-        if (destinationHex(sourceHex, direction, distance)
-            == static_cast<int8_t>(destinationIndex))
-            return direction;
+        assert(state.legal_moves_count == 0);
+        generateLegalMoves(*this);
+        return;
     }
-    return std::nullopt;
-}
 
-} // namespace
-
-Board boardFromArena(const arena_game_state_t& state)
-{
-    return parseBoard(state.board, state.current_turn == ARENA_SIDE_WHITE);
-}
-
-std::vector<ArenaMove> movesFromArena(const arena_game_state_t& state, const Board& board)
-{
-    std::vector<ArenaMove> moves;
-    for (const arena_piece_moves_t& piece :
-         std::span(state.legal_moves, state.legal_moves_count))
+    for (const arena_piece_moves_t& piece : std::span(state.legal_moves, state.legal_moves_count))
     {
-        const int8_t sourceHex = parseArenaHexIndex(piece.pos);
-        if (sourceHex < 0)
+        assert(piece.pos != nullptr);
+        const std::optional<uint8_t> sourceHex = parseArenaHexIndex(piece.pos);
+        if (!sourceHex.has_value())
             continue;
 
-        const uint8_t stackHeight = board.hexes[sourceHex].height();
+        const uint8_t stackHeight = hexes[sourceHex.value()].height();
         if (stackHeight == 0)
             continue;
 
-        // A one-piece stack sows and moves identically, so the engine only uses
-        // the whole-stack form even if the SDK includes a splitting flag.
-        const bool splitsStack = piece.splitting && stackHeight >= 2;
-
-        for (const char* destination :
-             std::span(piece.valid_moves, piece.valid_moves_count))
+        assert(piece.has_splitting);
+        assert(piece.valid_moves != nullptr || piece.valid_moves_count == 0);
+        for (const char* destination : std::span(piece.valid_moves, piece.valid_moves_count))
         {
-            const int8_t destinationIndex = parseArenaHexIndex(destination);
-            if (destinationIndex < 0)
+            assert(destination != nullptr);
+            const std::optional<uint8_t> destinationIndex = parseArenaHexIndex(destination);
+            if (!destinationIndex.has_value())
                 continue;
 
             const std::optional<uint8_t> direction = directionToArenaDestination(
-                static_cast<uint8_t>(sourceHex), static_cast<uint8_t>(destinationIndex),
-                stackHeight);
+                sourceHex.value(), destinationIndex.value(), stackHeight);
             if (!direction.has_value())
                 continue;
 
-            moves.push_back(ArenaMove{
-                Move{static_cast<uint8_t>(sourceHex), *direction, splitsStack},
-                piece.pos, destination, piece.splitting});
+            const Move move{sourceHex.value(), direction.value(), piece.splitting};
+            if (!isLegal(move.id()))
+            {
+                setLegal(move.id());
+                ++legalMoveCount;
+            }
         }
     }
-    return moves;
 }
 
-arena_move_t moveToArena(const ArenaMove& move)
+mlx::core::array Board::tensorEncoding() const
 {
-    return arena_move_t{
-        .from_pos = move.sourcePosition,
-        .to_pos = move.destinationPosition,
-        .side = nullptr,
-        .splitting = move.serverSplittingFlag,
-    };
-}
-
-// ===========================================================================
-// Board -> network input
-// ===========================================================================
-
-namespace
-{
-
-// Swapping colours for Black lands exactly on the Piece enum's own numbering, so
-// the perspective code is just the swapped enum value: 0 empty, 1 my normal,
-// 2 my kernel, 3 their normal, 4 their kernel.
-constexpr int perspectiveCode(Piece piece, bool whiteToMove)
-{
-    return static_cast<int>(whiteToMove ? piece : swappedPieceColors[static_cast<uint8_t>(piece)]);
-}
-
-} // namespace
-
-void encodeBoard(const Board& board, std::span<float, encodedBoardSize> output)
-{
-    assert(board.repetitionCount >= 1);
+    assert(repetitionCount >= 1);
+    std::array<float, encodedBoardSize> encoded{};
+    const std::span<float, encodedBoardSize> output{encoded};
     std::ranges::fill(output, 0.0f);
 
-    const bool moverIsWhite = board.whiteToMove;
+    const bool moverIsWhite = whiteToMove;
     const float countScale = 1.0f / piecesPerPlayer;
 
     int ownStackCount = 0;
@@ -531,8 +499,8 @@ void encodeBoard(const Board& board, std::span<float, encodedBoardSize> output)
     {
         const std::span<float, featuresPerHex> hexFeatures{output.data() + (hexIdx * featuresPerHex), featuresPerHex};
 
-        const uint8_t absoluteHexIdx = moverIsWhite ? static_cast<uint8_t>(hexIdx) : rotatedHexes[hexIdx];
-        const Hex& stack = board.hexes[absoluteHexIdx];
+        const uint8_t absoluteHexIdx = moverIsWhite ? static_cast<uint8_t>(hexIdx) : rotatedHex(hexIdx);
+        const Hex& stack = hexes[absoluteHexIdx];
         const uint8_t stackHeight = stack.height();
 
         // pieceAt() reports empty past the top, so short stacks pad themselves.
@@ -582,24 +550,26 @@ void encodeBoard(const Board& board, std::span<float, encodedBoardSize> output)
             {
                 const Move move{absoluteHexIdx, absoluteDirection, splitsStack != 0};
                 hexFeatures[legalMovesOffset + relativeDirection * 2 + splitsStack] =
-                    board.isLegal(move.id()) ? 1.0f : 0.0f;
+                    isLegal(move.id()) ? 1.0f : 0.0f;
             }
         }
     }
 
     const std::span<float, globalFeatureCount> globalFeatures{output.data() + hexCount * featuresPerHex, globalFeatureCount};
 
-    globalFeatures[globalMoveNumberIndex] = std::min<float>(static_cast<float>(board.plyCount), moveLimit) / moveLimit;
-    globalFeatures[globalStalenessIndex] = std::min<float>(static_cast<float>(board.stalenessCount), stalenessLimit) / stalenessLimit;
-    globalFeatures[globalRepetitionIndex] = std::min<float>(static_cast<float>(board.repetitionCount - 1), repetitionLimit - 1) / (repetitionLimit - 1);
+    globalFeatures[globalMoveNumberIndex] = std::min<float>(static_cast<float>(plyCount), moveLimit) / moveLimit;
+    globalFeatures[globalStalenessIndex] = std::min<float>(static_cast<float>(stalenessCount), stalenessLimit) / stalenessLimit;
+    globalFeatures[globalRepetitionIndex] = std::min<float>(static_cast<float>(repetitionCount - 1), repetitionLimit - 1) / (repetitionLimit - 1);
 
     globalFeatures[globalOwnStackCountIndex] = static_cast<float>(ownStackCount) * countScale;
     globalFeatures[globalOpponentStackCountIndex] = static_cast<float>(opponentStackCount) * countScale;
     globalFeatures[globalOwnPrisonerCountIndex] = static_cast<float>(ownPrisonerCount) * countScale;
     globalFeatures[globalOpponentPrisonerCountIndex] = static_cast<float>(opponentPrisonerCount) * countScale;
-    globalFeatures[globalInCheckIndex] = isKernelAttacked(board, board.ownKernelIndex(), !moverIsWhite) ? 1.0f : 0.0f;
+    const uint8_t ownKernelIndex = moverIsWhite ? whiteKernelIndex : blackKernelIndex;
+    globalFeatures[globalInCheckIndex] = isKernelAttacked(*this, ownKernelIndex, !moverIsWhite) ? 1.0f : 0.0f;
 
     assert(std::ranges::all_of(output, [](float value) { return value >= 0.0f && value <= 1.0f; }));
+    return mlx::core::array(encoded.data(), mlx::core::Shape{encodedBoardSize}, mlx::core::float32);
 }
 
-} // namespace amoeba
+} // namespace amoeba_bot

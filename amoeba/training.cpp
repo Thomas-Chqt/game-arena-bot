@@ -24,11 +24,22 @@
 #include <string>
 #include <vector>
 
-namespace amoeba
+namespace amoeba_bot
 {
 
 namespace
 {
+
+uint16_t policyIndexToMoveId(uint16_t policyIndex, bool whiteToMove)
+{
+    Move move = Move::fromId(policyIndex);
+    if (!whiteToMove)
+    {
+        move.sourceCoord = rotatedHex(move.sourceCoord);
+        move.direction = oppositeDirection(move.direction);
+    }
+    return move.id();
+}
 
 // std::println leaves stdout block-buffered whenever it is not a terminal, so a
 // redirected run shows nothing at all until the buffer fills - which for short
@@ -108,7 +119,7 @@ uint16_t selectMoveFromVisits(const VisitCounts& visitCounts, int plyCount, int 
     assert(totalVisits > 0);
 
     uint64_t remaining = std::uniform_int_distribution<uint64_t>{0, totalVisits - 1}(randomEngine);
-    for (uint16_t moveId = 0; moveId < amoeba::moveIdCount; ++moveId)
+    for (uint16_t moveId = 0; moveId < moveIdCount; ++moveId)
     {
         if (visitCounts[moveId] > remaining)
             return moveId;
@@ -127,8 +138,8 @@ struct NetworkPairing
 // One game in flight.
 struct ActiveGame
 {
-    amoeba::Board board;
-    std::optional<amoeba::Outcome> outcome;
+    Board board;
+    std::optional<Outcome> outcome;
     std::vector<uint64_t> positionHistory;
     std::vector<TrainingSample> trainingSamples;
     std::mt19937_64 randomEngine;
@@ -148,7 +159,7 @@ struct ActiveGame
 
     // Set fresh each round: the leaf this game cannot go on without, which
     // network owes it the answer, and where it sits in that network's batch.
-    const amoeba::Board* pendingLeaf = nullptr;
+    const Board* pendingLeaf = nullptr;
     int networkIndex = 0;
     size_t evaluationBatchOffset = 0;
 };
@@ -186,7 +197,7 @@ private:
 void GameBatchRunner::initializeGame(ActiveGame& game, int gameId, NetworkPairing pairing, uint64_t seed) const
 {
     game.gameId = gameId;
-    game.board = amoeba::createStartingBoard();
+    game.board = Board::startingBoard();
     game.pairing = pairing;
     game.isActive = true;
     game.startTime = std::chrono::steady_clock::now();
@@ -218,7 +229,7 @@ void GameBatchRunner::advanceUntilEvaluation(ActiveGame& game) const
     while (!game.outcome.has_value())
     {
         const int networkIndex = game.board.whiteToMove ? game.pairing.whiteNetwork : game.pairing.blackNetwork;
-        if (const amoeba::Board* leaf = game.search->pendingLeaf())
+        if (const Board* leaf = game.search->pendingLeaf())
         {
             game.networkIndex = networkIndex;
             game.pendingLeaf = leaf;
@@ -230,15 +241,15 @@ void GameBatchRunner::advanceUntilEvaluation(ActiveGame& game) const
 
         const uint16_t chosenMoveId =
             selectMoveFromVisits(visitCounts, game.board.plyCount, m_samplingPlies, game.randomEngine);
-        amoeba::MoveResult result =
-            amoeba::applyMove(game.board, amoeba::Move::fromId(chosenMoveId), game.positionHistory);
-        if (const auto* outcome = std::get_if<amoeba::Outcome>(&result))
+        MoveResult result =
+            applyMove(game.board, Move::fromId(chosenMoveId), game.positionHistory);
+        if (const auto* outcome = std::get_if<Outcome>(&result))
         {
             game.outcome = *outcome;
             break;
         }
 
-        game.board = std::get<amoeba::Board>(std::move(result));
+        game.board = std::get<Board>(std::move(result));
         game.positionHistory.push_back(game.board.positionHash);
         startSearch(game);
     }
@@ -258,7 +269,7 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
     int completedGameCount = 0;
     int startedGameCount = 0;
 
-    std::vector<std::vector<const amoeba::Board*>> pendingBoardsByNetwork(m_networks.size());
+    std::vector<std::vector<const Board*>> pendingBoardsByNetwork(m_networks.size());
     std::vector<std::vector<Evaluation>> evaluationsByNetwork(m_networks.size());
 
     report("[{}] {} games, {} in flight, at {} simulations", label, gameCount, activeGames.size(),
@@ -304,7 +315,7 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
     for (;;)
     {
         size_t gatheredBoardCount = 0;
-        for (std::vector<const amoeba::Board*>& batch : pendingBoardsByNetwork)
+        for (std::vector<const Board*>& batch : pendingBoardsByNetwork)
             batch.clear();
 
         for (ActiveGame& game : activeGames)
@@ -312,7 +323,7 @@ void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t
             if (!game.isActive || game.pendingLeaf == nullptr)
                 continue;
 
-            std::vector<const amoeba::Board*>& batch =
+            std::vector<const Board*>& batch =
                 pendingBoardsByNetwork[static_cast<size_t>(game.networkIndex)];
             game.evaluationBatchOffset = batch.size();
             batch.push_back(game.pendingLeaf);
@@ -400,7 +411,8 @@ namespace
 TrainingBatch createBatchFromSamples(const std::vector<TrainingSample>& samples, std::span<const size_t> picks)
 {
     const int batchSize = static_cast<int>(picks.size());
-    std::vector<float> input(picks.size() * encodedBoardSize);
+    std::vector<mlx::core::array> input;
+    input.reserve(picks.size());
     std::vector<float> legal(picks.size() * moveIdCount);
     std::vector<float> policy(picks.size() * moveIdCount);
     std::vector<float> outcomes(picks.size());
@@ -408,9 +420,7 @@ TrainingBatch createBatchFromSamples(const std::vector<TrainingSample>& samples,
     for (size_t batchIndex = 0; batchIndex < picks.size(); ++batchIndex)
     {
         const TrainingSample& sample = samples[picks[batchIndex]];
-        encodeBoard(sample.board, std::span<float, encodedBoardSize>(
-                                      input.data() + batchIndex * encodedBoardSize,
-                                      encodedBoardSize));
+        input.push_back(sample.board.tensorEncoding());
 
         // AlphaZero learns the complete search preference, not just the move
         // eventually played, by normalizing all visit counts into probabilities.
@@ -420,12 +430,11 @@ TrainingBatch createBatchFromSamples(const std::vector<TrainingSample>& samples,
             throw std::runtime_error(std::format(
                 "sample {} has no visits, so it has no policy to learn", picks[batchIndex]));
 
-        const std::span<const uint16_t, moveIdCount> moveIdsByPolicyIndex =
-            policyIndicesToMoveIds(sample.board.whiteToMove);
         const size_t policyOffset = batchIndex * moveIdCount;
         for (int policyIndex = 0; policyIndex < moveIdCount; ++policyIndex)
         {
-            const uint16_t moveId = moveIdsByPolicyIndex[policyIndex];
+            const uint16_t moveId = policyIndexToMoveId(
+                static_cast<uint16_t>(policyIndex), sample.board.whiteToMove);
             legal[policyOffset + policyIndex] = sample.board.isLegal(moveId) ? 1.0f : 0.0f;
             policy[policyOffset + policyIndex] =
                 static_cast<float>(sample.visits[moveId]) / static_cast<float>(totalVisits);
@@ -434,7 +443,7 @@ TrainingBatch createBatchFromSamples(const std::vector<TrainingSample>& samples,
     }
 
     return TrainingBatch{
-        mlx::core::array(input.data(), mlx::core::Shape{batchSize, encodedBoardSize}, mlx::core::float32),
+        mlx::core::stack(input),
         mlx::core::array(legal.data(), mlx::core::Shape{batchSize, moveIdCount}, mlx::core::float32),
         mlx::core::array(policy.data(), mlx::core::Shape{batchSize, moveIdCount}, mlx::core::float32),
         mlx::core::array(outcomes.data(), mlx::core::Shape{batchSize}, mlx::core::float32)};
@@ -662,4 +671,4 @@ TrainingSettings::TrainingSettings()
 {
 }
 
-} // namespace amoeba
+} // namespace amoeba_bot

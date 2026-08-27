@@ -1,24 +1,20 @@
-#ifndef AMOEBA_HPP
-#define AMOEBA_HPP
+#pragma once
 
 #include <arena/arena.h>
+
+#include <mlx/array.h>
+#include <mlx/mlx.h>
 
 #include <array>
 #include <bit>
 #include <cassert>
 #include <cstdint>
+#include <optional>
 #include <span>
-#include <string>
 #include <variant>
-#include <vector>
 
-namespace amoeba
+namespace amoeba_bot
 {
-
-// ---------------------------------------------------------------------------
-// Board geometry: radius-3 hex, axial coordinates, 37 cells.
-// Valid iff |q| <= 3, |r| <= 3, |q + r| <= 3.
-// ---------------------------------------------------------------------------
 
 inline constexpr int boardRadius = 3;
 inline constexpr int hexCount = 37;
@@ -29,313 +25,9 @@ inline constexpr int maximumMovableStackHeight = 6;
 inline constexpr int moveIdCount = hexCount * directionCount * 2;
 inline constexpr int legalMoveWordCount = (moveIdCount + 63) / 64;
 
-struct Coordinate
-{
-    int8_t q{};
-    int8_t r{};
-    constexpr auto operator<=>(const Coordinate&) const = default;
-};
-
-struct Direction
-{
-    int8_t q{};
-    int8_t r{};
-    constexpr auto operator<=>(const Direction&) const = default;
-};
-
-// Opposite directions are three positions apart. The same mapping is used when
-// rotating a position into Black's perspective.
-inline constexpr std::array<Direction, directionCount> directions = { {
-    {  1,  0 }, // 0 east
-    {  1, -1 }, // 1 northeast
-    {  0, -1 }, // 2 northwest
-    { -1,  0 }, // 3 west
-    { -1,  1 }, // 4 southwest
-    {  0,  1 }, // 5 southeast
-}};
-
-constexpr uint8_t oppositeDirection(uint8_t direction)
-{
-    assert(direction < directionCount);
-    return static_cast<uint8_t>((direction + directionCount / 2) % directionCount);
-}
-
-inline constexpr auto coordinates = [] -> std::array<Coordinate, hexCount>
-{
-    std::array<Coordinate, hexCount> result{};
-    int index = 0;
-    for (int q = -boardRadius; q <= boardRadius; ++q)
-    {
-        for (int r = -boardRadius; r <= boardRadius; ++r)
-        {
-            if (q + r >= -boardRadius && q + r <= boardRadius)
-                result[index++] = Coordinate{static_cast<int8_t>(q), static_cast<int8_t>(r)};
-        }
-    }
-    return result;
-}();
-
-// Reverse lookup: (q + 3) * 7 + (r + 3) -> hex index, or -1 if off board.
-inline constexpr auto coordinateIndices = [] -> std::array<int8_t, 49>
-{
-    std::array<int8_t, 49> table{};
-    for (int8_t& index : table)
-        index = -1;
-
-    for (int hex = 0; hex < hexCount; ++hex)
-    {
-        const Coordinate coordinate = coordinates[hex];
-        table[(coordinate.q + boardRadius) * 7 + (coordinate.r + boardRadius)] = static_cast<int8_t>(hex);
-    }
-    return table;
-}();
-
-constexpr int8_t hexIndex(int q, int r)
-{
-    if (q < -boardRadius || q > boardRadius || r < -boardRadius || r > boardRadius)
-        return -1;
-    return coordinateIndices[(q + boardRadius) * 7 + (r + boardRadius)];
-}
-
-// Step one hex from a source in a direction. A negative entry leaves the board.
-inline constexpr auto neighboringHexes = [] -> std::array<std::array<int8_t, directionCount>, hexCount>
-{
-    std::array<std::array<int8_t, directionCount>, hexCount> table{};
-    for (int hex = 0; hex < hexCount; ++hex) {
-        for (int direction = 0; direction < directionCount; ++direction) {
-            table[hex][direction] = hexIndex(coordinates[hex].q + directions[direction].q, coordinates[hex].r + directions[direction].r);
-        }
-    }
-    return table;
-}();
-
-// 180-degree rotation: (q, r) -> (-q, -r).
-inline constexpr auto rotatedHexes = [] -> std::array<uint8_t, hexCount>
-{
-    std::array<uint8_t, hexCount> table{};
-    for (int hex = 0; hex < hexCount; ++hex)
-        table[hex] = static_cast<uint8_t>(hexIndex(-coordinates[hex].q, -coordinates[hex].r));
-    return table;
-}();
-
-// ---------------------------------------------------------------------------
-// Pieces
-// ---------------------------------------------------------------------------
-
-// Public-facing codes. Empty exists here but is never stored in a packed stack;
-// a slot is empty iff its depth >= height.
-enum class Piece : uint8_t
-{
-    empty       = 0,
-    white       = 1,
-    whiteKernel = 2,
-    black       = 3,
-    blackKernel = 4,
-};
-
-constexpr bool isWhitePiece(Piece piece)
-{
-    return piece == Piece::white || piece == Piece::whiteKernel;
-}
-
-// Indexed by Piece's underlying value.
-inline constexpr std::array<Piece, 5> swappedPieceColors = {
-    Piece::empty,
-    Piece::black,
-    Piece::blackKernel,
-    Piece::white,
-    Piece::whiteKernel
-};
-
-// ---------------------------------------------------------------------------
-// Hex: a stack packed into a single 64-bit word.
-//
-// bits  0..43  : 22 slots x 2 bits, bottom to top. Slot value is Piece minus 1
-//                (so 0=WN, 1=WK, 2=BN, 3=BK). Slots at or above `height` are junk.
-// bits 44..48  : height, 0..22.
-//
-// Always go through the accessors; the layout is an implementation detail.
-// ---------------------------------------------------------------------------
-
-class Hex
-{
-public:
-    static constexpr int heightShift = 44;
-    static constexpr uint64_t heightMask = 0x1FULL << heightShift;
-
-    constexpr Hex() = default;
-
-    constexpr uint8_t height() const { return static_cast<uint8_t>((m_bits >> heightShift) & 0x1F); }
-
-    constexpr bool isEmpty() const { return height() == 0; }
-
-    // Depth zero is the bottom of the stack. Reading above the top returns empty,
-    // which lets the encoder pad short stacks without a separate branch.
-    constexpr Piece pieceAt(uint8_t depth) const
-    {
-        if (depth >= height())
-            return Piece::empty;
-        return static_cast<Piece>(((m_bits >> (depth * 2)) & 0x3) + 1);
-    }
-
-    // The piece that controls the stack.
-    constexpr Piece topPiece() const
-    {
-        const uint8_t stackHeight = height();
-        return stackHeight == 0 ? Piece::empty : pieceAt(static_cast<uint8_t>(stackHeight - 1));
-    }
-
-    constexpr void pushPiece(Piece piece)
-    {
-        assert(piece != Piece::empty);
-        assert(height() < maximumStackHeight);
-
-        const uint8_t stackHeight = height();
-        const uint64_t encodedPiece = static_cast<uint64_t>(piece) - 1;
-        m_bits &= ~(0x3ULL << (stackHeight * 2));
-        m_bits |= encodedPiece << (stackHeight * 2);
-        setHeight(static_cast<uint8_t>(stackHeight + 1));
-    }
-
-    constexpr void clear() { m_bits = 0; }
-
-    constexpr auto operator<=>(const Hex&) const = default;
-
-private:
-    constexpr void setHeight(uint8_t height)
-    {
-        assert(height <= maximumStackHeight);
-        m_bits = (m_bits & ~heightMask) | (static_cast<uint64_t>(height) << heightShift);
-    }
-
-    uint64_t m_bits{};
-};
-
-static_assert(sizeof(Hex) == 8);
-
-// ---------------------------------------------------------------------------
-// Move
-//
-// The distance travelled is always the stack height, so it is not stored.
-// A move has a stable id in 0..443, which doubles as the policy head index:
-//     id = (sourceHex * 6 + direction) * 2 + splitsStack
-// ---------------------------------------------------------------------------
-
-struct Move
-{
-    uint8_t sourceHex{};
-    uint8_t direction{};
-    bool splitsStack{};
-
-    constexpr uint16_t id() const
-    {
-        assert(sourceHex < hexCount);
-        assert(direction < directionCount);
-        return static_cast<uint16_t>((sourceHex * directionCount + direction) * 2 + (splitsStack ? 1 : 0));
-    }
-
-    static constexpr Move fromId(uint16_t id)
-    {
-        assert(id < moveIdCount);
-        return Move{
-            .sourceHex = static_cast<uint8_t>(id / (directionCount * 2)),
-            .direction = static_cast<uint8_t>((id / 2) % directionCount),
-            .splitsStack = (id & 1) != 0
-        };
-    }
-
-    constexpr auto operator<=>(const Move&) const = default;
-};
-
-// ---------------------------------------------------------------------------
-// Board
-// ---------------------------------------------------------------------------
-
-// Absolute game result, independent of any player's point of view.
-enum class Outcome : uint8_t
-{
-    whiteWins,
-    blackWins,
-    draw,
-};
-
-struct Board
-{
-    Hex hexes[hexCount]{};
-    uint64_t positionHash{};
-
-    // One bit per move id, filled by applyMove(). Doubles as the policy mask:
-    // feed it straight to the network to set illegal logits to -infinity.
-    uint64_t legalMoveBits[legalMoveWordCount]{};
-    uint16_t legalMoveCount{};
-
-    uint8_t whiteKernelIndex{};
-    uint8_t blackKernelIndex{};
-
-    uint16_t plyCount{};
-    uint16_t stalenessCount{};
-    uint8_t repetitionCount{1};
-
-    bool whiteToMove{true};
-
-    constexpr bool isLegal(uint16_t id) const
-    {
-        assert(id < moveIdCount);
-        return ((legalMoveBits[id >> 6] >> (id & 63)) & 1ULL) != 0;
-    }
-
-    constexpr void setLegal(uint16_t id)
-    {
-        assert(id < moveIdCount);
-        legalMoveBits[id >> 6] |= 1ULL << (id & 63);
-    }
-
-    constexpr void clearLegal()
-    {
-        for (uint64_t& word : legalMoveBits)
-            word = 0;
-        legalMoveCount = 0;
-    }
-
-    // Visit every legal move id. fn is called as fn(uint16_t id).
-    //     b.forEachLegal([&](uint16_t id) { Move m = Move::fromId(id); ... });
-    template <typename Callback> constexpr void forEachLegal(Callback&& callback) const
-    {
-        for (int word = 0; word < legalMoveWordCount; ++word)
-        {
-            for (uint64_t remaining = legalMoveBits[word]; remaining != 0; remaining &= remaining - 1)
-            {
-                const int leastSignificantBit = std::countr_zero(remaining);
-                callback(static_cast<uint16_t>(word * 64 + leastSignificantBit));
-            }
-        }
-    }
-
-    constexpr uint8_t ownKernelIndex() const { return whiteToMove ? whiteKernelIndex : blackKernelIndex; }
-    constexpr uint8_t opponentKernelIndex() const { return whiteToMove ? blackKernelIndex : whiteKernelIndex; }
-
-    constexpr bool isControlledBy(uint8_t hexIndex, bool white) const
-    {
-        assert(hexIndex < hexCount);
-        const Piece topPiece = hexes[hexIndex].topPiece();
-        return topPiece != Piece::empty && isWhitePiece(topPiece) == white;
-    }
-
-    // True if the side to move controls this stack.
-    constexpr bool controls(uint8_t hexIndex) const
-    {
-        return isControlledBy(hexIndex, whiteToMove);
-    }
-};
-
-// A move either produces another position that can be played or ends the game.
-// Terminal positions are deliberately not represented as Boards: their legal-move
-// cache would no longer describe moves that may actually be played.
-using MoveResult = std::variant<Board, Outcome>;
-
-// ---------------------------------------------------------------------------
-// Rule parameters, taken from amoeba-reference.md, which mirrors the server.
-// ---------------------------------------------------------------------------
+inline constexpr int encodedStackDepth = maximumMovableStackHeight;
+inline constexpr int pieceCodeCount = 5; // empty, my normal, my kernel, their normal, their kernel
+inline constexpr int heightBucketCount = maximumMovableStackHeight + 2; // 0..6 exactly, then 7-and-up
 
 // Occurrences of the same position - same stacks, same side to move - that draw.
 inline constexpr int repetitionLimit = 3;
@@ -345,98 +37,6 @@ inline constexpr int stalenessLimit = 80;
 
 // Total moves after which the game is adjudicated.
 inline constexpr int moveLimit = 250;
-
-// ---------------------------------------------------------------------------
-// Geometry
-// ---------------------------------------------------------------------------
-
-// Walk `steps` hexes from `start` in direction `dir`. Returns -1 if that leaves
-// the board. The board is convex, so if the endpoint is on the board then every
-// hex along the way is too - which is why both move types need only this check.
-constexpr int8_t destinationHex(uint8_t startHex, uint8_t direction, uint8_t distance)
-{
-    assert(startHex < hexCount);
-    assert(direction < directionCount);
-
-    int8_t currentHex = static_cast<int8_t>(startHex);
-    for (uint8_t step = 0; step < distance; ++step)
-    {
-        currentHex = neighboringHexes[currentHex][direction];
-        if (currentHex < 0)
-            return -1;
-    }
-    return currentHex;
-}
-
-// ---------------------------------------------------------------------------
-// Moves
-// ---------------------------------------------------------------------------
-
-// Full move: returns the next playable Board, or the game's absolute outcome.
-// Pass the hash history - including the hash of `b` itself - to enable
-// repetition detection. Without it, repetition is not checked.
-// Precondition: `move` is legal on `board`.
-MoveResult applyMove(const Board& board, Move move, std::span<const uint64_t> positionHistory = {});
-
-// ---------------------------------------------------------------------------
-// Parsing the server's format, e.g. "-1,1:WK;0,0:WB;1,-1:BK;1,0:W"
-// Stack contents run bottom to top, so "WB" is white with black above it.
-// ---------------------------------------------------------------------------
-
-Board parseBoard(const std::string& serializedBoard, bool whiteToMove = true);
-
-// Keeps the engine move together with the SDK-owned strings required to submit
-// it. The strings remain valid for the duration of the Arena callback.
-struct ArenaMove
-{
-    Move move;
-    const char* sourcePosition;
-    const char* destinationPosition;
-    bool serverSplittingFlag;
-};
-
-// Conversion between the Game Arena SDK representation and the engine types.
-// Game/search code should not need to understand SDK coordinates or flags.
-Board boardFromArena(const arena_game_state_t& state);
-std::vector<ArenaMove> movesFromArena(const arena_game_state_t& state, const Board& board);
-arena_move_t moveToArena(const ArenaMove& move);
-
-// The opening from section 3 of amoeba-reference.md, White to move. Self-play and
-// the encoder test both need it, and two copies of a 22-piece board string would
-// eventually disagree.
-Board createStartingBoard();
-
-// ===========================================================================
-// Board -> network input
-// ===========================================================================
-
-// ---------------------------------------------------------------------------
-// Board -> network input.
-//
-// hexCount blocks of featuresPerHex floats, one block per hex, followed by
-// globalFeatureCount floats describing the position as a whole. Every value is in
-// [0, 1]: the network's first layer weighs all of them against each other, so a
-// feature with a much larger range would drown out the rest.
-//
-// Categories are one-hot rather than a single number, because the network only
-// ever multiplies and adds - given `piece = 3` it would treat a black piece as
-// three times a white one, and a kernel as the midpoint of two normal pieces.
-//
-// Everything is written from the point of view of the side to move: for Black
-// the colours are swapped and the board is rotated 180 degrees, so the network
-// learns the game once instead of once per colour. Block t therefore describes
-// what the mover sees at position t, which is absolute hex rotatedHexes[t] when
-// Black is to move, and direction d in a block means absolute
-// oppositeDirection(d). A policy over this input needs mapping back the same way before it names a move
-// the server will accept.
-// ---------------------------------------------------------------------------
-
-// Stacks taller than maximumMovableStackHeight can never move again, so their
-// internal order can never matter again either. Six slots covers every stack
-// still in play.
-inline constexpr int encodedStackDepth = maximumMovableStackHeight;
-inline constexpr int pieceCodeCount = 5; // empty, my normal, my kernel, their normal, their kernel
-inline constexpr int heightBucketCount = maximumMovableStackHeight + 2; // 0..6 exactly, then 7-and-up
 
 inline constexpr int featuresPerHex =
     encodedStackDepth * pieceCodeCount // stack contents, bottom first: slot d is the piece a sow lands d + 1 hexes away
@@ -469,72 +69,362 @@ inline constexpr int globalOwnPrisonerCountIndex = 5;
 inline constexpr int globalOpponentPrisonerCountIndex = 6;
 inline constexpr int globalInCheckIndex = 7;
 
-// Requires b.legalMoveBits and the kernel cache to be populated - applyMove() and
-// parseBoard() both do it.
-void encodeBoard(const Board& board, std::span<float, encodedBoardSize> output);
-
-// ---------------------------------------------------------------------------
-// Policy space -> absolute move ids
-//
-// encodeBoard() writes the slot for (token, dir) from the absolute move
-// (rotatedHexes[token], oppositeDirection(dir)) when Black is to move, so a
-// policy coming back from the network is indexed in that same flipped space. It has to be
-// permuted before any of it names a move, and before a search's visit counts
-// become a training target.
-//
-// This is the one mapping whose failure is silent: a wrong permutation still
-// gives a valid distribution over legal moves, the loss still falls, and the bot
-// simply plays as though the board were rotated.
-//
-// rotatedHexes and oppositeDirection() are both involutions, so the permutation
-// is its own inverse and the same table maps a target back the other way.
-// ---------------------------------------------------------------------------
-
-inline constexpr auto identityPolicyMapping = [] -> std::array<uint16_t, moveIdCount>
+struct Coordinate
 {
-    std::array<uint16_t, moveIdCount> table{};
-    for (int moveId = 0; moveId < moveIdCount; ++moveId)
-        table[moveId] = static_cast<uint16_t>(moveId);
-    return table;
-}();
+    int8_t q{};
+    int8_t r{};
+    constexpr auto operator<=>(const Coordinate&) const = default;
+};
 
-inline constexpr auto rotatedPolicyMapping = [] -> std::array<uint16_t, moveIdCount>
+struct Direction
 {
-    std::array<uint16_t, moveIdCount> table{};
-    for (int token = 0; token < hexCount; ++token)
+    int8_t q{};
+    int8_t r{};
+    constexpr auto operator<=>(const Direction&) const = default;
+};
+
+inline constexpr std::array<Direction, directionCount> directions{{
+    {  1,  0 }, // 0 east
+    {  1, -1 }, // 1 northeast
+    {  0, -1 }, // 2 northwest
+    { -1,  0 }, // 3 west
+    { -1,  1 }, // 4 southwest
+    {  0,  1 }, // 5 southeast
+}};
+
+inline constexpr uint8_t directionIdx(Direction dir)
+{
+    static constexpr auto table = [] -> std::array<uint8_t, 9>
     {
-        for (uint8_t direction = 0; direction < directionCount; ++direction)
+        std::array<uint8_t, 9> table{};
+        table.fill(directionCount);
+        for (uint8_t index = 0; index < directionCount; ++index)
+            table[(directions[index].q + 1) * 3 + directions[index].r + 1] = index;
+        return table;
+    }();
+
+    assert(dir.q >= -1 && dir.q <= 1 && dir.r >= -1 && dir.r <= 1);
+    const uint8_t index = table[(dir.q + 1) * 3 + dir.r + 1];
+    assert(index < directionCount);
+    return index;
+}
+
+constexpr uint8_t oppositeDirection(uint8_t direction)
+{
+    assert(direction < directionCount);
+    return static_cast<uint8_t>((direction + directionCount / 2) % directionCount);
+}
+
+enum class Piece : uint8_t
+{
+    empty       = 0,
+    white       = 1,
+    whiteKernel = 2,
+    black       = 3,
+    blackKernel = 4,
+};
+
+constexpr bool isWhitePiece(Piece piece)
+{
+    return piece == Piece::white || piece == Piece::whiteKernel;
+}
+
+constexpr Piece colorSpwaped(Piece piece)
+{
+    static constexpr std::array<Piece, 5> table = {
+        Piece::empty,
+        Piece::black,
+        Piece::blackKernel,
+        Piece::white,
+        Piece::whiteKernel
+    };
+    return table[(uint8_t)piece];
+}
+
+class Hex
+{
+  public:
+    static constexpr int heightShift = 44;
+    static constexpr uint64_t heightMask = 0x1FULL << heightShift;
+
+    constexpr Hex() = default;
+
+    constexpr uint8_t height() const
+    {
+        return static_cast<uint8_t>((m_bits >> heightShift) & 0x1F);
+    }
+
+    constexpr bool isEmpty() const
+    {
+        return height() == 0;
+    }
+
+    // Depth zero is the bottom of the stack. Reading above the top returns empty.
+    constexpr Piece pieceAt(uint8_t depth) const
+    {
+        if (depth >= height())
+            return Piece::empty;
+        return static_cast<Piece>(((m_bits >> (depth * 2)) & 0x3) + 1);
+    }
+
+    constexpr Piece topPiece() const
+    {
+        const uint8_t stackHeight = height();
+        return stackHeight == 0 ? Piece::empty : pieceAt(static_cast<uint8_t>(stackHeight - 1));
+    }
+
+    constexpr void pushPiece(Piece piece)
+    {
+        assert(piece != Piece::empty);
+        assert(height() < maximumStackHeight);
+
+        const uint8_t stackHeight = height();
+        const uint64_t encodedPiece = static_cast<uint64_t>(piece) - 1;
+        m_bits &= ~(0x3ULL << (stackHeight * 2));
+        m_bits |= encodedPiece << (stackHeight * 2);
+        setHeight(static_cast<uint8_t>(stackHeight + 1));
+    }
+
+    constexpr void clear() { m_bits = 0; }
+
+    constexpr auto operator<=>(const Hex&) const = default;
+
+  private:
+    constexpr void setHeight(uint8_t height)
+    {
+        assert(height <= maximumStackHeight);
+        m_bits = (m_bits & ~heightMask) | (static_cast<uint64_t>(height) << heightShift);
+    }
+
+    uint64_t m_bits{};
+};
+
+static_assert(sizeof(Hex) == 8);
+
+constexpr Coordinate hexCoord(uint8_t hexIdx)
+{
+    static constexpr auto table = [] -> std::array<Coordinate, hexCount>
+    {
+        std::array<Coordinate, hexCount> result{};
+        int index = 0;
+        for (int q = -boardRadius; q <= boardRadius; ++q)
         {
-            for (int splitsStack = 0; splitsStack < 2; ++splitsStack)
+            for (int r = -boardRadius; r <= boardRadius; ++r)
             {
-                const uint16_t moveId = (token * directionCount + direction) * 2 + splitsStack;
-                const uint16_t rotatedMoveId = static_cast<uint16_t>((rotatedHexes[token] * directionCount + oppositeDirection(direction)) * 2 + splitsStack);
-                table[moveId] = rotatedMoveId;
+                if (q + r >= -boardRadius && q + r <= boardRadius)
+                    result[index++] = Coordinate{static_cast<int8_t>(q), static_cast<int8_t>(r)};
+            }
+        }
+        return result;
+    }();
+    assert(hexIdx < hexCount);
+    return table[hexIdx];
+}
+
+constexpr std::optional<uint8_t> hexIndex(Coordinate coord)
+{
+    static constexpr auto coordinateIndices = [] -> std::array<std::optional<uint8_t>, 49>
+    {
+        std::array<std::optional<uint8_t>, 49> table{};
+        for (std::optional<uint8_t>& index : table)
+            index = std::nullopt;
+        for (int8_t hexIdx = 0; hexIdx < hexCount; ++hexIdx)
+        {
+            const Coordinate coordinate = hexCoord(hexIdx);
+            table[(coordinate.q + boardRadius) * 7 + (coordinate.r + boardRadius)] = hexIdx;
+        }
+        return table;
+    }();
+
+    if (coord.q < -boardRadius || coord.q > boardRadius || coord.r < -boardRadius || coord.r > boardRadius)
+        return std::nullopt;
+    return coordinateIndices[(coord.q + boardRadius) * 7 + (coord.r + boardRadius)];
+}
+
+constexpr std::optional<uint8_t> neighboringHex(uint8_t hexIdx, Direction dir)
+{
+    static constexpr auto table = [] -> std::array<std::array<std::optional<uint8_t>, directionCount>, hexCount>
+    {
+        std::array<std::array<std::optional<uint8_t>, directionCount>, hexCount> table{};
+        for (uint8_t hexIdx = 0; hexIdx < hexCount; ++hexIdx) {
+            for (uint8_t dirIdx = 0; dirIdx < directionCount; ++dirIdx) {
+                table[hexIdx][dirIdx] = hexIndex(Coordinate{
+                    .q = static_cast<int8_t>(hexCoord(hexIdx).q + directions[dirIdx].q),
+                    .r = static_cast<int8_t>(hexCoord(hexIdx).r + directions[dirIdx].r)
+                });
+            }
+        }
+        return table;
+    }();
+    assert(hexIdx < hexCount);
+    return table[hexIdx][directionIdx(dir)];
+}
+
+constexpr std::optional<uint8_t> destinationHex(uint8_t startHexIdx, Direction dir, uint8_t distance)
+{
+    assert(startHexIdx < hexCount);
+
+    uint8_t currentHex = startHexIdx;
+    for (uint8_t step = 0; step < distance; ++step)
+    {
+        std::optional<uint8_t> neighbor = neighboringHex(currentHex, dir);
+        if (neighbor.has_value() == false)
+            return std::nullopt;
+        currentHex = neighbor.value();
+    }
+    return currentHex;
+}
+
+constexpr uint8_t rotatedHex(uint8_t hexIdx)
+{
+    static constexpr auto table = [] -> std::array<uint8_t, hexCount>
+    {
+        std::array<uint8_t, hexCount> table{};
+        for (int hexIdx = 0; hexIdx < hexCount; ++hexIdx) {
+            table[hexIdx] = hexIndex(Coordinate{
+                static_cast<int8_t>(-hexCoord(hexIdx).q),
+                static_cast<int8_t>(-hexCoord(hexIdx).r)
+            }).value();
+        }
+        return table;
+    }();
+    assert(hexIdx < hexCount);
+    return table[hexIdx];
+}
+
+struct Board
+{
+    Hex hexes[hexCount]{};
+    uint64_t positionHash{};
+
+    uint64_t legalMoveBits[legalMoveWordCount]{};
+    uint16_t legalMoveCount{};
+
+    uint8_t whiteKernelIndex{};
+    uint8_t blackKernelIndex{};
+
+    uint16_t plyCount{};
+    uint16_t stalenessCount{};
+    uint8_t repetitionCount{1};
+
+    bool whiteToMove{true};
+
+    constexpr Board() = default;
+
+    // if `*legal_moves` is null, it will be generated internally
+    // `my_side` is ignored
+    Board(const arena_game_state_t&);
+
+    static Board startingBoard()
+    {
+        static const char* boardString =
+            "-3,1:W;-3,3:W;-2,-1:B;-2,1:W;-2,3:W;-1,-1:B;-1,1:W;-1,2:WK;-1,3:W;0,-3:B;0,-1:B;0,1:W;"
+            "0,3:W;1,-3:B;1,-2:BK;1,-1:B;1,1:W;2,-3:B;2,-1:B;2,1:W;3,-3:B;3,-1:B";
+        arena_game_state_t state {
+            .board = boardString,
+            .current_turn = arena_side_t::ARENA_SIDE_WHITE,
+            .my_side = arena_side_t::ARENA_SIDE_WHITE,
+            .legal_moves = nullptr,
+            .legal_moves_count = 0
+        };
+        return Board(state);
+    }
+
+    constexpr bool isLegal(uint16_t id) const
+    {
+        assert(id < moveIdCount);
+        return ((legalMoveBits[id >> 6] >> (id & 63)) & 1ULL) != 0;
+    }
+
+    constexpr void setLegal(uint16_t id)
+    {
+        assert(id < moveIdCount);
+        legalMoveBits[id >> 6] |= 1ULL << (id & 63);
+    }
+
+    constexpr void clearLegal()
+    {
+        for (uint64_t& word : legalMoveBits)
+            word = 0;
+        legalMoveCount = 0;
+    }
+
+    constexpr void forEachLegal(std::invocable<uint16_t> auto&& callback) const
+    {
+        for (int word = 0; word < legalMoveWordCount; ++word)
+        {
+            for (uint64_t remaining = legalMoveBits[word]; remaining != 0; remaining &= remaining - 1)
+            {
+                const int leastSignificantBit = std::countr_zero(remaining);
+                callback(static_cast<uint16_t>(word * 64 + leastSignificantBit));
             }
         }
     }
-    return table;
-}();
 
-static_assert(
-    []
-    {
-        for (int moveId = 0; moveId < moveIdCount; ++moveId)
-        {
-            if (rotatedPolicyMapping[rotatedPolicyMapping[moveId]] != moveId)
-                return false;
-        }
-        return true;
-    }(),
-    "the policy flip must be its own inverse");
+    mlx::core::array tensorEncoding() const;
+};
 
-// Identity for White, because encodeBoard() does not flip then.
-constexpr std::span<const uint16_t, moveIdCount> policyIndicesToMoveIds(bool whiteToMove)
+struct Move
 {
-    return whiteToMove ? std::span<const uint16_t, moveIdCount>{identityPolicyMapping}
-                       : std::span<const uint16_t, moveIdCount>{rotatedPolicyMapping};
-}
+    uint8_t sourceCoord{};
+    uint8_t direction{};
+    bool splitsStack{};
 
-} // namespace amoeba
+    constexpr uint16_t id() const
+    {
+        assert(sourceCoord < hexCount);
+        assert(direction < directionCount);
+        return static_cast<uint16_t>((sourceCoord * directionCount + direction) * 2 + (splitsStack ? 1 : 0));
+    }
 
-#endif // AMOEBA_HPP
+    static constexpr Move fromId(uint16_t id)
+    {
+        assert(id < moveIdCount);
+        return Move{
+            .sourceCoord = static_cast<uint8_t>(id / (directionCount * 2)),
+            .direction = static_cast<uint8_t>((id / 2) % directionCount),
+            .splitsStack = (id & 1) != 0
+        };
+    }
+
+    arena_move_t toArena(uint8_t height) const
+    {
+        static constexpr std::array<const char*, hexCount> arenaCoordinateStrings{{
+            "-3,0", "-3,1", "-3,2", "-3,3", "-2,-1", "-2,0", "-2,1", "-2,2", "-2,3",
+            "-1,-2", "-1,-1", "-1,0", "-1,1", "-1,2", "-1,3", "0,-3", "0,-2", "0,-1",
+            "0,0", "0,1", "0,2", "0,3", "1,-3", "1,-2", "1,-1", "1,0", "1,1", "1,2",
+            "2,-3", "2,-2", "2,-1", "2,0", "2,1", "3,-3", "3,-2", "3,-1", "3,0",
+        }};
+
+        assert(sourceCoord < hexCount);
+        assert(direction < directionCount);
+        assert(height > 0 && height <= maximumMovableStackHeight);
+        assert(!splitsStack || height >= 2);
+        const std::optional<uint8_t> destination =
+            destinationHex(sourceCoord, directions[direction], height);
+        assert(destination.has_value());
+
+        return arena_move_t{
+            .from_pos = arenaCoordinateStrings[sourceCoord],
+            .to_pos = arenaCoordinateStrings[destination.value()],
+            .side = nullptr,
+            .splitting = splitsStack,
+        };
+    }
+
+    constexpr auto operator<=>(const Move&) const = default;
+};
+
+enum class Outcome : uint8_t
+{
+    whiteWins,
+    blackWins,
+    draw,
+};
+
+using MoveResult = std::variant<Board, Outcome>;
+
+// history contain `board` as its last element
+MoveResult applyMove(const Board& board, Move move, std::span<const uint64_t> positionHistory = {});
+
+} // namespace amoeba_bot
