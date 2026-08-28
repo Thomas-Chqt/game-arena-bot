@@ -1,5 +1,4 @@
-#ifndef MCTS_HPP
-#define MCTS_HPP
+#pragma once
 
 #include "amoeba.hpp"
 
@@ -7,60 +6,51 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <variant>
 #include <vector>
 
 namespace amoeba_bot
 {
 
-struct MCTSConfig
-{
-    int simulations = 800;
-};
+using VisitCounts = std::array<uint32_t, moveIdCount>;
 
+template<int SimulationCount>
 class MCTS
 {
+    static_assert(SimulationCount > 0);
+
 public:
-    MCTS(const Board& root, std::span<const uint64_t> history, MCTSConfig config = {});
+    MCTS(const Board& root, std::span<const uint64_t> history);
 
     const Board* pendingLeaf();
-
-    void absorb(std::span<float> policy, float value);
-
-    std::array<uint32_t, moveIdCount> visits() const;
+    void absorb(std::span<const float, moveIdCount> policy, float value);
+    VisitCounts visits() const;
 
 private:
     struct Edge
     {
         uint16_t moveId;
-
         float prior;
         float valueSum;
         uint32_t visits;
-
-        std::optional<int32_t> node;
+        std::optional<uint32_t> node;
     };
 
     struct Node
     {
         Board board;
-
         uint32_t visits;
-
         uint32_t firstEdgeIndex;
         uint32_t edgeCount;
     };
 
-    uint32_t addNode(const Board&, std::span<float> policy);
+    uint32_t addNode(const Board&, std::span<const float, moveIdCount> policy);
     uint32_t addTerminalNode(float value);
-
     uint32_t selectEdgeToExplore(uint32_t node) const;
-    void addExplorationNoise();
     bool descend();
     void backpropagate(float value);
 
-    MCTSConfig m_config;
-
-    std::vector<std::variant<Node, float>> m_nodes; // `Node` or float to indicate the game result
+    std::vector<std::variant<Node, float>> m_nodes;
     std::vector<Edge> m_edges;
 
     std::array<uint64_t, moveLimit + 1> m_gameHistory;
@@ -72,6 +62,10 @@ private:
     std::optional<Board> m_pendingLeaf;
 };
 
-} // namespace amoeba_bot
+uint16_t bestMove(const VisitCounts&);
+float outcomeFor(Outcome, bool whiteToMove);
 
-#endif // MCTS_HPP
+extern template class MCTS<200>;
+extern template class MCTS<1000>;
+
+} // namespace amoeba_bot

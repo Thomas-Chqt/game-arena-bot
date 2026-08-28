@@ -1,28 +1,40 @@
-// Reusable self-play, optimization, and gating helpers. main.cpp owns the
-// high-level generation loop and checkpoint promotion policy.
-
 #include "training.hpp"
 
-#include <sys/resource.h>
+#include "mcts.hpp"
+#include "network.hpp"
+
+#include <poll.h>
+#include <signal.h>
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
+#include <cstring>
 #include <format>
-#include <functional>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <print>
 #include <random>
-#include <set>
+#include <ranges>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
+
+extern char** environ;
 
 namespace amoeba_bot
 {
@@ -30,95 +42,56 @@ namespace amoeba_bot
 namespace
 {
 
-uint16_t policyIndexToMoveId(uint16_t policyIndex, bool whiteToMove)
-{
-    Move move = Move::fromId(policyIndex);
-    if (!whiteToMove)
-    {
-        move.sourceCoord = rotatedHex(move.sourceCoord);
-        move.direction = oppositeDirection(move.direction);
-    }
-    return move.id();
-}
+constexpr uint64_t seed = 20260819;
+constexpr int selfPlaySimulationCount = 200;
+constexpr int evaluationSimulationCount = 200;
+constexpr int gamesPerSelfPlayField = 128;
+constexpr int concurrentSelfPlayGames = 128;
+constexpr int evaluationGameCount = 200;
+constexpr int concurrentEvaluationGames = 64;
+constexpr int samplingPlyCount = 20;
+constexpr float rootNoise = 0.25f;
+constexpr float noiseAlpha = 0.35f;
+constexpr size_t replayBufferCapacity = 300'000;
+constexpr size_t minimumReplaySize = 2'048;
+constexpr size_t trainingBatchSize = 256;
+constexpr double targetReuse = 4.0;
+constexpr float learningRate = 1e-3f;
+constexpr float weightDecay = 1e-4f;
+constexpr uint64_t selfPlayRefreshSteps = 50;
+constexpr uint64_t evaluationSteps = 500;
+constexpr float promotionThreshold = 0.55f;
+constexpr int workerChannel = 3;
 
-// std::println leaves stdout block-buffered whenever it is not a terminal, so a
-// redirected run shows nothing at all until the buffer fills - which for short
-// progress lines means not until the process exits.
-template <typename... Args> void report(std::format_string<Args...> format, Args&&... args)
+template<typename... Args>
+void report(std::format_string<Args...> format, Args&&... args)
 {
     std::println(format, std::forward<Args>(args)...);
     std::fflush(stdout);
 }
 
-} // namespace
-
-// MLX hands freed device buffers to a pool rather than back to the system, and the
-// pool's default limit is the memory limit - on Metal, 1.5x the device's
-// recommended working set, so most of the machine. That makes the split worth
-// printing rather than guessing at:
-//
-//   live    what MLX is actually holding for arrays that exist
-//   cached  handed back by MLX but not released to the system
-//   process the OS's high-water mark, which includes everything above plus the
-//           replay buffer, the trees and every other allocation we make
-//
-// A large cache beside a small live figure is shape churn, not a leak: the field's
-// batch shrinks by one every time a game ends, and each distinct batch size is a
-// differently shaped set of intermediates for the pool to keep. A large live figure
-// is something genuinely retained, and then the fault is ours.
-void reportMemory(const char* phase)
+struct TrainingSample
 {
-    constexpr double bytesPerGibibyte = 1024.0 * 1024.0 * 1024.0;
+    Board board;
+    VisitCounts visits;
+    float outcome;
+    uint64_t gameId;
+};
 
-    rusage usage{};
-    getrusage(RUSAGE_SELF, &usage);
+static_assert(std::is_trivially_copyable_v<TrainingSample>);
 
-#if defined(__APPLE__)
-    const double processHighWaterBytes = static_cast<double>(usage.ru_maxrss);
-#else
-    const double processHighWaterBytes = static_cast<double>(usage.ru_maxrss) * 1024.0;
-#endif
-
-    report("[memory] after {}: {:.2f} GiB live, {:.2f} GiB cached, {:.2f} GiB MLX peak, "
-           "{:.2f} GiB process high-water",
-           phase, static_cast<double>(mlx::core::get_active_memory()) / bytesPerGibibyte,
-           static_cast<double>(mlx::core::get_cache_memory()) / bytesPerGibibyte,
-           static_cast<double>(mlx::core::get_peak_memory()) / bytesPerGibibyte,
-           processHighWaterBytes / bytesPerGibibyte);
-}
-
-namespace
-{
-
-int readIntegerSetting(const char* name, int fallback)
-{
-    const char* text = std::getenv(name);
-    return text == nullptr ? fallback : std::stoi(text);
-}
-
-float readFloatSetting(const char* name, float fallback)
-{
-    const char* text = std::getenv(name);
-    return text == nullptr ? fallback : std::stof(text);
-}
-
-// ---------------------------------------------------------------------------
-// Playing hundreds of games concurrently
-// ---------------------------------------------------------------------------
-
-// Proportional to visits early, argmax afterwards. Without the early sampling
-// every game walks the same opening and the training set is far narrower than
-// its position count suggests.
-uint16_t selectMoveFromVisits(const VisitCounts& visitCounts, int plyCount, int samplingPlyCount,
+uint16_t selectMoveFromVisits(const VisitCounts& visitCounts, int plyCount,
                               std::mt19937_64& randomEngine)
 {
     if (plyCount >= samplingPlyCount)
         return bestMove(visitCounts);
 
-    const uint64_t totalVisits = std::accumulate(visitCounts.begin(), visitCounts.end(), uint64_t{0});
+    const uint64_t totalVisits =
+        std::accumulate(visitCounts.begin(), visitCounts.end(), uint64_t{0});
     assert(totalVisits > 0);
 
-    uint64_t remaining = std::uniform_int_distribution<uint64_t>{0, totalVisits - 1}(randomEngine);
+    uint64_t remaining =
+        std::uniform_int_distribution<uint64_t>{0, totalVisits - 1}(randomEngine);
     for (uint16_t moveId = 0; moveId < moveIdCount; ++moveId)
     {
         if (visitCounts[moveId] > remaining)
@@ -128,547 +101,716 @@ uint16_t selectMoveFromVisits(const VisitCounts& visitCounts, int plyCount, int 
     return bestMove(visitCounts);
 }
 
-// Which network takes which colour, as indices into the field's network list.
 struct NetworkPairing
 {
-    int whiteNetwork;
-    int blackNetwork;
+    int white;
+    int black;
 };
 
-// One game in flight.
+template<int SimulationCount>
 struct ActiveGame
 {
     Board board;
     std::optional<Outcome> outcome;
     std::vector<uint64_t> positionHistory;
-    std::vector<TrainingSample> trainingSamples;
-    std::mt19937_64 randomEngine;
-    std::mt19937_64 searchRandomEngine;
+    std::vector<TrainingSample> samples;
+    std::mt19937_64 moveRandom;
+    std::mt19937_64 noiseRandom;
     NetworkPairing pairing{0, 0};
-    int gameId = 0;
-    bool isActive = false;
-
-    // Reported when the game ends. `trainingSamples` is one per move, so the move count is
-    // already there; the evaluations have to be counted as they are absorbed.
-    std::chrono::steady_clock::time_point startTime;
-    long long evaluatedPositionCount = 0;
-
-    // One fresh tree for the current move. The caller chooses which network
-    // evaluates its leaves, so gate games do not need one tree per network.
-    std::optional<MCTS> search;
-
-    // Set fresh each round: the leaf this game cannot go on without, which
-    // network owes it the answer, and where it sits in that network's batch.
+    uint64_t gameId = 0;
+    bool active = false;
+    std::optional<MCTS<SimulationCount>> search;
     const Board* pendingLeaf = nullptr;
     int networkIndex = 0;
-    size_t evaluationBatchOffset = 0;
+    size_t evaluationOffset = 0;
+    uint64_t evaluatedPositions = 0;
+    bool firstLeafOfSearch = true;
 };
 
-// Plays a field of independent games in lockstep. Each search offers one leaf per
-// round, and the runner batches those leaves by network before continuing.
+void addExplorationNoise(Evaluation& evaluation, const Board& board,
+                         std::mt19937_64& randomEngine)
+{
+    std::gamma_distribution<float> gamma{noiseAlpha, 1.0f};
+    std::array<float, moveIdCount> noise{};
+    float total = 0.0f;
+    board.forEachLegal([&](uint16_t moveId) {
+        noise[moveId] = gamma(randomEngine);
+        total += noise[moveId];
+    });
+    if (total <= 0.0f)
+        return;
+
+    board.forEachLegal([&](uint16_t moveId) {
+        evaluation.policy[moveId] =
+            (1.0f - rootNoise) * evaluation.policy[moveId]
+            + rootNoise * noise[moveId] / total;
+    });
+}
+
+template<int SimulationCount, bool AddRootNoise>
 class GameBatchRunner
 {
 public:
-    GameBatchRunner(std::span<const Network* const> networks, MCTSConfig searchConfig, int samplingPlies)
+    explicit GameBatchRunner(std::span<const Network* const> networks)
         : m_networks(networks)
-        , m_searchConfig(searchConfig)
-        , m_samplingPlies(samplingPlies)
     {
+        assert(!networks.empty() && networks.size() <= 2);
     }
 
-    // Plays `games` games with `slots` of them in flight, refilling a slot as its
-    // game ends so the batch stays full until the work runs out. `pairingFor(game)`
-    // says who plays which colour. `finished` returning false stops the field there
-    // and then; the other games still in flight are abandoned.
-    void playGames(int gameCount, int concurrentGameCount, uint64_t seed, const char* label,
-                   const std::function<NetworkPairing(int)>& pairingFor,
-                   const std::function<bool(int, std::vector<TrainingSample>&&)>& onGameFinished);
-
-private:
-    void initializeGame(ActiveGame&, int gameId, NetworkPairing, uint64_t seed) const;
-    void startSearch(ActiveGame&) const;
-    void advanceUntilEvaluation(ActiveGame&) const;
-
-    std::span<const Network* const> m_networks;
-    MCTSConfig m_searchConfig;
-    int m_samplingPlies;
-};
-
-void GameBatchRunner::initializeGame(ActiveGame& game, int gameId, NetworkPairing pairing, uint64_t seed) const
-{
-    game.gameId = gameId;
-    game.board = Board::startingBoard();
-    game.pairing = pairing;
-    game.isActive = true;
-    game.startTime = std::chrono::steady_clock::now();
-    game.evaluatedPositionCount = 0;
-    game.positionHistory.assign(1, game.board.positionHash);
-    game.outcome.reset();
-    game.trainingSamples.clear();
-    game.randomEngine.seed(seed ^ (0x9e3779b97f4a7c15ULL * (static_cast<uint64_t>(gameId) + 1)));
-    game.searchRandomEngine.seed(seed + static_cast<uint64_t>(gameId));
-
-    // The caller owns noise-seed progression because each MCTS exists for one
-    // position only. It stays separate from move sampling so changing one random
-    // process does not perturb the other.
-    startSearch(game);
-    game.pendingLeaf = nullptr;
-}
-
-void GameBatchRunner::startSearch(ActiveGame& game) const
-{
-    MCTSConfig config = m_searchConfig;
-    config.noiseSeed = game.searchRandomEngine();
-    game.search.emplace(game.board, game.positionHistory, config);
-}
-
-// Plays as far as it can without an evaluation, leaving the leaf it is waiting on
-// in `pendingLeaf` - or leaving it null, which means the game is over.
-void GameBatchRunner::advanceUntilEvaluation(ActiveGame& game) const
-{
-    while (!game.outcome.has_value())
+    template<int GameCount, int ConcurrentGameCount, typename PairingFor,
+             typename GameFinished>
+    void play(uint64_t firstGameId, uint64_t randomSeed,
+              PairingFor&& pairingFor, GameFinished&& gameFinished)
     {
-        const int networkIndex = game.board.whiteToMove ? game.pairing.whiteNetwork : game.pairing.blackNetwork;
-        if (const Board* leaf = game.search->pendingLeaf())
+        static_assert(GameCount > 0);
+        static_assert(ConcurrentGameCount > 0);
+
+        const int slotCount = std::min(GameCount, ConcurrentGameCount);
+        std::vector<ActiveGame<SimulationCount>> games(static_cast<size_t>(slotCount));
+        int started = 0;
+        int completed = 0;
+        bool keepPlaying = true;
+
+        for (ActiveGame<SimulationCount>& game : games)
         {
-            game.networkIndex = networkIndex;
-            game.pendingLeaf = leaf;
-            return;
+            initialize(game, firstGameId + started, pairingFor(started), randomSeed);
+            ++started;
         }
 
-        const VisitCounts visitCounts = game.search->visits();
-        game.trainingSamples.push_back({game.board, visitCounts, 0.0f, game.gameId});
+        std::array<std::vector<const Board*>, 2> pendingBoards;
+        std::array<std::vector<Evaluation>, 2> evaluations;
 
-        const uint16_t chosenMoveId =
-            selectMoveFromVisits(visitCounts, game.board.plyCount, m_samplingPlies, game.randomEngine);
-        MoveResult result =
-            applyMove(game.board, Move::fromId(chosenMoveId), game.positionHistory);
-        if (const auto* outcome = std::get_if<Outcome>(&result))
+        while (keepPlaying)
         {
-            game.outcome = *outcome;
-            break;
-        }
+            size_t pendingCount = 0;
+            for (std::vector<const Board*>& boards : pendingBoards)
+                boards.clear();
 
-        game.board = std::get<Board>(std::move(result));
-        game.positionHistory.push_back(game.board.positionHash);
-        startSearch(game);
-    }
-    game.pendingLeaf = nullptr;
-}
-
-void GameBatchRunner::playGames(int gameCount, int concurrentGameCount, uint64_t seed, const char* label,
-                                const std::function<NetworkPairing(int)>& pairingFor,
-                                const std::function<bool(int, std::vector<TrainingSample>&&)>& onGameFinished)
-{
-    if (gameCount <= 0)
-        return;
-
-    std::vector<ActiveGame> activeGames(static_cast<size_t>(std::max(1, std::min(gameCount, concurrentGameCount))));
-
-    bool shouldContinue = true;
-    int completedGameCount = 0;
-    int startedGameCount = 0;
-
-    std::vector<std::vector<const Board*>> pendingBoardsByNetwork(m_networks.size());
-    std::vector<std::vector<Evaluation>> evaluationsByNetwork(m_networks.size());
-
-    report("[{}] {} games, {} in flight, at {} simulations", label, gameCount, activeGames.size(),
-           m_searchConfig.simulations);
-
-    for (ActiveGame& game : activeGames)
-    {
-        initializeGame(game, startedGameCount, pairingFor(startedGameCount), seed);
-        ++startedGameCount;
-        advanceUntilEvaluation(game);
-    }
-
-    // Hands a finished game over and refills its slot if more work remains.
-    const auto handOver = [&](ActiveGame& game)
-    {
-        for (TrainingSample& sample : game.trainingSamples)
-        {
-            assert(game.outcome.has_value());
-            sample.outcome = outcomeFor(*game.outcome, sample.board.whiteToMove);
-        }
-
-        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - game.startTime).count();
-        const size_t moves = game.trainingSamples.size();
-
-        if (!onGameFinished(game.gameId, std::move(game.trainingSamples)))
-            shouldContinue = false;
-        ++completedGameCount;
-
-        report("[{}] game {}: {:.0f}s, {} moves, {} evaluated positions -- {} games left", label, game.gameId,
-               seconds, moves,
-               game.evaluatedPositionCount, gameCount - completedGameCount);
-
-        if (!shouldContinue || startedGameCount >= gameCount)
-        {
-            game.isActive = false;
-            return;
-        }
-        initializeGame(game, startedGameCount, pairingFor(startedGameCount), seed);
-        ++startedGameCount;
-        advanceUntilEvaluation(game);
-    };
-
-    for (;;)
-    {
-        size_t gatheredBoardCount = 0;
-        for (std::vector<const Board*>& batch : pendingBoardsByNetwork)
-            batch.clear();
-
-        for (ActiveGame& game : activeGames)
-        {
-            if (!game.isActive || game.pendingLeaf == nullptr)
-                continue;
-
-            std::vector<const Board*>& batch =
-                pendingBoardsByNetwork[static_cast<size_t>(game.networkIndex)];
-            game.evaluationBatchOffset = batch.size();
-            batch.push_back(game.pendingLeaf);
-            ++gatheredBoardCount;
-        }
-
-        if (gatheredBoardCount == 0)
-            return;
-
-        for (size_t networkIndex = 0; networkIndex < m_networks.size(); ++networkIndex)
-        {
-            if (pendingBoardsByNetwork[networkIndex].empty())
-                continue;
-            evaluationsByNetwork[networkIndex].resize(pendingBoardsByNetwork[networkIndex].size());
-            (*m_networks[networkIndex])(pendingBoardsByNetwork[networkIndex],
-                                       evaluationsByNetwork[networkIndex]);
-        }
-
-        for (ActiveGame& game : activeGames)
-        {
-            if (!game.isActive || game.pendingLeaf == nullptr)
-                continue;
-
-            game.search->absorb(
-                evaluationsByNetwork[static_cast<size_t>(game.networkIndex)][game.evaluationBatchOffset]);
-            game.pendingLeaf = nullptr;
-            ++game.evaluatedPositionCount;
-            advanceUntilEvaluation(game);
-
-            if (game.pendingLeaf == nullptr)
+            for (ActiveGame<SimulationCount>& game : games)
             {
-                handOver(game);
-                if (!shouldContinue)
-                    return;
+                if (!game.active)
+                    continue;
+                advance(game);
+                if (game.pendingLeaf == nullptr)
+                {
+                    finish(game);
+                    keepPlaying = gameFinished(game.gameId, std::move(game.samples));
+                    ++completed;
+                    if (!keepPlaying || started == GameCount)
+                    {
+                        game.active = false;
+                        continue;
+                    }
+                    initialize(game, firstGameId + started, pairingFor(started), randomSeed);
+                    ++started;
+                    advance(game);
+                }
+
+                if (!game.active)
+                    continue;
+                std::vector<const Board*>& boards =
+                    pendingBoards[static_cast<size_t>(game.networkIndex)];
+                game.evaluationOffset = boards.size();
+                boards.push_back(game.pendingLeaf);
+                ++pendingCount;
+            }
+
+            if (!keepPlaying || pendingCount == 0)
+                break;
+
+            for (size_t networkIndex = 0; networkIndex < m_networks.size(); ++networkIndex)
+            {
+                if (pendingBoards[networkIndex].empty())
+                    continue;
+                evaluations[networkIndex].resize(pendingBoards[networkIndex].size());
+                (*m_networks[networkIndex])(pendingBoards[networkIndex], evaluations[networkIndex]);
+            }
+
+            for (ActiveGame<SimulationCount>& game : games)
+            {
+                if (!game.active || game.pendingLeaf == nullptr)
+                    continue;
+                Evaluation& evaluation =
+                    evaluations[static_cast<size_t>(game.networkIndex)][game.evaluationOffset];
+                if constexpr (AddRootNoise)
+                {
+                    if (game.firstLeafOfSearch)
+                        addExplorationNoise(evaluation, *game.pendingLeaf, game.noiseRandom);
+                }
+                game.search->absorb(evaluation.policy, evaluation.value);
+                game.firstLeafOfSearch = false;
+                game.pendingLeaf = nullptr;
+                ++game.evaluatedPositions;
             }
         }
+
+        report("[games] completed {} of {} games at {} simulations",
+               completed, GameCount, SimulationCount);
     }
-}
 
-} // namespace
-
-std::vector<TrainingSample> generateSelfPlaySamples(
-    const AmoebaNetwork& champion, const TrainingSettings& settings, uint64_t seed)
-{
-    MCTSConfig searchConfig = settings.searchConfig;
-    searchConfig.rootNoise = settings.rootNoise;
-
-    const Network* const networks[]{&champion};
-
-    std::vector<TrainingSample> trainingSamples;
-    int whiteWins = 0, blackWins = 0, draws = 0;
-
-    GameBatchRunner gameRunner{networks, searchConfig, settings.samplingPlyCount};
-    gameRunner.playGames(
-        settings.selfPlayGameCount, settings.concurrentSelfPlayGames, seed, "selfplay",
-        [](int) { return NetworkPairing{0, 0}; },
-        [&](int, std::vector<TrainingSample>&& played)
-        {
-            // The last sample's mover lost, drew, or was adjudicated against;
-            // read the result off it rather than threading the final Board out.
-            const float last = played.back().outcome;
-            if (last == 0.0f)
-                ++draws;
-            else if (played.back().board.whiteToMove == (last > 0.0f))
-                ++whiteWins;
-            else
-                ++blackWins;
-
-            trainingSamples.insert(trainingSamples.end(), std::make_move_iterator(played.begin()), std::make_move_iterator(played.end()));
-            return true; // self-play always plays every game it was asked for
-        });
-
-    report("[selfplay] {} positions from {} games: {} White, {} Black, {} drawn", trainingSamples.size(),
-           settings.selfPlayGameCount, whiteWins, blackWins, draws);
-    return trainingSamples;
-}
-
-namespace
-{
-
-// ---------------------------------------------------------------------------
-// Training
-// ---------------------------------------------------------------------------
-
-TrainingBatch createBatchFromSamples(const std::vector<TrainingSample>& samples, std::span<const size_t> picks)
-{
-    const int batchSize = static_cast<int>(picks.size());
-    std::vector<mlx::core::array> input;
-    input.reserve(picks.size());
-    std::vector<float> legal(picks.size() * moveIdCount);
-    std::vector<float> policy(picks.size() * moveIdCount);
-    std::vector<float> outcomes(picks.size());
-
-    for (size_t batchIndex = 0; batchIndex < picks.size(); ++batchIndex)
+private:
+    void initialize(ActiveGame<SimulationCount>& game, uint64_t gameId,
+                    NetworkPairing pairing, uint64_t randomSeed)
     {
-        const TrainingSample& sample = samples[picks[batchIndex]];
-        input.push_back(sample.board.tensorEncoding());
+        game.board = Board::startingBoard();
+        game.outcome.reset();
+        game.positionHistory.assign(1, game.board.positionHash);
+        game.samples.clear();
+        game.moveRandom.seed(randomSeed ^ (0x9e3779b97f4a7c15ULL * (gameId + 1)));
+        game.noiseRandom.seed(randomSeed + gameId);
+        game.pairing = pairing;
+        game.gameId = gameId;
+        game.active = true;
+        game.evaluatedPositions = 0;
+        startSearch(game);
+    }
 
-        // AlphaZero learns the complete search preference, not just the move
-        // eventually played, by normalizing all visit counts into probabilities.
+    void startSearch(ActiveGame<SimulationCount>& game)
+    {
+        game.search.emplace(game.board, game.positionHistory);
+        game.pendingLeaf = nullptr;
+        game.firstLeafOfSearch = true;
+    }
+
+    void advance(ActiveGame<SimulationCount>& game)
+    {
+        while (!game.outcome.has_value())
+        {
+            if (const Board* leaf = game.search->pendingLeaf())
+            {
+                game.networkIndex = game.board.whiteToMove
+                    ? game.pairing.white : game.pairing.black;
+                game.pendingLeaf = leaf;
+                return;
+            }
+
+            const VisitCounts visits = game.search->visits();
+            game.samples.push_back({game.board, visits, 0.0f, game.gameId});
+            const uint16_t moveId = selectMoveFromVisits(
+                visits, game.board.plyCount, game.moveRandom);
+            MoveResult result = applyMove(
+                game.board, Move::fromId(moveId), game.positionHistory);
+            if (const auto* outcome = std::get_if<Outcome>(&result))
+            {
+                game.outcome = *outcome;
+                break;
+            }
+
+            game.board = std::get<Board>(std::move(result));
+            game.positionHistory.push_back(game.board.positionHash);
+            startSearch(game);
+        }
+        game.pendingLeaf = nullptr;
+    }
+
+    void finish(ActiveGame<SimulationCount>& game)
+    {
+        assert(game.outcome.has_value());
+        for (TrainingSample& sample : game.samples)
+            sample.outcome = outcomeFor(*game.outcome, sample.board.whiteToMove);
+    }
+
+    std::span<const Network* const> m_networks;
+};
+
+TrainingBatch createBatch(
+    const std::vector<TrainingSample>& replay,
+    std::span<const size_t, trainingBatchSize> picks)
+{
+    const auto policyIndexToMoveId = [](uint16_t policyIndex, bool whiteToMove) {
+        Move move = Move::fromId(policyIndex);
+        if (!whiteToMove)
+        {
+            move.sourceCoord = rotatedHex(move.sourceCoord);
+            move.direction = oppositeDirection(move.direction);
+        }
+        return move.id();
+    };
+
+    std::vector<mlx::core::array> inputs;
+    inputs.reserve(trainingBatchSize);
+    std::vector<float> legal(trainingBatchSize * moveIdCount);
+    std::vector<float> policy(trainingBatchSize * moveIdCount);
+    std::array<float, trainingBatchSize> outcomes{};
+
+    for (size_t batchIndex = 0; batchIndex < trainingBatchSize; ++batchIndex)
+    {
+        const TrainingSample& sample = replay[picks[batchIndex]];
+        inputs.push_back(sample.board.tensorEncoding());
         const uint64_t totalVisits =
             std::accumulate(sample.visits.begin(), sample.visits.end(), uint64_t{0});
-        if (totalVisits == 0)
-            throw std::runtime_error(std::format(
-                "sample {} has no visits, so it has no policy to learn", picks[batchIndex]));
+        assert(totalVisits > 0);
 
-        const size_t policyOffset = batchIndex * moveIdCount;
-        for (int policyIndex = 0; policyIndex < moveIdCount; ++policyIndex)
+        const size_t offset = batchIndex * moveIdCount;
+        for (uint16_t policyIndex = 0; policyIndex < moveIdCount; ++policyIndex)
         {
             const uint16_t moveId = policyIndexToMoveId(
-                static_cast<uint16_t>(policyIndex), sample.board.whiteToMove);
-            legal[policyOffset + policyIndex] = sample.board.isLegal(moveId) ? 1.0f : 0.0f;
-            policy[policyOffset + policyIndex] =
-                static_cast<float>(sample.visits[moveId]) / static_cast<float>(totalVisits);
+                policyIndex, sample.board.whiteToMove);
+            legal[offset + policyIndex] = sample.board.isLegal(moveId) ? 1.0f : 0.0f;
+            policy[offset + policyIndex] =
+                static_cast<float>(sample.visits[moveId]) / totalVisits;
         }
         outcomes[batchIndex] = sample.outcome;
     }
 
-    return TrainingBatch{
-        mlx::core::stack(input),
-        mlx::core::array(legal.data(), mlx::core::Shape{batchSize, moveIdCount}, mlx::core::float32),
-        mlx::core::array(policy.data(), mlx::core::Shape{batchSize, moveIdCount}, mlx::core::float32),
-        mlx::core::array(outcomes.data(), mlx::core::Shape{batchSize}, mlx::core::float32)};
+    return {
+        mlx::core::stack(inputs),
+        mlx::core::array(legal.data(),
+                         {static_cast<int>(trainingBatchSize), moveIdCount},
+                         mlx::core::float32),
+        mlx::core::array(policy.data(),
+                         {static_cast<int>(trainingBatchSize), moveIdCount},
+                         mlx::core::float32),
+        mlx::core::array(outcomes.data(),
+                         {static_cast<int>(trainingBatchSize)},
+                         mlx::core::float32),
+    };
 }
 
-// Holds out whole games. Positions within a game are near-copies of each other and
-// every one carries the same outcome label, so splitting by position leaves a
-// held-out position's own game in the training set and the value head can score
-// well by recognising the game rather than by reading the board. The symptom is a
-// held-out loss that improves as you generate *fewer* games.
-struct DatasetSplit
+enum class MessageType : uint32_t
 {
-    std::vector<size_t> training;
-    std::vector<size_t> validation;
+    samples,
+    liveWeights,
+    evaluate,
+    evaluationResult,
+    stop,
 };
 
-DatasetSplit splitDatasetByGame(const std::vector<TrainingSample>& samples, std::mt19937_64& randomEngine)
+struct Message
 {
-    std::set<int> ids;
-    for (const TrainingSample& sample : samples)
-    {
-        ids.insert(sample.gameId);
-    }
+    MessageType type{};
+    uint32_t count{};
+    uint64_t version{};
+    double score{};
+    uint32_t promoted{};
+};
 
-    std::vector<int> order(ids.begin(), ids.end());
-    std::ranges::shuffle(order, randomEngine);
-    const size_t heldOutCount = std::max<size_t>(1, order.size() / 10);
-    const std::set<int> heldOut(order.begin(), order.begin() + static_cast<long>(heldOutCount));
-
-    DatasetSplit split;
-    for (size_t sampleIndex = 0; sampleIndex < samples.size(); ++sampleIndex)
+bool readAll(int socket, void* output, size_t size)
+{
+    char* destination = static_cast<char*>(output);
+    while (size > 0)
     {
-        (heldOut.contains(samples[sampleIndex].gameId) ? split.validation : split.training).push_back(sampleIndex);
+        const ssize_t received = recv(socket, destination, size, 0);
+        if (received == 0)
+            return false;
+        if (received < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            throw std::runtime_error(std::format("recv: {}", std::strerror(errno)));
+        }
+        destination += received;
+        size -= static_cast<size_t>(received);
     }
-    return split;
+    return true;
 }
 
-// Leaves `candidate` holding the weights from the best step, not the last. Held-out loss
-// turns back up well before training ends, so keeping the final parameters ships a
-// network measurably worse than one already in hand.
-} // namespace
-
-void trainCandidate(AmoebaNetwork& candidate, const std::vector<TrainingSample>& samples,
-                    const TrainingSettings& settings, uint64_t seed)
+void writeAll(int socket, const void* input, size_t size)
 {
-    std::mt19937_64 randomEngine{seed};
-    const DatasetSplit split = splitDatasetByGame(samples, randomEngine);
-    if (split.training.empty() || split.validation.empty())
-        throw std::runtime_error("not enough games to hold any out");
-
-    const TrainingBatch validation = createBatchFromSamples(
-        samples, std::span{split.validation}.subspan(0, std::min<size_t>(1024, split.validation.size())));
-
-    std::vector<mlx::core::array> parameters = candidate.parameters();
-
-    report("[train] {} parameters, {} positions, {} held out, {} steps at batch {}", candidate.parameterCount(),
-           split.training.size(), split.validation.size(), settings.maximumTrainingSteps, settings.trainingBatchSize);
-    report("{:>7}  {:>9}  {:>9}  {:>9}  {:>9}", "step", "policy", "value", "held.pol", "held.val");
-
-    // Checked four times more often than it is printed, because the optimum moves
-    // as the replay buffer fills: at 22k positions it lands around step 100, and
-    // at the buffer's full 200k the same step count is barely one pass over the
-    // data and the optimum is far later. Stopping on patience rather than on a
-    // fixed count is what lets one STEPS serve both.
-    constexpr int validationCheckInterval = 25;
-    constexpr int validationPatience = 8;
-
-    Adam adam{parameters};
-    std::vector<size_t> picks(static_cast<size_t>(settings.trainingBatchSize));
-    std::vector<mlx::core::array> bestParameters = parameters;
-    float lowestValidationLoss = std::numeric_limits<float>::max();
-    int bestStep = 0;
-    int checksWithoutImprovement = 0;
-
-    for (int step = 1; step <= settings.maximumTrainingSteps; ++step)
+    const char* source = static_cast<const char*>(input);
+    while (size > 0)
     {
-        for (size_t& pick : picks)
+        const ssize_t written = send(socket, source, size, MSG_NOSIGNAL);
+        if (written < 0)
         {
-            pick = split.training[std::uniform_int_distribution<size_t>{0, split.training.size() - 1}(randomEngine)];
+            if (errno == EINTR)
+                continue;
+            throw std::runtime_error(std::format("send: {}", std::strerror(errno)));
         }
-        const TrainingBatch batch = createBatchFromSamples(samples, picks);
-
-        const LossAndGrad training =
-            candidate.valueAndGrad(parameters, batch, settings.weightDecay);
-
-        parameters = adam.updateParameters(parameters, training.gradients, settings.learningRate);
-        mlx::core::eval(parameters);
-
-        if (step % validationCheckInterval != 0 && step != 1)
-            continue;
-
-        const Loss held = candidate.loss(parameters, validation, 0.0f);
-        mlx::core::eval({training.loss.total, training.loss.policy, training.loss.value,
-                         held.total, held.policy, held.value});
-
-        // Judged on policy and value together: one orders the moves, the other
-        // evaluates the leaves, and the search needs both.
-        const float combined = held.policy.item<float>() + held.value.item<float>();
-        if (combined < lowestValidationLoss)
-        {
-            lowestValidationLoss = combined;
-            bestStep = step;
-            bestParameters = parameters;
-            checksWithoutImprovement = 0;
-        }
-        else
-        {
-            ++checksWithoutImprovement;
-        }
-
-        if (step % 100 == 0 || step == 1)
-            report("{:>7}  {:>9.4f}  {:>9.4f}  {:>9.4f}  {:>9.4f}", step,
-                   training.loss.policy.item<float>(), training.loss.value.item<float>(),
-                   held.policy.item<float>(), held.value.item<float>());
-
-        if (checksWithoutImprovement >= validationPatience)
-        {
-            report("[train] held-out loss has not improved in {} checks, stopping at step {}", validationPatience,
-                   step);
-            break;
-        }
+        source += written;
+        size -= static_cast<size_t>(written);
     }
-
-    report("[train] best held-out loss {:.4f} at step {} of {}, keeping those weights", lowestValidationLoss, bestStep,
-           settings.maximumTrainingSteps);
-    candidate.replaceParameters(bestParameters);
 }
 
-namespace
+void sendMessage(int socket, const Message& message)
 {
+    writeAll(socket, &message, sizeof(message));
+}
 
-// ---------------------------------------------------------------------------
-// The gate
-// ---------------------------------------------------------------------------
+bool receiveMessage(int socket, Message& message)
+{
+    return readAll(socket, &message, sizeof(message));
+}
 
-// Standard error of a proportion. Quoted with every gate result so a score is
-// not read as more precise than it is: 3.5 points at 200 games, 8 at 40.
+void sendSamples(int socket, const std::vector<TrainingSample>& samples)
+{
+    assert(samples.size() <= std::numeric_limits<uint32_t>::max());
+    sendMessage(socket, Message{
+        .type = MessageType::samples,
+        .count = static_cast<uint32_t>(samples.size()),
+    });
+    writeAll(socket, samples.data(), samples.size() * sizeof(TrainingSample));
+}
+
+std::filesystem::path internalPath(
+    const std::filesystem::path& weights, std::string_view suffix)
+{
+    std::filesystem::path result = weights;
+    result += suffix;
+    return result;
+}
+
+void saveAtomically(const Network& network, const std::filesystem::path& path)
+{
+    const std::filesystem::path temporary =
+        path.parent_path() / (path.stem().string() + ".tmp" + path.extension().string());
+    std::filesystem::remove(temporary);
+    network.save(temporary);
+    std::filesystem::rename(temporary, path);
+}
+
+struct Worker
+{
+    pid_t process = -1;
+    int socket = -1;
+};
+
+Worker spawnWorker(const std::filesystem::path& executable,
+                   std::string_view role,
+                   const std::filesystem::path& weights)
+{
+    int channels[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, channels) != 0)
+        throw std::runtime_error(std::format("socketpair: {}", std::strerror(errno)));
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addclose(&actions, channels[0]);
+    if (channels[1] != workerChannel)
+    {
+        posix_spawn_file_actions_adddup2(&actions, channels[1], workerChannel);
+        posix_spawn_file_actions_addclose(&actions, channels[1]);
+    }
+
+    std::string executableText = executable.string();
+    std::string roleText{role};
+    std::string weightsText = weights.string();
+    char* arguments[]{executableText.data(), roleText.data(), weightsText.data(), nullptr};
+
+    pid_t process = -1;
+    const int status = posix_spawnp(
+        &process, executableText.c_str(), &actions, nullptr, arguments, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(channels[1]);
+    if (status != 0)
+    {
+        close(channels[0]);
+        throw std::runtime_error(std::format("posix_spawn: {}", std::strerror(status)));
+    }
+    return {process, channels[0]};
+}
+
+void stopWorker(Worker& worker)
+{
+    if (worker.socket >= 0)
+    {
+        close(worker.socket);
+        worker.socket = -1;
+    }
+    if (worker.process > 0)
+    {
+        kill(worker.process, SIGTERM);
+        waitpid(worker.process, nullptr, 0);
+        worker.process = -1;
+    }
+}
+
+volatile sig_atomic_t stopRequested = 0;
+
+void requestStop(int)
+{
+    stopRequested = 1;
+}
+
 double standardError(double score, int games)
 {
     return std::sqrt(std::max(score * (1.0 - score), 0.01) / games);
 }
 
-// Whether more games could still change the verdict. A candidate that is clearly
-// better says so in about twenty games, and one that is genuinely within a point
-// or two of the champion would need thousands - neither is worth playing two
-// hundred for. Three sigma rather than two because the question is asked after
-// every game, and repeated testing at two sigma promotes noise.
-bool gateResultIsSettled(int played, double score, float threshold)
+bool gateSettled(int played, double score)
 {
     constexpr int minimumGameCount = 20;
-    return played >= minimumGameCount && std::abs(score - static_cast<double>(threshold)) > 3.0 * standardError(score, played);
+    return played >= minimumGameCount
+        && std::abs(score - promotionThreshold) > 3.0 * standardError(score, played);
 }
 
-// The candidate's score, draws counted as half. Colours alternate so the
-// first-move advantage cancels rather than being handed to whoever is listed
-// first, and the early sampling in chooseMove is what makes the games differ -
-// two argmax players would replay one game GATE_GAMES times.
-//
-// Ranks with fewer simulations than self-play used, because only the result is
-// read here - the visit counts that needed the deeper search are discarded.
 } // namespace
 
-double evaluateCandidate(const AmoebaNetwork& candidate, const AmoebaNetwork& champion,
-                         const TrainingSettings& settings, uint64_t seed)
+int runSelfPlayWorker(const std::filesystem::path& weights)
+try
 {
-    MCTSConfig searchConfig = settings.searchConfig;
-    searchConfig.simulations = settings.gateSimulationCount;
-    searchConfig.rootNoise = 0.0f; // competition keeps the network's own opinion
+    const std::filesystem::path liveWeights = internalPath(weights, ".live.safetensors");
+    uint64_t firstGameId = 0;
+    uint64_t field = 0;
 
-    const Network* const networks[]{&candidate, &champion};
+    for (;;)
+    {
+        std::unique_ptr<Network> network = loadNetwork(liveWeights);
+        const Network* networks[]{network.get()};
+        GameBatchRunner<selfPlaySimulationCount, true> runner{networks};
+        runner.template play<gamesPerSelfPlayField, concurrentSelfPlayGames>(
+            firstGameId, seed + field,
+            [](int) { return NetworkPairing{0, 0}; },
+            [&](uint64_t, std::vector<TrainingSample>&& samples) {
+                sendSamples(workerChannel, samples);
+                return true;
+            });
+        firstGameId += gamesPerSelfPlayField;
+        ++field;
 
-    int wins = 0, draws = 0, losses = 0;
-
-    // A smaller field than self-play, because everything still in flight when the
-    // verdict settles is work thrown away: gateResultIsSettled() is consulted on each game that
-    // comes in, and the twentieth of 64 lands long before the rest.
-    GameBatchRunner gameRunner{networks, searchConfig, settings.samplingPlyCount};
-    gameRunner.playGames(
-        settings.gateGameCount, settings.concurrentGateGames, seed, "gate",
-        [](int game) { return game % 2 == 0 ? NetworkPairing{0, 1} : NetworkPairing{1, 0}; },
-        [&](int game, std::vector<TrainingSample>&& played)
+        pollfd descriptor{.fd = workerChannel, .events = POLLIN, .revents = 0};
+        while (poll(&descriptor, 1, 0) > 0 && (descriptor.revents & POLLIN) != 0)
         {
-            // The final sample is from the point of view of the side that lost or drew.
-            const TrainingSample& last = played.back();
-            const bool whiteWon = last.outcome < 0.0f ? !last.board.whiteToMove : last.board.whiteToMove;
-
-            if (last.outcome == 0.0f)
-                ++draws;
-            else if (whiteWon == (game % 2 == 0))
-                ++wins;
-            else
-                ++losses;
-
-            const int total = wins + draws + losses;
-            const double score = (wins + 0.5 * draws) / total;
-            return !gateResultIsSettled(total, score, settings.promotionThreshold);
-        });
-
-    const int total = wins + draws + losses;
-    const double score = (wins + 0.5 * draws) / total;
-
-    report("[gate] candidate {:.1f}% +/- {:.1f}% ({}-{}-{}) over {} games at {} simulations", 100.0 * score,
-           100.0 * standardError(score, total), wins, draws, losses, total, settings.gateSimulationCount);
-    return score;
+            Message message;
+            if (!receiveMessage(workerChannel, message) || message.type == MessageType::stop)
+                return EXIT_SUCCESS;
+            descriptor.revents = 0;
+        }
+    }
+}
+catch (const std::exception& error)
+{
+    std::println(stderr, "[selfplay] {}", error.what());
+    return EXIT_FAILURE;
 }
 
-// ---------------------------------------------------------------------------
-
-TrainingSettings::TrainingSettings()
-    : seed(static_cast<uint64_t>(readIntegerSetting("SEED", 20260819)))
-    , searchConfig{.simulations = readIntegerSetting("SIMULATIONS", 400)}
-    , selfPlayGameCount(readIntegerSetting("GAMES", 512))
-    , samplingPlyCount(readIntegerSetting("SAMPLING_PLIES", 20))
-    , rootNoise(readFloatSetting("NOISE", 0.25f))
-    , concurrentSelfPlayGames(readIntegerSetting("CONCURRENT", 256))
-    , maximumTrainingSteps(readIntegerSetting("STEPS", 1000))
-    , trainingBatchSize(readIntegerSetting("BATCH", 256))
-    , learningRate(readFloatSetting("RATE", 1e-3f))
-    , weightDecay(readFloatSetting("DECAY", 1e-4f))
-    , replayBufferCapacity(static_cast<size_t>(readIntegerSetting("BUFFER", 300000)))
-    , gateGameCount(readIntegerSetting("GATE_GAMES", 200))
-    , promotionThreshold(readFloatSetting("GATE", 0.55f))
-    , concurrentGateGames(readIntegerSetting("GATE_CONCURRENT", 256))
-    , gateSimulationCount(readIntegerSetting("GATE_SIMULATIONS", 200))
+int runEvaluationWorker(const std::filesystem::path& weights)
+try
 {
+    const std::filesystem::path candidateWeights =
+        internalPath(weights, ".candidate.safetensors");
+
+    for (;;)
+    {
+        Message command;
+        if (!receiveMessage(workerChannel, command) || command.type == MessageType::stop)
+            return EXIT_SUCCESS;
+        if (command.type != MessageType::evaluate)
+            throw std::runtime_error("evaluation worker received an invalid command");
+
+        std::unique_ptr<Network> candidate = loadNetwork(candidateWeights);
+        std::unique_ptr<Network> champion = loadNetwork(weights);
+        const Network* networks[]{candidate.get(), champion.get()};
+        int wins = 0;
+        int draws = 0;
+        int losses = 0;
+
+        GameBatchRunner<evaluationSimulationCount, false> runner{networks};
+        runner.template play<evaluationGameCount, concurrentEvaluationGames>(
+            command.version * evaluationGameCount,
+            seed + 7777 + command.version,
+            [](int game) {
+                return game % 2 == 0 ? NetworkPairing{0, 1}
+                                     : NetworkPairing{1, 0};
+            },
+            [&](uint64_t gameId, std::vector<TrainingSample>&& samples) {
+                const TrainingSample& last = samples.back();
+                if (last.outcome == 0.0f)
+                    ++draws;
+                else
+                {
+                    const bool whiteWon =
+                        (last.outcome > 0.0f) == last.board.whiteToMove;
+                    const bool candidateWasWhite = gameId % 2 == 0;
+                    if (whiteWon == candidateWasWhite)
+                        ++wins;
+                    else
+                        ++losses;
+                }
+                const int total = wins + draws + losses;
+                const double score = (wins + 0.5 * draws) / total;
+                return !gateSettled(total, score);
+            });
+
+        const int total = wins + draws + losses;
+        const double score = (wins + 0.5 * draws) / total;
+        const bool promoted = score >= promotionThreshold;
+        if (promoted)
+            saveAtomically(*candidate, weights);
+        sendMessage(workerChannel, Message{
+            .type = MessageType::evaluationResult,
+            .count = static_cast<uint32_t>(total),
+            .version = command.version,
+            .score = score,
+            .promoted = promoted,
+        });
+    }
+}
+catch (const std::exception& error)
+{
+    std::println(stderr, "[evaluation] {}", error.what());
+    return EXIT_FAILURE;
+}
+
+int runTraining(const std::filesystem::path& weights,
+                const std::filesystem::path& executable)
+{
+    Worker selfPlay;
+    Worker evaluation;
+    const std::filesystem::path liveWeights = internalPath(weights, ".live.safetensors");
+    const std::filesystem::path candidateWeights =
+        internalPath(weights, ".candidate.safetensors");
+
+    try
+    {
+        std::unique_ptr<Network> network;
+        if (std::filesystem::exists(weights))
+            network = loadNetwork(weights);
+        else
+        {
+            network = createDefaultNetwork(seed);
+            saveAtomically(*network, weights);
+        }
+
+        saveAtomically(*network, liveWeights);
+
+        report("[train] {}: {}, {} parameters", weights.string(),
+               network->name(), network->parameterCount());
+
+        selfPlay = spawnWorker(executable, "--self-play-worker", weights);
+        evaluation = spawnWorker(executable, "--evaluation-worker", weights);
+        signal(SIGINT, requestStop);
+        signal(SIGTERM, requestStop);
+
+        std::vector<TrainingSample> replay;
+        replay.reserve(replayBufferCapacity);
+        size_t replayWrite = 0;
+        double credits = 0.0;
+        std::mt19937_64 randomEngine{ seed };
+        std::vector<mlx::core::array> parameters = network->parameters();
+        Adam adam{ parameters };
+        uint64_t step = 0;
+        bool evaluationBusy = false;
+        bool evaluationPending = false;
+
+        const auto publishCandidate = [&] {
+            network->replaceParameters(parameters);
+            saveAtomically(*network, candidateWeights);
+            sendMessage(evaluation.socket, Message{
+                                               .type = MessageType::evaluate,
+                                               .version = step,
+                                           });
+            evaluationBusy = true;
+            evaluationPending = false;
+        };
+
+        while (!stopRequested)
+        {
+            const bool canTrain = replay.size() >= minimumReplaySize
+                                  && credits >= trainingBatchSize;
+            pollfd descriptors[]{
+                { .fd = selfPlay.socket, .events = POLLIN, .revents = 0 },
+                { .fd = evaluation.socket, .events = POLLIN, .revents = 0 },
+            };
+            const int ready = poll(descriptors, 2, canTrain ? 0 : -1);
+            if (ready < 0 && errno != EINTR)
+                throw std::runtime_error(std::format("poll: {}", std::strerror(errno)));
+            if (stopRequested)
+                break;
+
+            if ((descriptors[0].revents & POLLIN) != 0)
+            {
+                Message message;
+                if (!receiveMessage(selfPlay.socket, message))
+                    throw std::runtime_error("self-play worker stopped");
+                if (message.type != MessageType::samples)
+                    throw std::runtime_error("trainer received an invalid self-play message");
+
+                std::vector<TrainingSample> fresh(message.count);
+                if (!readAll(selfPlay.socket, fresh.data(), fresh.size() * sizeof(TrainingSample)))
+                    throw std::runtime_error("self-play worker stopped inside a sample batch");
+                for (TrainingSample& sample : fresh)
+                {
+                    if (replay.size() < replayBufferCapacity)
+                        replay.push_back(std::move(sample));
+                    else
+                    {
+                        replay[replayWrite] = std::move(sample);
+                        replayWrite = (replayWrite + 1) % replayBufferCapacity;
+                    }
+                }
+                credits += fresh.size() * targetReuse;
+            }
+
+            if ((descriptors[1].revents & POLLIN) != 0)
+            {
+                Message result;
+                if (!receiveMessage(evaluation.socket, result))
+                    throw std::runtime_error("evaluation worker stopped");
+                if (result.type != MessageType::evaluationResult)
+                    throw std::runtime_error("trainer received an invalid evaluation message");
+                report("[evaluation] step {}: {:.1f}% over {} games -- {}",
+                       result.version, 100.0 * result.score, result.count,
+                       result.promoted ? "PROMOTED" : "rejected");
+                evaluationBusy = false;
+                if (evaluationPending)
+                    publishCandidate();
+            }
+
+            if ((descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+                throw std::runtime_error("self-play worker failed");
+            if ((descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+                throw std::runtime_error("evaluation worker failed");
+
+            if (!canTrain)
+                continue;
+
+            std::array<size_t, trainingBatchSize> picks;
+            for (size_t& pick : picks)
+                pick = std::uniform_int_distribution<size_t>{ 0, replay.size() - 1 }(randomEngine);
+            const TrainingBatch batch = createBatch(replay, picks);
+            const LossAndGrad result = network->valueAndGrad(parameters, batch, weightDecay);
+            parameters = adam.updateParameters(parameters, result.gradients, learningRate);
+            mlx::core::eval({ result.loss.policy, result.loss.value });
+            mlx::core::eval(parameters);
+            credits -= trainingBatchSize;
+            ++step;
+
+            const float policyLoss = result.loss.policy.item<float>();
+            const float valueLoss = result.loss.value.item<float>();
+            if (!std::isfinite(policyLoss) || !std::isfinite(valueLoss))
+                throw std::runtime_error("training produced a non-finite loss");
+
+            if (step % 10 == 0)
+            {
+                report("[train] step {}, replay {}, policy {:.4f}, value {:.4f}, credits {:.0f}",
+                       step, replay.size(), policyLoss, valueLoss, credits);
+            }
+
+            if (step % selfPlayRefreshSteps == 0)
+            {
+                network->replaceParameters(parameters);
+                saveAtomically(*network, liveWeights);
+                sendMessage(selfPlay.socket, Message{
+                                                 .type = MessageType::liveWeights,
+                                                 .version = step,
+                                             });
+            }
+
+            if (step % evaluationSteps == 0)
+            {
+                if (evaluationBusy)
+                    evaluationPending = true;
+                else
+                    publishCandidate();
+            }
+        }
+
+        stopWorker(selfPlay);
+        stopWorker(evaluation);
+        std::filesystem::remove(liveWeights);
+        std::filesystem::remove(candidateWeights);
+        return EXIT_SUCCESS;
+    }
+    catch (const std::exception& error)
+    {
+        stopWorker(selfPlay);
+        stopWorker(evaluation);
+        std::filesystem::remove(liveWeights);
+        std::filesystem::remove(candidateWeights);
+        std::println(stderr, "[train] {}", error.what());
+        return EXIT_FAILURE;
+    }
 }
 
 } // namespace amoeba_bot

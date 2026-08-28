@@ -20,7 +20,7 @@
 // needs all three to see draws and adjudications coming.
 
 #include "mcts.hpp"
-#include "amoeba_network.hpp"
+#include "network.hpp"
 #include "training.hpp"
 
 #include <arena/arena.h>
@@ -77,8 +77,8 @@ template <typename Callback> void runGuardedCallback(const char* callbackName, C
 struct BotContext
 {
     std::filesystem::path checkpointPath;
-    std::unique_ptr<AmoebaNetwork> network;
-    std::optional<MCTS> search;
+    std::unique_ptr<Network> network;
+    std::optional<MCTS<searchSimulationCount>> search;
     Board board;
     std::optional<Outcome> outcome;
     uint16_t plyCount = 0;
@@ -96,18 +96,17 @@ bool hasSamePosition(const Board& left, const Board& right)
 
 void startSearch(BotContext& context)
 {
-    context.search.emplace(context.board, context.positionHistory,
-                           MCTSConfig{.simulations = searchSimulationCount});
+    context.search.emplace(context.board, context.positionHistory);
 }
 
-VisitCounts finishSearch(MCTS& search, const Network& network)
+VisitCounts finishSearch(MCTS<searchSimulationCount>& search, const Network& network)
 {
     while (const Board* leaf = search.pendingLeaf())
     {
         const Board* boards[]{leaf};
         Evaluation evaluation;
         network(boards, std::span{&evaluation, 1});
-        search.absorb(evaluation);
+        search.absorb(evaluation.policy, evaluation.value);
     }
     return search.visits();
 }
@@ -231,10 +230,10 @@ Move selectMove(BotContext& context, std::chrono::steady_clock::time_point turnS
 
 void loadCheckpoint(BotContext& context)
 {
-    context.network = std::make_unique<AmoebaNetwork>(context.checkpointPath);
+    context.network = loadNetwork(context.checkpointPath);
 
     std::println("[bot] {}: {}, {} parameters", context.checkpointPath.filename().string(),
-                 AmoebaNetwork::name, context.network->parameterCount());
+                 context.network->name(), context.network->parameterCount());
 }
 
 void onGameStart(const arena_game_state_t* state, void* userData)
@@ -294,90 +293,6 @@ void onDisconnect(const char* reason, void*)
     std::println(stderr, "[bot] disconnected: {}", reason == nullptr ? "unknown reason" : reason);
 }
 
-// Flush high-level training progress even when stdout is redirected to a file.
-template <typename... Args> void report(std::format_string<Args...> format, Args&&... args)
-{
-    std::println(format, std::forward<Args>(args)...);
-    std::fflush(stdout);
-}
-
-void runTraining(const std::filesystem::path& weights)
-{
-    const TrainingSettings settings;
-
-    // Generation zero is saved immediately so bot mode has a checkpoint while
-    // the first generation is still being produced.
-    std::unique_ptr<AmoebaNetwork> champion;
-    if (std::filesystem::exists(weights))
-    {
-        champion = std::make_unique<AmoebaNetwork>(weights);
-        report("[train] resuming from {}: {}, {} parameters", weights.string(),
-               AmoebaNetwork::name, champion->parameterCount());
-    }
-    else
-    {
-        champion = std::make_unique<AmoebaNetwork>(settings.seed);
-        champion->save(weights);
-        report("[train] {} did not exist: started from random weights, {} parameters, saved",
-               weights.string(), champion->parameterCount());
-    }
-
-    std::vector<TrainingSample> replay;
-    int gameIdBase = 0;
-
-    for (int generation = 1;; ++generation)
-    {
-        report("");
-        report("======== generation {} ========", generation);
-
-        std::vector<TrainingSample> fresh = generateSelfPlaySamples(
-            *champion, settings,
-            settings.seed + static_cast<uint64_t>(generation) * 1000);
-
-        // IDs stay unique across generations so holding out one game cannot
-        // accidentally retain positions from an older game with the same ID.
-        for (TrainingSample& sample : fresh)
-            sample.gameId += gameIdBase;
-        gameIdBase += settings.selfPlayGameCount;
-
-        reportMemory("self-play");
-
-        replay.insert(replay.end(), std::make_move_iterator(fresh.begin()),
-                      std::make_move_iterator(fresh.end()));
-        if (replay.size() > settings.replayBufferCapacity)
-        {
-            replay.erase(replay.begin(), replay.begin() + static_cast<long>(
-                replay.size() - settings.replayBufferCapacity));
-        }
-        report("[train] replay buffer holds {} positions", replay.size());
-
-        // Training refines a copy; the champion remains unchanged until the
-        // candidate proves itself in games.
-        AmoebaNetwork candidate = *champion;
-        trainCandidate(candidate, replay, settings,
-                       settings.seed + static_cast<uint64_t>(generation));
-        reportMemory("training");
-
-        const double score = evaluateCandidate(
-            candidate, *champion, settings,
-            settings.seed + 7777 + static_cast<uint64_t>(generation));
-        reportMemory("the gate");
-
-        if (score < settings.promotionThreshold)
-        {
-            report("[train] generation {} rejected at {:.1f}%, keeping the previous weights",
-                   generation, 100.0 * score);
-        }
-        else
-        {
-            *champion = candidate;
-            champion->save(weights);
-            report("[train] generation {} PROMOTED at {:.1f}%, wrote {}",
-                   generation, 100.0 * score, weights.string());
-        }
-    }
-}
-
 int runBot(const std::filesystem::path& weights)
 {
     const char* botId = std::getenv("BOT1_ID");
@@ -431,11 +346,14 @@ int runBot(const std::filesystem::path& weights)
 
 int main(int argc, char** argv)
 {
+    if (argc == 3 && std::string_view{argv[1]} == "--self-play-worker")
+        return amoeba_bot::runSelfPlayWorker(std::filesystem::path{argv[2]});
+
+    if (argc == 3 && std::string_view{argv[1]} == "--evaluation-worker")
+        return amoeba_bot::runEvaluationWorker(std::filesystem::path{argv[2]});
+
     if (argc == 3 && std::string_view{argv[1]} == "--train")
-    {
-        amoeba_bot::runTraining(std::filesystem::path{argv[2]});
-        return EXIT_SUCCESS;
-    }
+        return amoeba_bot::runTraining(std::filesystem::path{argv[2]}, argv[0]);
 
     if (argc == 2 && std::string_view{argv[1]} != "--train")
         return amoeba_bot::runBot(std::filesystem::path{argv[1]});

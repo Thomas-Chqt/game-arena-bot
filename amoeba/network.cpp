@@ -1,4 +1,6 @@
 #include "network.hpp"
+#include "hex_ray_lite_network.hpp"
+#include "transformer_network.hpp"
 
 #include <cassert>
 #include <format>
@@ -7,22 +9,6 @@
 
 namespace amoeba_bot
 {
-
-namespace
-{
-
-uint16_t policyIndexToMoveId(uint16_t policyIndex, bool whiteToMove)
-{
-    Move move = Move::fromId(policyIndex);
-    if (!whiteToMove)
-    {
-        move.sourceCoord = rotatedHex(move.sourceCoord);
-        move.direction = oppositeDirection(move.direction);
-    }
-    return move.id();
-}
-
-} // namespace
 
 Prediction Network::evaluate(mlx::core::array input,
                              std::span<const mlx::core::array> parameters) const
@@ -66,6 +52,16 @@ void Network::createCompiledForward() const
 void Network::operator()(std::span<const Board* const> boards,
                          std::span<Evaluation> outputs) const
 {
+    const auto policyIndexToMoveId = [](uint16_t policyIndex, bool whiteToMove) {
+        Move move = Move::fromId(policyIndex);
+        if (!whiteToMove)
+        {
+            move.sourceCoord = rotatedHex(move.sourceCoord);
+            move.direction = oppositeDirection(move.direction);
+        }
+        return move.id();
+    };
+
     assert(boards.size() == outputs.size());
     const int batchSize = static_cast<int>(boards.size());
 
@@ -194,6 +190,33 @@ std::string childName(std::string_view parent, std::string_view child)
 std::string indexedName(std::string_view parent, size_t index)
 {
     return childName(parent, std::format("{}", index));
+}
+
+std::unique_ptr<Network> createDefaultNetwork(uint64_t seed)
+{
+    using DefaultNetwork = TransformerNetwork;
+    return std::make_unique<DefaultNetwork>(seed);
+}
+
+std::unique_ptr<Network> loadNetwork(const std::filesystem::path& checkpoint)
+{
+    auto [tensors, metadata] = mlx::core::load_safetensors(checkpoint.string());
+    const auto storedName = metadata.find("network");
+    if (storedName == metadata.end())
+    {
+        if (metadata["blocks"] == "6" && metadata["width"] == "128"
+            && metadata["heads"] == "8")
+            return std::make_unique<TransformerNetwork>(checkpoint);
+        throw std::runtime_error(std::format(
+            "{}: checkpoint has no recognized network identifier", checkpoint.string()));
+    }
+
+    if (storedName->second == TransformerNetwork::identifier)
+        return std::make_unique<TransformerNetwork>(checkpoint);
+    if (storedName->second == HexRayLiteNetwork::identifier)
+        return std::make_unique<HexRayLiteNetwork>(checkpoint);
+    throw std::runtime_error(std::format(
+        "{}: unknown network identifier {}", checkpoint.string(), storedName->second));
 }
 
 Adam::Adam(const std::vector<mlx::core::array>& parameters, AdamConfig config)

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "mcts.hpp"
+#include "amoeba.hpp"
 
 #include <mlx/mlx.h>
 
@@ -15,6 +15,7 @@
 #include <format>
 #include <functional>
 #include <numeric>
+#include <memory>
 #include <print>
 #include <span>
 #include <stdexcept>
@@ -37,10 +38,10 @@ concept Module = requires(const T& module, mlx::core::array input, std::span<con
     module(std::move(input), parameters);
 };
 
-template<typename T>
-struct NetworkName
+struct Evaluation
 {
-    static_assert(false, "");
+    std::array<float, moveIdCount> policy{};
+    float value{};
 };
 
 struct Prediction
@@ -87,6 +88,8 @@ class Network
 
 public:
     virtual ~Network() = default;
+
+    std::string_view name() const { return m_name; }
 
     // MCTS-facing inference. This fixed Amoeba adapter batches Board objects,
     // masks illegal moves, and returns probabilities indexed by absolute move id.
@@ -198,12 +201,13 @@ protected:
 
     void materializeParameters() { mlx::core::eval(m_parameters); }
 
-    void load(const std::filesystem::path& checkpoint)
+    void load(const std::filesystem::path& checkpoint, bool acceptMissingIdentifier = false)
     {
         auto [tensors, metadata] = mlx::core::load_safetensors(checkpoint.string());
 
         const auto storedName = metadata.find("network");
-        if (storedName == metadata.end() || storedName->second != m_name)
+        if ((storedName == metadata.end() && !acceptMissingIdentifier)
+            || (storedName != metadata.end() && storedName->second != m_name))
             throw std::runtime_error(std::format("{}: checkpoint is not for network {}", checkpoint.string(), m_name));
         if (tensors.size() != m_layout.size())
             throw std::runtime_error(std::format("{}: expected {} tensors, found {}", checkpoint.string(),
@@ -602,5 +606,8 @@ private:
     std::vector<mlx::core::array> m_variance;
     int m_steps = 0;
 };
+
+std::unique_ptr<Network> createDefaultNetwork(uint64_t seed);
+std::unique_ptr<Network> loadNetwork(const std::filesystem::path& checkpoint);
 
 } // namespace amoeba_bot

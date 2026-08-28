@@ -13,6 +13,8 @@ set(AMOEBA_SOURCES
     amoeba/amoeba.cpp
     amoeba/mcts.cpp
     amoeba/network.cpp
+    amoeba/transformer_network.cpp
+    amoeba/hex_ray_lite_network.cpp
     amoeba/training.cpp
 )
 
