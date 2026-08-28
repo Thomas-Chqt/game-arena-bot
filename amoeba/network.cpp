@@ -49,8 +49,7 @@ void Network::createCompiledForward() const
     m_compiledForward = mlx::core::compile(std::move(function));
 }
 
-void Network::operator()(std::span<const Board* const> boards,
-                         std::span<Evaluation> outputs) const
+PendingEvaluations Network::submit(std::span<const Board* const> boards) const
 {
     const auto policyIndexToMoveId = [](uint16_t policyIndex, bool whiteToMove) {
         Move move = Move::fromId(policyIndex);
@@ -62,14 +61,16 @@ void Network::operator()(std::span<const Board* const> boards,
         return move.id();
     };
 
-    assert(boards.size() == outputs.size());
     const int batchSize = static_cast<int>(boards.size());
+    assert(batchSize > 0);
 
     // Collect several MCTS leaves into one tensor so MLX evaluates them in one
     // GPU batch instead of launching one network call per position.
     std::vector<mlx::core::array> encodedBoards;
     encodedBoards.reserve(boards.size());
     std::vector<float> legalMoveMask(static_cast<size_t>(batchSize) * moveIdCount);
+    std::vector<uint8_t> whiteToMove;
+    whiteToMove.reserve(boards.size());
 
     for (size_t boardIndex = 0; boardIndex < boards.size(); ++boardIndex)
     {
@@ -77,6 +78,7 @@ void Network::operator()(std::span<const Board* const> boards,
         const size_t maskOffset = boardIndex * moveIdCount;
 
         encodedBoards.push_back(boards[boardIndex]->tensorEncoding());
+        whiteToMove.push_back(boards[boardIndex]->whiteToMove);
 
         for (int policyIndex = 0; policyIndex < moveIdCount; ++policyIndex)
         {
@@ -99,11 +101,31 @@ void Network::operator()(std::span<const Board* const> boards,
         mlx::core::greater(legal, mlx::core::array(0.0f)), prediction.policy,
         mlx::core::array(-1e9f));
     const mlx::core::array probabilities = mlx::core::softmax(masked, -1);
-    mlx::core::eval({probabilities, prediction.value});
+    std::vector<mlx::core::array> outputs{probabilities, prediction.value};
+    mlx::core::async_eval(outputs);
+    return {std::move(outputs), std::move(whiteToMove)};
+}
 
-    const float* policyData = probabilities.data<float>();
-    const float* valueData = prediction.value.data<float>();
-    for (size_t boardIndex = 0; boardIndex < boards.size(); ++boardIndex)
+void Network::finish(PendingEvaluations pending,
+                     std::span<Evaluation> outputs) const
+{
+    const auto policyIndexToMoveId = [](uint16_t policyIndex, bool whiteToMove) {
+        Move move = Move::fromId(policyIndex);
+        if (!whiteToMove)
+        {
+            move.sourceCoord = rotatedHex(move.sourceCoord);
+            move.direction = oppositeDirection(move.direction);
+        }
+        return move.id();
+    };
+
+    assert(pending.outputs.size() == 2);
+    assert(pending.whiteToMove.size() == outputs.size());
+    mlx::core::eval(pending.outputs);
+
+    const float* policyData = pending.outputs[0].data<float>();
+    const float* valueData = pending.outputs[1].data<float>();
+    for (size_t boardIndex = 0; boardIndex < outputs.size(); ++boardIndex)
     {
         const size_t policyOffset = boardIndex * moveIdCount;
 
@@ -111,10 +133,17 @@ void Network::operator()(std::span<const Board* const> boards,
         // policy indices back to absolute Move::id values before MCTS sees them.
         for (int policyIndex = 0; policyIndex < moveIdCount; ++policyIndex)
             outputs[boardIndex].policy[policyIndexToMoveId(
-                static_cast<uint16_t>(policyIndex), boards[boardIndex]->whiteToMove)] =
+                static_cast<uint16_t>(policyIndex), pending.whiteToMove[boardIndex])] =
                 policyData[policyOffset + policyIndex];
         outputs[boardIndex].value = valueData[boardIndex];
     }
+}
+
+void Network::operator()(std::span<const Board* const> boards,
+                         std::span<Evaluation> outputs) const
+{
+    assert(boards.size() == outputs.size());
+    finish(submit(boards), outputs);
 }
 
 std::vector<mlx::core::array> Network::computeLoss(
@@ -192,31 +221,66 @@ std::string indexedName(std::string_view parent, size_t index)
     return childName(parent, std::format("{}", index));
 }
 
-std::unique_ptr<Network> createDefaultNetwork(uint64_t seed)
+void Network::save(const std::filesystem::path& checkpoint) const
 {
-    using DefaultNetwork = TransformerNetwork;
-    return std::make_unique<DefaultNetwork>(seed);
+    std::unordered_map<std::string, mlx::core::array> tensors;
+    for (size_t index = 0; index < m_layout.size(); ++index)
+        tensors.emplace(m_layout[index].name, m_parameters[index]);
+
+    if (checkpoint.extension() == ".safetensors")
+    {
+        mlx::core::save_safetensors(
+            checkpoint.string(), tensors, {{"network", m_name}});
+        return;
+    }
+
+    std::filesystem::path temporary = checkpoint;
+    temporary += ".tmp.safetensors";
+    std::filesystem::remove(temporary);
+    mlx::core::save_safetensors(
+        temporary.string(), tensors, {{"network", m_name}});
+    std::filesystem::rename(temporary, checkpoint);
 }
 
-std::unique_ptr<Network> loadNetwork(const std::filesystem::path& checkpoint)
+std::unique_ptr<Network> createNetwork(std::string_view identifier, uint64_t seed)
+{
+    if (identifier == TransformerNetwork::identifier)
+        return std::make_unique<TransformerNetwork>(seed);
+    if (identifier == HexRayLiteNetwork::identifier)
+        return std::make_unique<HexRayLiteNetwork>(seed);
+    throw std::runtime_error(std::format("unknown network identifier {}", identifier));
+}
+
+std::unique_ptr<Network> loadNetwork(
+    const std::filesystem::path& checkpoint,
+    std::string_view expectedIdentifier)
 {
     auto [tensors, metadata] = mlx::core::load_safetensors(checkpoint.string());
     const auto storedName = metadata.find("network");
+    std::string_view identifier;
     if (storedName == metadata.end())
     {
         if (metadata["blocks"] == "6" && metadata["width"] == "128"
             && metadata["heads"] == "8")
-            return std::make_unique<TransformerNetwork>(checkpoint);
-        throw std::runtime_error(std::format(
-            "{}: checkpoint has no recognized network identifier", checkpoint.string()));
+            identifier = TransformerNetwork::identifier;
+        else
+            throw std::runtime_error(std::format(
+                "{}: checkpoint has no recognized network identifier", checkpoint.string()));
     }
+    else
+        identifier = storedName->second;
 
-    if (storedName->second == TransformerNetwork::identifier)
+    if (!expectedIdentifier.empty() && identifier != expectedIdentifier)
+        throw std::runtime_error(std::format(
+            "{}: checkpoint network {} does not match requested network {}",
+            checkpoint.string(), identifier, expectedIdentifier));
+
+    if (identifier == TransformerNetwork::identifier)
         return std::make_unique<TransformerNetwork>(checkpoint);
-    if (storedName->second == HexRayLiteNetwork::identifier)
+    if (identifier == HexRayLiteNetwork::identifier)
         return std::make_unique<HexRayLiteNetwork>(checkpoint);
     throw std::runtime_error(std::format(
-        "{}: unknown network identifier {}", checkpoint.string(), storedName->second));
+        "{}: unknown network identifier {}", checkpoint.string(), identifier));
 }
 
 Adam::Adam(const std::vector<mlx::core::array>& parameters, AdamConfig config)
@@ -229,6 +293,31 @@ Adam::Adam(const std::vector<mlx::core::array>& parameters, AdamConfig config)
         m_mean.push_back(mlx::core::zeros(tensor.shape(), tensor.dtype()));
         m_variance.push_back(mlx::core::zeros(tensor.shape(), tensor.dtype()));
     }
+}
+
+void Adam::restore(std::vector<mlx::core::array> mean,
+                   std::vector<mlx::core::array> variance, int steps)
+{
+    if (mean.size() != m_mean.size() || variance.size() != m_variance.size())
+        throw std::runtime_error("Adam checkpoint has the wrong number of tensors");
+    if (steps < 0)
+        throw std::runtime_error("Adam checkpoint has a negative step count");
+
+    for (size_t index = 0; index < m_mean.size(); ++index)
+    {
+        if (mean[index].shape() != m_mean[index].shape()
+            || variance[index].shape() != m_variance[index].shape()
+            || mean[index].dtype() != m_mean[index].dtype()
+            || variance[index].dtype() != m_variance[index].dtype())
+            throw std::runtime_error(std::format(
+                "Adam checkpoint tensor {} has the wrong shape or type", index));
+    }
+
+    m_mean = std::move(mean);
+    m_variance = std::move(variance);
+    m_steps = steps;
+    mlx::core::eval(m_mean);
+    mlx::core::eval(m_variance);
 }
 
 std::vector<mlx::core::array> Adam::updateParameters(const std::vector<mlx::core::array>& parameters,

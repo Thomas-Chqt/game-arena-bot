@@ -1,11 +1,10 @@
 // amoeba_bot either plays Amoeba on Game Arena or trains the same network:
 //
-//   amoeba_bot <weights.safetensors>
-//   amoeba_bot --train <weights.safetensors>
+//   amoeba_bot [--network <identifier>] <weights.safetensors>
+//   amoeba_bot --train [--network <identifier>] <weights.safetensors>
 //
-// Bot mode requires an existing checkpoint and keeps it for the process lifetime.
-// Training mode creates a missing checkpoint and replaces it whenever a candidate
-// defeats the current champion.
+// An existing checkpoint identifies its own architecture. --network checks that
+// identifier, or selects the architecture when creating a missing checkpoint.
 //
 // Credentials come from BOT1_ID and BOT1_KEY; ROOM_ID picks a practice room, and
 // without it the bot queues for ranked games back to back.
@@ -51,6 +50,7 @@ namespace
 // is no clock on it, so elapsed time is a measurement rather than a limit. The
 // server allows 5 s a move, and nothing here enforces that.
 constexpr int searchSimulationCount = 1000;
+constexpr uint64_t initializationSeed = 20260819;
 
 // A C++ exception unwinding through the SDK's C frames is undefined behaviour,
 // so nothing may leave a callback. A turn that goes unanswered times out and
@@ -228,14 +228,6 @@ Move selectMove(BotContext& context, std::chrono::steady_clock::time_point turnS
     return chosenMove;
 }
 
-void loadCheckpoint(BotContext& context)
-{
-    context.network = loadNetwork(context.checkpointPath);
-
-    std::println("[bot] {}: {}, {} parameters", context.checkpointPath.filename().string(),
-                 context.network->name(), context.network->parameterCount());
-}
-
 void onGameStart(const arena_game_state_t* state, void* userData)
 {
     runGuardedCallback("on_game_start", [&] {
@@ -293,7 +285,8 @@ void onDisconnect(const char* reason, void*)
     std::println(stderr, "[bot] disconnected: {}", reason == nullptr ? "unknown reason" : reason);
 }
 
-int runBot(const std::filesystem::path& weights)
+int runBot(const std::filesystem::path& weights,
+           std::string_view networkIdentifier)
 {
     const char* botId = std::getenv("BOT1_ID");
     const char* apiKey = std::getenv("BOT1_KEY");
@@ -308,8 +301,19 @@ int runBot(const std::filesystem::path& weights)
     {
         context.checkpointPath = weights;
         if (!std::filesystem::exists(context.checkpointPath))
-            throw std::runtime_error(std::format("{} does not exist", context.checkpointPath.string()));
-        loadCheckpoint(context);
+        {
+            if (networkIdentifier.empty())
+                throw std::runtime_error(std::format(
+                    "{} does not exist; select a network with --network",
+                    context.checkpointPath.string()));
+            context.network = createNetwork(networkIdentifier, initializationSeed);
+            context.network->save(context.checkpointPath);
+        }
+        else
+            context.network = loadNetwork(context.checkpointPath, networkIdentifier);
+        std::println("[bot] {}: {}, {} parameters",
+                     context.checkpointPath.filename().string(),
+                     context.network->name(), context.network->parameterCount());
     }
     catch (const std::exception& error)
     {
@@ -346,19 +350,40 @@ int runBot(const std::filesystem::path& weights)
 
 int main(int argc, char** argv)
 {
-    if (argc == 3 && std::string_view{argv[1]} == "--self-play-worker")
-        return amoeba_bot::runSelfPlayWorker(std::filesystem::path{argv[2]});
+    bool train = false;
+    bool valid = true;
+    bool networkSpecified = false;
+    std::string_view networkIdentifier;
+    std::filesystem::path weights;
+    for (int index = 1; index < argc; ++index)
+    {
+        const std::string_view argument{argv[index]};
+        if (argument == "--train")
+            train = true;
+        else if (argument == "--network" && !networkSpecified
+                 && index + 1 < argc)
+        {
+            networkSpecified = true;
+            networkIdentifier = argv[++index];
+            if (networkIdentifier.empty() || networkIdentifier.starts_with('-'))
+                valid = false;
+        }
+        else if (argument.starts_with('-') || !weights.empty())
+            valid = false;
+        else
+            weights = argument;
+    }
 
-    if (argc == 3 && std::string_view{argv[1]} == "--evaluation-worker")
-        return amoeba_bot::runEvaluationWorker(std::filesystem::path{argv[2]});
+    if (valid && !weights.empty())
+    {
+        if (train)
+            return amoeba_bot::runTraining(weights, networkIdentifier);
+        return amoeba_bot::runBot(weights, networkIdentifier);
+    }
 
-    if (argc == 3 && std::string_view{argv[1]} == "--train")
-        return amoeba_bot::runTraining(std::filesystem::path{argv[2]}, argv[0]);
-
-    if (argc == 2 && std::string_view{argv[1]} != "--train")
-        return amoeba_bot::runBot(std::filesystem::path{argv[1]});
-
-    std::println(stderr, "usage: amoeba_bot <weights.safetensors>");
-    std::println(stderr, "       amoeba_bot --train <weights.safetensors>");
+    std::println(stderr,
+                 "usage: amoeba_bot [--network <identifier>] <weights.safetensors>");
+    std::println(stderr,
+                 "       amoeba_bot --train [--network <identifier>] <weights.safetensors>");
     return EXIT_FAILURE;
 }

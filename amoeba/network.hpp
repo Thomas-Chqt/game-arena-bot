@@ -44,6 +44,12 @@ struct Evaluation
     float value{};
 };
 
+struct PendingEvaluations
+{
+    std::vector<mlx::core::array> outputs;
+    std::vector<uint8_t> whiteToMove;
+};
+
 struct Prediction
 {
     mlx::core::array policy; // [batch, moveIdCount]
@@ -93,6 +99,9 @@ public:
 
     // MCTS-facing inference. This fixed Amoeba adapter batches Board objects,
     // masks illegal moves, and returns probabilities indexed by absolute move id.
+    PendingEvaluations submit(std::span<const Board* const> boards) const;
+    void finish(PendingEvaluations pending,
+                std::span<Evaluation> outputs) const;
     void operator()(std::span<const Board* const> boards,
                     std::span<Evaluation> outputs) const;
 
@@ -159,13 +168,7 @@ public:
         std::println("Total parameters: {}", parameterCount());
     }
 
-    void save(const std::filesystem::path& checkpoint) const
-    {
-        std::unordered_map<std::string, mlx::core::array> tensors;
-        for (size_t index = 0; index < m_layout.size(); ++index)
-            tensors.emplace(m_layout[index].name, m_parameters[index]);
-        mlx::core::save_safetensors(checkpoint.string(), tensors, {{"network", m_name}});
-    }
+    void save(const std::filesystem::path& checkpoint) const;
 
 protected:
     // The base is constructed before the derived module members, so setting the
@@ -209,9 +212,17 @@ protected:
         if ((storedName == metadata.end() && !acceptMissingIdentifier)
             || (storedName != metadata.end() && storedName->second != m_name))
             throw std::runtime_error(std::format("{}: checkpoint is not for network {}", checkpoint.string(), m_name));
-        if (tensors.size() != m_layout.size())
-            throw std::runtime_error(std::format("{}: expected {} tensors, found {}", checkpoint.string(),
-                                                 m_layout.size(), tensors.size()));
+
+        for (const auto& [name, tensor] : tensors)
+        {
+            const bool networkParameter = std::ranges::any_of(
+                m_layout, [&](const ParameterDefinition& definition) {
+                    return definition.name == name;
+                });
+            if (!networkParameter && !name.starts_with("adam."))
+                throw std::runtime_error(std::format(
+                    "{}: unexpected tensor {}", checkpoint.string(), name));
+        }
 
         std::vector<mlx::core::array> loaded;
         loaded.reserve(m_layout.size());
@@ -598,7 +609,12 @@ public:
     std::vector<mlx::core::array> updateParameters(const std::vector<mlx::core::array>& parameters,
                                                     const std::vector<mlx::core::array>& gradients, float rate);
 
+    void restore(std::vector<mlx::core::array> mean,
+                 std::vector<mlx::core::array> variance, int steps);
+
     int steps() const { return m_steps; }
+    const std::vector<mlx::core::array>& mean() const { return m_mean; }
+    const std::vector<mlx::core::array>& variance() const { return m_variance; }
 
 private:
     AdamConfig m_config;
@@ -607,7 +623,9 @@ private:
     int m_steps = 0;
 };
 
-std::unique_ptr<Network> createDefaultNetwork(uint64_t seed);
-std::unique_ptr<Network> loadNetwork(const std::filesystem::path& checkpoint);
+std::unique_ptr<Network> createNetwork(std::string_view identifier, uint64_t seed);
+std::unique_ptr<Network> loadNetwork(
+    const std::filesystem::path& checkpoint,
+    std::string_view expectedIdentifier = {});
 
 } // namespace amoeba_bot
