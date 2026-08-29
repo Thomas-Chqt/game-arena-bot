@@ -35,6 +35,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -49,8 +50,10 @@ constexpr int selfPlaySimulationCount = 200;
 constexpr int evaluationSimulationCount = 200;
 constexpr int selfPlayLaneSize = 256;
 constexpr int championGameCount = 200;
+constexpr int evaluationOpeningPlyCount = 4;
 constexpr int randomGameCount = 100;
 constexpr int rolloutGameCount = 100;
+constexpr int baselineScreenGameCount = 16;
 constexpr int concurrentEvaluationGames = 64;
 constexpr int samplingPlyCount = 20;
 constexpr float rootNoise = 0.25f;
@@ -64,6 +67,7 @@ constexpr float weightDecay = 1e-4f;
 constexpr uint64_t selfPlayRefreshSteps = 50;
 constexpr uint64_t evaluationSteps = 1'000;
 constexpr float promotionThreshold = 0.55f;
+constexpr float clearBaselineScore = 14.0f / baselineScreenGameCount;
 constexpr int workerSocket = 3;
 constexpr char workerRoleEnvironment[] = "AMOEBA_TRAINING_WORKER";
 constexpr char workerSocketEnvironment[] = "AMOEBA_TRAINING_SOCKET";
@@ -249,9 +253,23 @@ template<int SimulationCount>
 void initialize(ActiveGame<SimulationCount>& game, uint64_t gameId,
                 NetworkPairing pairing, uint64_t randomSeed)
 {
-    game.board = Board::startingBoard();
+    initialize(game, gameId, pairing, randomSeed, Board::startingBoard(), {});
+}
+
+template<int SimulationCount>
+void initialize(ActiveGame<SimulationCount>& game, uint64_t gameId,
+                NetworkPairing pairing, uint64_t randomSeed,
+                const Board& initialBoard, std::span<const uint64_t> initialHistory)
+{
+    game.board = initialBoard;
     game.outcome.reset();
-    game.positionHistory.assign(1, game.board.positionHash);
+    if (initialHistory.empty())
+        game.positionHistory.assign(1, game.board.positionHash);
+    else
+    {
+        assert(initialHistory.back() == game.board.positionHash);
+        game.positionHistory.assign(initialHistory.begin(), initialHistory.end());
+    }
     game.samples.clear();
     game.moveRandom.seed(randomSeed ^ (0x9e3779b97f4a7c15ULL * (gameId + 1)));
     game.noiseRandom.seed(randomSeed + gameId);
@@ -259,6 +277,46 @@ void initialize(ActiveGame<SimulationCount>& game, uint64_t gameId,
     game.gameId = gameId;
     game.active = true;
     startSearch(game);
+}
+
+struct EvaluationOpening
+{
+    Board board;
+    std::vector<uint64_t> positionHistory;
+};
+
+std::optional<EvaluationOpening> makeEvaluationOpening(std::mt19937_64& randomEngine)
+{
+    EvaluationOpening opening{.board = Board::startingBoard()};
+    opening.positionHistory.push_back(opening.board.positionHash);
+    for (int ply = 0; ply < evaluationOpeningPlyCount; ++ply)
+    {
+        const MoveResult result = applyMove(
+            opening.board, Move::fromId(randomLegalMove(opening.board, randomEngine)),
+            opening.positionHistory);
+        if (std::holds_alternative<Outcome>(result))
+            return std::nullopt;
+        opening.board = std::get<Board>(result);
+        opening.positionHistory.push_back(opening.board.positionHash);
+    }
+    return opening;
+}
+
+std::vector<EvaluationOpening> makeEvaluationOpenings(size_t count)
+{
+    // Every candidate sees this same suite. Pairing both colours from each
+    // position adds position diversity without injecting noise into search.
+    std::mt19937_64 randomEngine{seed + 7777};
+    std::unordered_set<uint64_t> positionHashes;
+    std::vector<EvaluationOpening> openings;
+    openings.reserve(count);
+    while (openings.size() < count)
+    {
+        std::optional<EvaluationOpening> opening = makeEvaluationOpening(randomEngine);
+        if (opening.has_value() && positionHashes.insert(opening->board.positionHash).second)
+            openings.push_back(std::move(*opening));
+    }
+    return openings;
 }
 
 template<int SimulationCount, bool SampleOpeningMoves>
@@ -336,17 +394,24 @@ public:
               GameFinished&& gameFinished)
     {
         static_assert(GameCount > 0);
+        static_assert(GameCount % 2 == 0);
+        const std::vector<EvaluationOpening> openings =
+            makeEvaluationOpenings(static_cast<size_t>(GameCount / 2));
         const int slotCount = std::min(GameCount, concurrentEvaluationGames);
         std::vector<ActiveGame<SimulationCount>> games(static_cast<size_t>(slotCount));
         int started = 0;
         int completed = 0;
-        for (ActiveGame<SimulationCount>& game : games)
-        {
+        const auto initializeGame = [&](ActiveGame<SimulationCount>& game) {
+            const size_t openingIndex = static_cast<size_t>(started / 2);
             initialize(game, firstGameId + started,
                        started % 2 == 0 ? NetworkPairing{0, 1}
-                                        : NetworkPairing{1, 0}, randomSeed);
+                                        : NetworkPairing{1, 0},
+                       randomSeed, openings[openingIndex].board,
+                       openings[openingIndex].positionHistory);
             ++started;
-        }
+        };
+        for (ActiveGame<SimulationCount>& game : games)
+            initializeGame(game);
         std::array<std::vector<const Board*>, 2> pendingBoards;
         std::array<std::vector<Evaluation>, 2> evaluations;
         while (completed < GameCount)
@@ -365,10 +430,7 @@ public:
                     ++completed;
                     if (started < GameCount)
                     {
-                        initialize(game, firstGameId + started,
-                                   started % 2 == 0 ? NetworkPairing{0, 1}
-                                                    : NetworkPairing{1, 0}, randomSeed);
-                        ++started;
+                        initializeGame(game);
                         advance<SimulationCount, false>(game);
                     }
                     else
@@ -991,6 +1053,22 @@ bool playBaselineGames(const Network& candidate, Baseline baseline,
     return true;
 }
 
+template<int TotalGameCount>
+bool playBaselineMatch(const Network& candidate, Baseline baseline,
+                       uint64_t firstGameId, uint64_t randomSeed,
+                       MatchScore& score, int socket)
+{
+    static_assert(TotalGameCount >= baselineScreenGameCount);
+    if (!playBaselineGames<baselineScreenGameCount>(
+            candidate, baseline, firstGameId, randomSeed, score, socket))
+        return false;
+    if (score.score() >= clearBaselineScore)
+        return true;
+    return playBaselineGames<TotalGameCount - baselineScreenGameCount>(
+        candidate, baseline, firstGameId + baselineScreenGameCount,
+        randomSeed, score, socket);
+}
+
 int runSelfPlayWorker(const std::filesystem::path& weights, int socket)
 try
 {
@@ -1056,11 +1134,11 @@ try
             });
         if (!championComplete)
             return EXIT_SUCCESS;
-        if (!playBaselineGames<randomGameCount>(
+        if (!playBaselineMatch<randomGameCount>(
                 *candidate, Baseline::random, command.version * 1'000 + 200,
                 seed + 8888 + command.version, scores[1], socket))
             return EXIT_SUCCESS;
-        if (!playBaselineGames<rolloutGameCount>(
+        if (!playBaselineMatch<rolloutGameCount>(
                 *candidate, Baseline::rollout, command.version * 1'000 + 300,
                 seed + 9999 + command.version, scores[2], socket))
             return EXIT_SUCCESS;
