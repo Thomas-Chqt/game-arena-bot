@@ -108,14 +108,11 @@ template<typename... Args>
 void report(std::format_string<Args...> format, Args&&... args)
 {
     if (selfPlayStatus.visible && isatty(STDOUT_FILENO))
-        std::println();
+        clearTerminalLine();
     std::println(format, std::forward<Args>(args)...);
     std::fflush(stdout);
     if (selfPlayStatus.visible)
-    {
         selfPlayStatus.rounds = 0;
-        drawSelfPlayStatus();
-    }
 }
 
 void reportSelfPlayStatus(uint64_t receivedRounds)
@@ -126,30 +123,22 @@ void reportSelfPlayStatus(uint64_t receivedRounds)
         std::chrono::steady_clock::now() - selfPlayStatus.startedAt).count();
     selfPlayStatus.roundsPerSecond = selfPlayStatus.totalRounds / elapsed;
     selfPlayStatus.visible = true;
-    if (!isatty(STDOUT_FILENO))
+    if (isatty(STDOUT_FILENO))
+        drawSelfPlayStatus();
+    else
     {
         std::println("[selfplay] received {} rounds, {:.1f} rounds/s average",
                      selfPlayStatus.rounds, selfPlayStatus.roundsPerSecond);
         std::fflush(stdout);
-        return;
     }
-    drawSelfPlayStatus();
 }
 
 void finishSelfPlayStatus()
 {
     if (!selfPlayStatus.visible)
         return;
-    if (!isatty(STDOUT_FILENO))
-    {
-        selfPlayStatus.visible = false;
-        return;
-    }
     clearTerminalLine();
     selfPlayStatus.visible = false;
-    std::println("[selfplay] received {} rounds, {:.1f} rounds/s average",
-                 selfPlayStatus.rounds, selfPlayStatus.roundsPerSecond);
-    std::fflush(stdout);
 }
 
 void requestStop(int)
