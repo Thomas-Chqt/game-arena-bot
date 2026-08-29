@@ -1550,7 +1550,6 @@ int runTraining(const std::filesystem::path& weights,
         size_t batchAttemptCount = 0;
         std::array<bool, 1000> nonFiniteWindow{};
         bool evaluationBusy = false;
-        bool evaluationPending = false;
         const auto publishCandidate = [&] {
             // A candidate that fails the health sweep must abort here, not be
             // handed to the gate: a mutilated network can still clear 55%
@@ -1562,7 +1561,6 @@ int runTraining(const std::filesystem::path& weights,
             sendMessage(workers.evaluation.socket,
                         Message{.type = MessageType::evaluate, .version = step});
             evaluationBusy = true;
-            evaluationPending = false;
         };
 
         while (!stopRequested)
@@ -1623,8 +1621,6 @@ int runTraining(const std::filesystem::path& weights,
                 report("[evaluation] step {}: {}", result.version,
                        result.promoted ? "PROMOTED" : "rejected");
                 evaluationBusy = false;
-                if (evaluationPending)
-                    publishCandidate();
             }
             if ((descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
                 throw std::runtime_error("self-play worker failed");
@@ -1696,9 +1692,7 @@ int runTraining(const std::filesystem::path& weights,
             }
             if (step % evaluationSteps == 0)
             {
-                if (evaluationBusy)
-                    evaluationPending = true;
-                else
+                if (!evaluationBusy)
                     publishCandidate();
             }
         }
