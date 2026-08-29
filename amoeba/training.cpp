@@ -114,7 +114,6 @@ void report(std::format_string<Args...> format, Args&&... args)
     if (selfPlayStatus.visible)
     {
         selfPlayStatus.rounds = 0;
-        drawSelfPlayStatus();
     }
 }
 
@@ -147,9 +146,12 @@ void finishSelfPlayStatus()
     }
     clearTerminalLine();
     selfPlayStatus.visible = false;
-    std::println("[selfplay] received {} rounds, {:.1f} rounds/s average",
-                 selfPlayStatus.rounds, selfPlayStatus.roundsPerSecond);
-    std::fflush(stdout);
+    if (selfPlayStatus.rounds > 0)
+    {
+        std::println("[selfplay] received {} rounds, {:.1f} rounds/s average",
+                     selfPlayStatus.rounds, selfPlayStatus.roundsPerSecond);
+        std::fflush(stdout);
+    }
 }
 
 void requestStop(int)
