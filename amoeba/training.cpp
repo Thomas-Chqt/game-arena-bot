@@ -1379,7 +1379,7 @@ int runTraining(const std::filesystem::path& weights,
                     throw std::runtime_error("self-play worker stopped");
                 if (message.type == MessageType::liveWeightsApplied)
                 {
-                    report("[train] network replaced at step {}", message.version);
+                    report("[selfplay] network replaced at step {}", message.version);
                     continue;
                 }
                 if (message.type != MessageType::samples)
