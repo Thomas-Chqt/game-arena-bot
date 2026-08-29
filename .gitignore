@@ -2,3 +2,4 @@
 .cache/
 build.nosync/
 *.live.safetensors
+*candidate.safetensors
