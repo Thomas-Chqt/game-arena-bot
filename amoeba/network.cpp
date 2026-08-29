@@ -246,18 +246,10 @@ std::unique_ptr<Network> loadNetwork(
 {
     auto [tensors, metadata] = mlx::core::load_safetensors(checkpoint.string());
     const auto storedName = metadata.find("network");
-    std::string_view identifier;
     if (storedName == metadata.end())
-    {
-        if (metadata["blocks"] == "6" && metadata["width"] == "128"
-            && metadata["heads"] == "8")
-            identifier = TransformerNetwork::identifier;
-        else
-            throw std::runtime_error(std::format(
-                "{}: checkpoint has no recognized network identifier", checkpoint.string()));
-    }
-    else
-        identifier = storedName->second;
+        throw std::runtime_error(std::format(
+            "{}: checkpoint has no network identifier", checkpoint.string()));
+    const std::string_view identifier = storedName->second;
 
     if (!expectedIdentifier.empty() && identifier != expectedIdentifier)
         throw std::runtime_error(std::format(

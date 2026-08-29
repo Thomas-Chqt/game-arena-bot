@@ -42,6 +42,10 @@ mlx::core::array TransformerBlock<Width, HeadCount>::operator()(
         std::array<int32_t, hexCount * hexCount> result{};
         for (uint8_t source = 0; source < hexCount; ++source)
         {
+            // A move never lands on its own source, so the diagonal is free
+            // for the self bucket and cannot collide with a (direction,
+            // distance) bucket.
+            result[source * hexCount + source] = 1;
             for (uint8_t direction = 0; direction < directionCount; ++direction)
             {
                 for (uint8_t distance = 1; distance <= maximumMovableStackHeight; ++distance)
@@ -50,7 +54,7 @@ mlx::core::array TransformerBlock<Width, HeadCount>::operator()(
                             destinationHex(source, directions[direction], distance))
                     {
                         result[source * hexCount + *destination] =
-                            1 + direction * maximumMovableStackHeight + distance - 1;
+                            2 + direction * maximumMovableStackHeight + distance - 1;
                     }
                 }
             }
@@ -86,12 +90,13 @@ TransformerNetwork::TransformerNetwork(uint64_t seed)
     , m_positionIndex(addParameter(
           "position", mlx::core::random::normal(
                           {hexCount, embeddingWidth}, mlx::core::float32, 0.0f, 0.02f)))
-    , m_block0(*this, "block0")
-    , m_block1(*this, "block1")
-    , m_block2(*this, "block2")
-    , m_block3(*this, "block3")
-    , m_block4(*this, "block4")
-    , m_block5(*this, "block5")
+    , m_block0(*this, "block0", residualInitScale())
+    , m_block1(*this, "block1", residualInitScale())
+    , m_block2(*this, "block2", residualInitScale())
+    , m_block3(*this, "block3", residualInitScale())
+    , m_block4(*this, "block4", residualInitScale())
+    , m_block5(*this, "block5", residualInitScale())
+    , m_finalNorm(*this, "final_norm")
     , m_policy(*this, "policy")
     , m_valueHiddenIndex(addParameter(
           "value.hidden", mlx::core::random::normal(
@@ -115,12 +120,13 @@ TransformerNetwork::TransformerNetwork(const std::filesystem::path& checkpoint)
     , m_positionIndex(addParameter(
           "position", mlx::core::random::normal(
                           {hexCount, embeddingWidth}, mlx::core::float32, 0.0f, 0.02f)))
-    , m_block0(*this, "block0")
-    , m_block1(*this, "block1")
-    , m_block2(*this, "block2")
-    , m_block3(*this, "block3")
-    , m_block4(*this, "block4")
-    , m_block5(*this, "block5")
+    , m_block0(*this, "block0", residualInitScale())
+    , m_block1(*this, "block1", residualInitScale())
+    , m_block2(*this, "block2", residualInitScale())
+    , m_block3(*this, "block3", residualInitScale())
+    , m_block4(*this, "block4", residualInitScale())
+    , m_block5(*this, "block5", residualInitScale())
+    , m_finalNorm(*this, "final_norm")
     , m_policy(*this, "policy")
     , m_valueHiddenIndex(addParameter(
           "value.hidden", mlx::core::random::normal(
@@ -135,7 +141,7 @@ TransformerNetwork::TransformerNetwork(const std::filesystem::path& checkpoint)
     , m_valueOutputBiasIndex(addParameter(
           "value.out.bias", mlx::core::zeros({1}, mlx::core::float32)))
 {
-    load(checkpoint, true);
+    load(checkpoint);
 }
 
 Prediction TransformerNetwork::forward(
@@ -168,6 +174,11 @@ Prediction TransformerNetwork::forward(
     tokens = m_block3(std::move(tokens), parameters);
     tokens = m_block4(std::move(tokens), parameters);
     tokens = m_block5(std::move(tokens), parameters);
+
+    // The blocks are pre-norm, so nothing above ever normalized the residual
+    // stream itself; without this both heads would read an activation scale
+    // that grows with depth and drifts over training.
+    tokens = m_finalNorm(std::move(tokens), parameters);
 
     const mlx::core::array policy = mlx::core::reshape(
         m_policy(tokens, parameters), {batchSize, moveIdCount});

@@ -1285,6 +1285,167 @@ Workers forkWorkers(const std::filesystem::path& weights)
             .evaluation = {evaluationProcess, evaluationChannels[0]}};
 }
 
+// ---------------------------------------------------------------------------
+// Parameter health tripwire.
+//
+// The promotion gate cannot see a network whose tensors are dying: the 2026
+// collapse promoted a champion that had already lost three quarters of its
+// parameters, because a mutilated network still beats fixed baselines. A
+// LayerNorm scale at zero also gates its whole branch off from gradient
+// forever, so by the time play degrades nothing is trainable. The only
+// reliable alarm is the parameter magnitudes themselves, compared against a
+// fresh initialization.
+//
+// Negative test (an alarm that has never fired is not an alarm): on a scratch
+// weights file, temporarily re-add the old L2 penalty term to the loss in
+// Network::computeLoss and confirm a WARNING within ~150 steps and an abort
+// well before step 2,500 - or zero one norm scale in the live file and
+// confirm the startup sweep refuses it. Then revert.
+// ---------------------------------------------------------------------------
+
+// LayerNorm scales initialize at exactly 1.0, so their floor is absolute and
+// survives restarts; matrices are judged relative to their own fresh-init rms.
+constexpr float scaleAbortRms = 0.1f;
+constexpr float scaleWarnRms = 0.5f;
+constexpr float scaleInflateWarnRms = 4.0f;
+constexpr float matrixAbortRatio = 0.10f;
+constexpr float matrixWarnRatio = 0.25f;
+constexpr float matrixInflateWarnRatio = 8.0f;
+constexpr int matrixAbortSweeps = 2;
+// Zero-initialized tensors (biases, norm shifts, relation biases) have no
+// meaningful reference magnitude and are skipped; their branches are covered
+// through the sibling tensors that always die with them.
+constexpr float monitoredReferenceRms = 1e-3f;
+
+// A consecutive streak catches a broken network; the window catches a steady
+// trickle (e.g. one poisoned replay sample resampled at ~0.085% per batch,
+// which would never produce 10 in a row).
+constexpr int nonFiniteAbortConsecutive = 10;
+constexpr int nonFiniteAbortPerWindow = 50;
+
+std::vector<float> tensorRms(const std::vector<mlx::core::array>& tensors)
+{
+    std::vector<mlx::core::array> values;
+    values.reserve(tensors.size());
+    for (const mlx::core::array& tensor : tensors)
+        values.push_back(mlx::core::sqrt(mlx::core::mean(mlx::core::square(tensor))));
+    mlx::core::eval(values);
+
+    std::vector<float> result;
+    result.reserve(values.size());
+    for (mlx::core::array& value : values)
+        result.push_back(value.item<float>());
+    return result;
+}
+
+class ParameterHealthMonitor
+{
+public:
+    explicit ParameterHealthMonitor(const Network& network)
+    {
+        // The reference is always a fresh network built from the layout's own
+        // initialization, never from loaded weights: re-anchoring to a resumed
+        // checkpoint would silently accept whatever erosion it already has.
+        const std::unique_ptr<Network> reference = createNetwork(network.name(), seed);
+        m_referenceRms = tensorRms(reference->parameters());
+        m_names.reserve(m_referenceRms.size());
+        for (size_t index = 0; index < m_referenceRms.size(); ++index)
+            m_names.emplace_back(network.parameterName(index));
+        m_strikes.assign(m_names.size(), 0);
+        m_warnedLow.assign(m_names.size(), 0);
+        m_warnedHigh.assign(m_names.size(), 0);
+    }
+
+    // Throws to stop the run. The caller quarantines the live checkpoint
+    // before letting the exception escape.
+    void check(const std::vector<mlx::core::array>& parameters, uint64_t step)
+    {
+        assert(parameters.size() == m_names.size());
+        const std::vector<float> rms = tensorRms(parameters);
+
+        float worstRatio = std::numeric_limits<float>::infinity();
+        float largestRatio = 0.0f;
+        size_t worstIndex = 0;
+        size_t largestIndex = 0;
+        for (size_t index = 0; index < rms.size(); ++index)
+        {
+            // rms < threshold is false for NaN, so non-finite needs its own test.
+            if (!std::isfinite(rms[index]))
+                throw std::runtime_error(std::format(
+                    "parameter health: {} is non-finite at step {}", m_names[index], step));
+
+            if (m_names[index].ends_with(".scale"))
+            {
+                if (rms[index] < scaleAbortRms)
+                    throw std::runtime_error(std::format(
+                        "parameter health: norm scale {} has collapsed to rms {:.4f} at step {}"
+                        " - its branch is (or is about to be) cut off from gradient",
+                        m_names[index], rms[index], step));
+                warnOnTransition(index, rms[index], scaleWarnRms, scaleInflateWarnRms, step);
+            }
+            else if (m_referenceRms[index] > monitoredReferenceRms)
+            {
+                const float ratio = rms[index] / m_referenceRms[index];
+                if (ratio < matrixAbortRatio)
+                {
+                    // Two consecutive sweeps, because a single dip below 10%
+                    // is no longer an absorbing state under decoupled decay
+                    // and a false 3 a.m. abort is the one failure this
+                    // monitor could newly introduce.
+                    if (++m_strikes[index] >= matrixAbortSweeps)
+                        throw std::runtime_error(std::format(
+                            "parameter health: {} fell to {:.1f}% of its initialization"
+                            " for {} consecutive sweeps at step {}",
+                            m_names[index], 100.0f * ratio, matrixAbortSweeps, step));
+                }
+                else
+                    m_strikes[index] = 0;
+                warnOnTransition(index, ratio, matrixWarnRatio, matrixInflateWarnRatio, step);
+
+                if (ratio < worstRatio)
+                {
+                    worstRatio = ratio;
+                    worstIndex = index;
+                }
+                if (ratio > largestRatio)
+                {
+                    largestRatio = ratio;
+                    largestIndex = index;
+                }
+            }
+        }
+
+        if (step % 1000 == 0)
+            report("[health] step {}: weakest {} at {:.0f}% of init, largest {} at {:.1f}x init",
+                   step, m_names[worstIndex], 100.0f * worstRatio,
+                   m_names[largestIndex], largestRatio);
+    }
+
+private:
+    // Warnings fire on entering the bad band, not every sweep: a repeated
+    // warning becomes wallpaper, and wallpaper is how the last collapse ran
+    // for a whole night unnoticed.
+    void warnOnTransition(size_t index, float value, float low, float high, uint64_t step)
+    {
+        const bool isLow = value < low;
+        const bool isHigh = value > high;
+        if (isLow && !m_warnedLow[index])
+            report("[health] WARNING step {}: {} is down to {:.3f} (warn threshold {})",
+                   step, m_names[index], value, low);
+        if (isHigh && !m_warnedHigh[index])
+            report("[health] WARNING step {}: {} has grown to {:.2f} (warn threshold {})",
+                   step, m_names[index], value, high);
+        m_warnedLow[index] = isLow;
+        m_warnedHigh[index] = isHigh;
+    }
+
+    std::vector<std::string> m_names;
+    std::vector<float> m_referenceRms;
+    std::vector<uint8_t> m_strikes;
+    std::vector<uint8_t> m_warnedLow;
+    std::vector<uint8_t> m_warnedHigh;
+};
+
 } // namespace
 
 int runTraining(const std::filesystem::path& weights,
@@ -1344,6 +1505,43 @@ int runTraining(const std::filesystem::path& weights,
         std::vector<mlx::core::array> parameters = network->parameters();
         Adam adam{parameters};
         const bool restoredAdam = resumed && restoreAdam(liveWeights, adam);
+
+        ParameterHealthMonitor healthMonitor{*network};
+        const auto checkParameterHealth = [&](uint64_t atStep)
+        {
+            try
+            {
+                healthMonitor.check(parameters, atStep);
+            }
+            catch (...)
+            {
+                // Never leave a condemned network where the next launch would
+                // resume it - that traps a relaunch loop in resume-abort
+                // cycles. Renamed aside, the next launch falls back to the
+                // champion file instead.
+                if (std::filesystem::exists(liveWeights))
+                {
+                    const std::filesystem::path aborted =
+                        internalPath(weights, ".aborted.safetensors");
+                    std::filesystem::remove(aborted);
+                    std::filesystem::rename(liveWeights, aborted);
+                }
+                throw;
+            }
+        };
+        if (restoredAdam)
+        {
+            // A NaN in a moment estimate is permanent (it is an exponential
+            // average), so a poisoned optimizer state must never resume.
+            for (const std::vector<mlx::core::array>* moments :
+                 {&adam.mean(), &adam.variance()})
+                for (const float momentRms : tensorRms(*moments))
+                    if (!std::isfinite(momentRms))
+                        throw std::runtime_error(
+                            "restored Adam state contains non-finite values");
+        }
+        checkParameterHealth(0);
+
         saveTrainingAtomically(*network, adam, liveWeights);
         report("[train] {}: {}, {} parameters", weights.string(),
                network->name(), network->parameterCount());
@@ -1358,9 +1556,17 @@ int runTraining(const std::filesystem::path& weights,
         double credits = 0.0;
         std::mt19937_64 randomEngine{seed};
         uint64_t step = 0;
+        int consecutiveNonFinite = 0;
+        int nonFiniteInWindow = 0;
+        size_t batchAttemptCount = 0;
+        std::array<bool, 1000> nonFiniteWindow{};
         bool evaluationBusy = false;
         bool evaluationPending = false;
         const auto publishCandidate = [&] {
+            // A candidate that fails the health sweep must abort here, not be
+            // handed to the gate: a mutilated network can still clear 55%
+            // against fixed baselines.
+            checkParameterHealth(step);
             network->replaceParameters(parameters);
             saveAtomically(*network, candidateWeights);
             report("[evaluation] step {}: started", step);
@@ -1443,23 +1649,57 @@ int runTraining(const std::filesystem::path& weights,
                 pick = std::uniform_int_distribution<size_t>{0, replay.size() - 1}(randomEngine);
             const TrainingBatch batch = createBatch(replay, picks, randomEngine);
             const LossAndGrad result = network->valueAndGrad(parameters, batch);
+
+            // Losses and one scalar covering every gradient value are checked
+            // BEFORE Adam sees the gradients: the moment estimates are
+            // exponential averages, so a single NaN batch would poison them
+            // permanently. A bad batch is skipped, not fatal - but a streak,
+            // or a steady trickle, means something is broken and stops the run.
+            mlx::core::array gradientNormSquared = mlx::core::array(0.0f);
+            for (const mlx::core::array& gradient : result.gradients)
+                gradientNormSquared =
+                    gradientNormSquared + mlx::core::sum(mlx::core::square(gradient));
+            mlx::core::eval({result.loss.policy, result.loss.value, gradientNormSquared});
+            const float policyLoss = result.loss.policy.item<float>();
+            const float valueLoss = result.loss.value.item<float>();
+            const float gradientNorm = std::sqrt(gradientNormSquared.item<float>());
+
+            const bool nonFinite = !std::isfinite(policyLoss) || !std::isfinite(valueLoss)
+                                   || !std::isfinite(gradientNorm);
+            nonFiniteInWindow -= nonFiniteWindow[batchAttemptCount % nonFiniteWindow.size()];
+            nonFiniteWindow[batchAttemptCount % nonFiniteWindow.size()] = nonFinite;
+            nonFiniteInWindow += nonFinite;
+            ++batchAttemptCount;
+            if (nonFinite)
+            {
+                ++consecutiveNonFinite;
+                report("[train] skipped a non-finite batch ({} consecutive, {} in the last {} attempts)",
+                       consecutiveNonFinite, nonFiniteInWindow, nonFiniteWindow.size());
+                if (consecutiveNonFinite >= nonFiniteAbortConsecutive
+                    || nonFiniteInWindow > nonFiniteAbortPerWindow)
+                    throw std::runtime_error("training keeps producing non-finite batches");
+                // The skipped batch still consumes credits, so persistent
+                // trouble paces against self-play instead of spinning the GPU.
+                credits -= trainingBatchSize;
+                continue;
+            }
+            consecutiveNonFinite = 0;
+
             parameters = adam.updateParameters(
                 parameters, result.gradients, learningRate, weightDecay);
-            mlx::core::eval({result.loss.policy, result.loss.value});
             mlx::core::eval(parameters);
             credits -= trainingBatchSize;
             ++step;
-            const float policyLoss = result.loss.policy.item<float>();
-            const float valueLoss = result.loss.value.item<float>();
-            if (!std::isfinite(policyLoss) || !std::isfinite(valueLoss))
-                throw std::runtime_error("training produced a non-finite loss");
             if (step % 10 == 0)
             {
-                report("[train] step {}, policy {:.4f}, value {:.4f}, credits {:.0f}",
-                       step, policyLoss, valueLoss, credits);
+                report("[train] step {}, policy {:.4f}, value {:.4f}, |g| {:.2f}, credits {:.0f}",
+                       step, policyLoss, valueLoss, gradientNorm, credits);
             }
             if (step % selfPlayRefreshSteps == 0)
             {
+                // Health is checked before anything is written or pushed, so a
+                // condemned network is never published to self-play or disk.
+                checkParameterHealth(step);
                 network->replaceParameters(parameters);
                 saveTrainingAtomically(*network, adam, liveWeights);
                 sendMessage(workers.selfPlay.socket,

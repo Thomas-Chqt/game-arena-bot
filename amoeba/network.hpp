@@ -129,6 +129,12 @@ public:
 
     const std::vector<mlx::core::array>& parameters() const { return m_parameters; }
 
+    std::string_view parameterName(size_t index) const
+    {
+        assert(index < m_layout.size());
+        return m_layout[index].name;
+    }
+
     // MLX arrays are immutable graph values, so Adam produces a new vector after
     // every step instead of changing tensors in place.
     void replaceParameters(std::vector<mlx::core::array> parameters)
@@ -204,13 +210,15 @@ protected:
 
     void materializeParameters() { mlx::core::eval(m_parameters); }
 
-    void load(const std::filesystem::path& checkpoint, bool acceptMissingIdentifier = false)
+    void load(const std::filesystem::path& checkpoint)
     {
         auto [tensors, metadata] = mlx::core::load_safetensors(checkpoint.string());
 
+        // An identifier-less checkpoint is never acceptable: the only files
+        // without one predate the v2 training scheme and may contain tensors
+        // killed by the old coupled weight decay.
         const auto storedName = metadata.find("network");
-        if ((storedName == metadata.end() && !acceptMissingIdentifier)
-            || (storedName != metadata.end() && storedName->second != m_name))
+        if (storedName == metadata.end() || storedName->second != m_name)
             throw std::runtime_error(std::format("{}: checkpoint is not for network {}", checkpoint.string(), m_name));
 
         for (const auto& [name, tensor] : tensors)
