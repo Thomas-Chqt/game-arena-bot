@@ -109,9 +109,9 @@ public:
     // gradients. Training calls valueAndGrad with the parameter values that the
     // optimizer is currently updating.
     Loss loss(const std::vector<mlx::core::array>& parameters,
-              const TrainingBatch& batch, float weightDecay) const;
+              const TrainingBatch& batch) const;
     LossAndGrad valueAndGrad(const std::vector<mlx::core::array>& parameters,
-                             const TrainingBatch& batch, float weightDecay) const;
+                             const TrainingBatch& batch) const;
 
     // Modules call this from their constructors and retain the returned index.
     // The actual tensor stays here in Network; a module owns only its structure.
@@ -249,7 +249,7 @@ private:
                         std::span<const mlx::core::array> parameters) const;
     std::vector<mlx::core::array> computeLoss(
         const std::vector<mlx::core::array>& parameters,
-        const TrainingBatch& batch, float weightDecay) const;
+        const TrainingBatch& batch) const;
     void createCompiledForward() const;
 
     // Metadata that belongs together is one structure. Values remain a flat
@@ -606,8 +606,9 @@ class Adam
 public:
     explicit Adam(const std::vector<mlx::core::array>& parameters, AdamConfig config = {});
 
-    std::vector<mlx::core::array> updateParameters(const std::vector<mlx::core::array>& parameters,
-                                                    const std::vector<mlx::core::array>& gradients, float rate);
+    std::vector<mlx::core::array> updateParameters(
+        const std::vector<mlx::core::array>& parameters,
+        const std::vector<mlx::core::array>& gradients, float rate, float weightDecay);
 
     void restore(std::vector<mlx::core::array> mean,
                  std::vector<mlx::core::array> variance, int steps);

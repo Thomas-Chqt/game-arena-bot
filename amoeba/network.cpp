@@ -148,7 +148,7 @@ void Network::operator()(std::span<const Board* const> boards,
 
 std::vector<mlx::core::array> Network::computeLoss(
     const std::vector<mlx::core::array>& parameters,
-    const TrainingBatch& batch, float weightDecay) const
+    const TrainingBatch& batch) const
 {
     const Prediction prediction = evaluate(batch.input, parameters);
 
@@ -166,40 +166,29 @@ std::vector<mlx::core::array> Network::computeLoss(
     const mlx::core::array valueLoss = mlx::core::mean(
         mlx::core::square(prediction.value - batch.valueTarget));
 
-    mlx::core::array totalLoss = policyLoss + valueLoss;
-    if (weightDecay > 0.0f)
-    {
-        // L2 weight decay discourages memorizing the replay buffer through
-        // unnecessarily large parameter values.
-        mlx::core::array penalty = mlx::core::array(0.0f);
-        for (const mlx::core::array& parameter : parameters)
-            penalty = penalty + mlx::core::sum(mlx::core::square(parameter));
-        totalLoss = totalLoss + penalty * weightDecay;
-    }
-
     // MLX differentiates the first returned value and carries the remaining
     // values through for logging.
-    return {totalLoss, policyLoss, valueLoss};
+    return {policyLoss + valueLoss, policyLoss, valueLoss};
 }
 
 Loss Network::loss(const std::vector<mlx::core::array>& parameters,
-                   const TrainingBatch& batch, float weightDecay) const
+                   const TrainingBatch& batch) const
 {
-    std::vector<mlx::core::array> values = computeLoss(parameters, batch, weightDecay);
+    std::vector<mlx::core::array> values = computeLoss(parameters, batch);
     assert(values.size() == 3);
     return Loss{std::move(values[0]), std::move(values[1]), std::move(values[2])};
 }
 
 LossAndGrad Network::valueAndGrad(
     const std::vector<mlx::core::array>& parameters,
-    const TrainingBatch& batch, float weightDecay) const
+    const TrainingBatch& batch) const
 {
     std::vector<int> parameterIndices(parameters.size());
     std::iota(parameterIndices.begin(), parameterIndices.end(), 0);
 
     const auto lossFunction = [&](const std::vector<mlx::core::array>& currentParameters)
     {
-        return computeLoss(currentParameters, batch, weightDecay);
+        return computeLoss(currentParameters, batch);
     };
     auto [values, gradients] =
         mlx::core::value_and_grad(lossFunction, parameterIndices)(parameters);
@@ -320,12 +309,15 @@ void Adam::restore(std::vector<mlx::core::array> mean,
     mlx::core::eval(m_variance);
 }
 
-std::vector<mlx::core::array> Adam::updateParameters(const std::vector<mlx::core::array>& parameters,
-                                                      const std::vector<mlx::core::array>& gradients, float rate)
+std::vector<mlx::core::array> Adam::updateParameters(
+    const std::vector<mlx::core::array>& parameters,
+    const std::vector<mlx::core::array>& gradients, float rate, float weightDecay)
 {
     if (parameters.size() != m_mean.size() || parameters.size() != gradients.size())
         throw std::runtime_error(std::format("Adam was built for {} tensors but got {} parameters and {} gradients",
                                              m_mean.size(), parameters.size(), gradients.size()));
+    assert(rate > 0.0f);
+    assert(weightDecay >= 0.0f);
     ++m_steps;
 
     // Both moving averages start at zero. These factors remove that initial bias
@@ -346,7 +338,11 @@ std::vector<mlx::core::array> Adam::updateParameters(const std::vector<mlx::core
         // epsilon only prevents division by zero for a parameter with no gradient.
         const mlx::core::array typicalGradient =
             mlx::core::sqrt(m_variance[index] / varianceScale) + m_config.epsilon;
-        updated.push_back(parameters[index] - (m_mean[index] / meanScale) / typicalGradient * rate);
+        // AdamW applies decay directly to the parameter, outside Adam's
+        // gradient normalization. This keeps a weak task gradient from turning
+        // regularization into a full-sized update toward zero.
+        updated.push_back(parameters[index] * (1.0f - rate * weightDecay)
+                          - (m_mean[index] / meanScale) / typicalGradient * rate);
     }
     return updated;
 }

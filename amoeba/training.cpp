@@ -1442,8 +1442,9 @@ int runTraining(const std::filesystem::path& weights,
             for (size_t& pick : picks)
                 pick = std::uniform_int_distribution<size_t>{0, replay.size() - 1}(randomEngine);
             const TrainingBatch batch = createBatch(replay, picks, randomEngine);
-            const LossAndGrad result = network->valueAndGrad(parameters, batch, weightDecay);
-            parameters = adam.updateParameters(parameters, result.gradients, learningRate);
+            const LossAndGrad result = network->valueAndGrad(parameters, batch);
+            parameters = adam.updateParameters(
+                parameters, result.gradients, learningRate, weightDecay);
             mlx::core::eval({result.loss.policy, result.loss.value});
             mlx::core::eval(parameters);
             credits -= trainingBatchSize;
