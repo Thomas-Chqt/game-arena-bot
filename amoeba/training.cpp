@@ -129,20 +129,18 @@ void report(std::format_string<Args...> format, Args&&... args)
 
 void reportSelfPlayStatus(uint64_t receivedRounds)
 {
+    selfPlayStatus.rounds += receivedRounds;
     selfPlayStatus.totalRounds += receivedRounds;
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - selfPlayStatus.startedAt).count();
     selfPlayStatus.roundsPerSecond = selfPlayStatus.totalRounds / elapsed;
     selfPlayStatus.visible = true;
     if (isatty(STDOUT_FILENO))
-    {
-        selfPlayStatus.rounds += receivedRounds;
         drawSelfPlayStatus();
-    }
     else
     {
         std::println("[selfplay] received {} rounds, {:.1f} rounds/s average",
-                     receivedRounds, selfPlayStatus.roundsPerSecond);
+                     selfPlayStatus.rounds, selfPlayStatus.roundsPerSecond);
         std::fflush(stdout);
     }
 }
