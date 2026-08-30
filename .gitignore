@@ -3,3 +3,4 @@
 build.nosync/
 *.live.safetensors
 *candidate.safetensors
+*.log

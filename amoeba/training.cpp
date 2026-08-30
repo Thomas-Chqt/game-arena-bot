@@ -62,8 +62,20 @@ constexpr size_t replayBufferCapacity = 300'000;
 constexpr size_t minimumReplaySize = 2'048;
 constexpr size_t trainingBatchSize = 256;
 constexpr double targetReuse = 4.0;
-constexpr float learningRate = 1e-3f;
-constexpr float weightDecay = 1e-4f;
+// At 1e-3 the parameters diffused rather than converged: the whole distance
+// a candidate travelled from its champion over 7000 steps was accounted for
+// by rate * sqrt(steps) to within 1%, and no candidate passed the gate.
+constexpr float learningRate = 3e-4f;
+// Decoupled decay removes variance at 2 * rate * weightDecay * w^2 per step
+// against Adam's rate^2, so tensor rms settles at sqrt(rate / (2 *
+// weightDecay)). The old 1e-3 / 1e-4 pairing put that at 2.24, which is no
+// bound at all: rms climbed monotonically and the residual output
+// projections reached 12x their initialization, erasing the 1/sqrt(2 *
+// blocks) scaling they are built with. This pairing settles at 0.12, the
+// scale the last promoted champion actually had, and takes 1 / (2 * rate *
+// weightDecay) = 167k steps to get there, so it corrects a drift without
+// ever being a force on the same order as the gradient.
+constexpr float weightDecay = 1e-2f;
 constexpr uint64_t selfPlayRefreshSteps = 50;
 constexpr uint64_t evaluationSteps = 1'000;
 constexpr float promotionThreshold = 0.55f;

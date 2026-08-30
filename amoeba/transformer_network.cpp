@@ -70,7 +70,7 @@ mlx::core::array TransformerBlock<Width, HeadCount>::operator()(
         {1, static_cast<int>(HeadCount), hexCount, hexCount});
 
     const float scoreScale =
-        1.0f / std::sqrt(static_cast<float>(Width / HeadCount));
+        1.0f / std::sqrt(static_cast<float>(static_cast<float>(Width) / static_cast<float>(HeadCount)));
     mlx::core::array scores = mlx::core::matmul(
         query, mlx::core::transpose(key, {0, 1, 3, 2}));
     scores = mlx::core::softmax(scores * scoreScale + relationBias, -1);
