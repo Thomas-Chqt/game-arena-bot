@@ -135,6 +135,27 @@ public:
         return m_layout[index].name;
     }
 
+    // Weight decay belongs on the matrices only. A LayerNorm gain, a norm shift
+    // or a bias has no scale that the loss defends, so decaying one walks it
+    // toward the same equilibrium as every weight matrix regardless of what it
+    // means - and a gain reaching zero gates its whole branch off from gradient
+    // permanently, which is the collapse the parameter health monitor exists to
+    // catch. Matched on the name's last component so a two-dimensional bias
+    // table (attn.bias, relation_bias) is excluded with the rest.
+    std::vector<uint8_t> weightDecayMask() const
+    {
+        std::vector<uint8_t> mask(m_layout.size());
+        for (size_t index = 0; index < m_layout.size(); ++index)
+        {
+            const std::string_view name = m_layout[index].name;
+            const size_t separator = name.rfind('.');
+            const std::string_view leaf =
+                separator == std::string_view::npos ? name : name.substr(separator + 1);
+            mask[index] = leaf != "scale" && leaf != "shift" && !leaf.contains("bias");
+        }
+        return mask;
+    }
+
     // MLX arrays are immutable graph values, so Adam produces a new vector after
     // every step instead of changing tensors in place.
     void replaceParameters(std::vector<mlx::core::array> parameters)
@@ -614,9 +635,12 @@ class Adam
 public:
     explicit Adam(const std::vector<mlx::core::array>& parameters, AdamConfig config = {});
 
+    // decayMask has one entry per parameter; a zero entry receives the Adam
+    // step but no weight decay. Network::weightDecayMask() builds it.
     std::vector<mlx::core::array> updateParameters(
         const std::vector<mlx::core::array>& parameters,
-        const std::vector<mlx::core::array>& gradients, float rate, float weightDecay);
+        const std::vector<mlx::core::array>& gradients, float rate, float weightDecay,
+        std::span<const uint8_t> decayMask);
 
     void restore(std::vector<mlx::core::array> mean,
                  std::vector<mlx::core::array> variance, int steps);

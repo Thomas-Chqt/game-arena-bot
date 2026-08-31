@@ -303,11 +303,15 @@ void Adam::restore(std::vector<mlx::core::array> mean,
 
 std::vector<mlx::core::array> Adam::updateParameters(
     const std::vector<mlx::core::array>& parameters,
-    const std::vector<mlx::core::array>& gradients, float rate, float weightDecay)
+    const std::vector<mlx::core::array>& gradients, float rate, float weightDecay,
+    std::span<const uint8_t> decayMask)
 {
     if (parameters.size() != m_mean.size() || parameters.size() != gradients.size())
         throw std::runtime_error(std::format("Adam was built for {} tensors but got {} parameters and {} gradients",
                                              m_mean.size(), parameters.size(), gradients.size()));
+    if (decayMask.size() != parameters.size())
+        throw std::runtime_error(std::format("Adam got a decay mask of {} entries for {} parameters",
+                                             decayMask.size(), parameters.size()));
     assert(rate > 0.0f);
     assert(weightDecay >= 0.0f);
     ++m_steps;
@@ -333,7 +337,8 @@ std::vector<mlx::core::array> Adam::updateParameters(
         // AdamW applies decay directly to the parameter, outside Adam's
         // gradient normalization. This keeps a weak task gradient from turning
         // regularization into a full-sized update toward zero.
-        updated.push_back(parameters[index] * (1.0f - rate * weightDecay)
+        const float decay = decayMask[index] != 0 ? rate * weightDecay : 0.0f;
+        updated.push_back(parameters[index] * (1.0f - decay)
                           - (m_mean[index] / meanScale) / typicalGradient * rate);
     }
     return updated;

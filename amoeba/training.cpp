@@ -58,10 +58,29 @@ constexpr int concurrentEvaluationGames = 64;
 constexpr int samplingPlyCount = 20;
 constexpr float rootNoise = 0.25f;
 constexpr float noiseAlpha = 0.35f;
-constexpr size_t replayBufferCapacity = 300'000;
+// Reuse and capacity are one decision. A position is drawn targetReuse times
+// on average whatever the capacity - the credit accounting enforces that - so
+// capacity sets the age of the data instead: a position survives
+// capacity * targetReuse / trainingBatchSize steps, 4,688 at these values,
+// which is what 300k at reuse 4 gave. Doubling reuse without halving capacity
+// would have doubled that age and trained on positions from a network 17%
+// away in relative L2.
+constexpr size_t replayBufferCapacity = 150'000;
 constexpr size_t minimumReplaySize = 2'048;
 constexpr size_t trainingBatchSize = 256;
-constexpr double targetReuse = 4.0;
+constexpr double targetReuse = 8.0;
+// One game in 32 never trains, so a held-out loss can be compared against the
+// training loss. The split is by game and never by position: positions inside
+// one game are near-copies carrying the same outcome label, so a by-position
+// split leaves a held-out position's own game in training and the value head
+// scores it by recognizing the game.
+constexpr uint64_t heldOutGameFraction = 32;
+// Sized so the held-out pool spans about as many steps as the replay buffer
+// (~1 held-out position arrives per step). A staler pool would report drift
+// as overfitting.
+constexpr size_t heldOutCapacity = 4'096;
+constexpr uint64_t heldOutSteps = 200;
+constexpr int heldOutBatchCount = 4;
 // At 1e-3 the parameters diffused rather than converged: the whole distance
 // a candidate travelled from its champion over 7000 steps was accounted for
 // by rate * sqrt(steps) to within 1%, and no candidate passed the gate.
@@ -177,6 +196,17 @@ struct TrainingSample
 };
 
 static_assert(std::is_trivially_copyable_v<TrainingSample>);
+
+// splitmix64's finalizer, so the split depends on the game id alone and is
+// identical across restarts. Game ids are unique across generations, so a game
+// held out once is held out forever.
+bool isHeldOutGame(uint64_t gameId)
+{
+    uint64_t mixed = gameId + 0x9e3779b97f4a7c15ULL;
+    mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
+    return (mixed ^ (mixed >> 31)) % heldOutGameFraction == 0;
+}
 
 uint16_t randomLegalMove(const Board& board, std::mt19937_64& randomEngine)
 {
@@ -1554,8 +1584,28 @@ int runTraining(const std::filesystem::path& weights,
         std::vector<TrainingSample> replay;
         replay.reserve(replayBufferCapacity);
         size_t replayWrite = 0;
+        std::vector<TrainingSample> heldOut;
+        heldOut.reserve(heldOutCapacity);
+        size_t heldOutWrite = 0;
+        double heldOutTrainPolicy = 0.0;
+        double heldOutTrainValue = 0.0;
+        uint64_t heldOutTrainSteps = 0;
         double credits = 0.0;
         std::mt19937_64 randomEngine{seed};
+        // Its own stream, so evaluating the held-out set never shifts the
+        // sequence the training batches draw from and SEED stays reproducible.
+        std::mt19937_64 heldOutRandom{seed ^ 0x5bf03635e1a2b9d7ULL};
+        const std::vector<uint8_t> decayMask = network->weightDecayMask();
+        const auto insertSample = [](std::vector<TrainingSample>& buffer, size_t capacity,
+                                     size_t& writeCursor, TrainingSample&& sample) {
+            if (buffer.size() < capacity)
+                buffer.push_back(std::move(sample));
+            else
+            {
+                buffer[writeCursor] = std::move(sample);
+                writeCursor = (writeCursor + 1) % capacity;
+            }
+        };
         uint64_t step = 0;
         int consecutiveNonFinite = 0;
         int nonFiniteInWindow = 0;
@@ -1604,17 +1654,20 @@ int runTraining(const std::filesystem::path& weights,
                 if (!readAll(workers.selfPlay.socket, fresh.data(),
                              fresh.size() * sizeof(TrainingSample)))
                     throw std::runtime_error("self-play worker stopped inside a sample message");
+                size_t trainable = 0;
                 for (TrainingSample& sample : fresh)
                 {
-                    if (replay.size() < replayBufferCapacity)
-                        replay.push_back(std::move(sample));
+                    if (isHeldOutGame(sample.gameId))
+                        insertSample(heldOut, heldOutCapacity, heldOutWrite, std::move(sample));
                     else
                     {
-                        replay[replayWrite] = std::move(sample);
-                        replayWrite = (replayWrite + 1) % replayBufferCapacity;
+                        insertSample(replay, replayBufferCapacity, replayWrite, std::move(sample));
+                        ++trainable;
                     }
                 }
-                credits += fresh.size() * targetReuse;
+                // Held-out positions grant no credit: they are never trained on,
+                // so counting them would let training outrun its data.
+                credits += trainable * targetReuse;
                 reportSelfPlayStatus(fresh.size());
             }
             if ((descriptors[1].revents & POLLIN) != 0)
@@ -1683,14 +1736,50 @@ int runTraining(const std::filesystem::path& weights,
             consecutiveNonFinite = 0;
 
             parameters = adam.updateParameters(
-                parameters, result.gradients, learningRate, weightDecay);
+                parameters, result.gradients, learningRate, weightDecay, decayMask);
             mlx::core::eval(parameters);
             credits -= trainingBatchSize;
             ++step;
+            heldOutTrainPolicy += policyLoss;
+            heldOutTrainValue += valueLoss;
+            ++heldOutTrainSteps;
             if (step % 10 == 0)
             {
                 report("[train] step {}, policy {:.4f}, value {:.4f}, |g| {:.2f}, credits {:.0f}",
                        step, policyLoss, valueLoss, gradientNorm, credits);
+            }
+            // The number to watch is the gap, not either loss alone: both fall
+            // together while the network is still learning, and the held-out
+            // loss turning up while training loss keeps falling is what says
+            // targetReuse is too high. Nothing here tunes on it.
+            if (step % heldOutSteps == 0 && heldOut.size() >= trainingBatchSize
+                && heldOutTrainSteps > 0)
+            {
+                double heldOutPolicy = 0.0;
+                double heldOutValue = 0.0;
+                for (int batchIndex = 0; batchIndex < heldOutBatchCount; ++batchIndex)
+                {
+                    std::array<size_t, trainingBatchSize> heldOutPicks;
+                    for (size_t& pick : heldOutPicks)
+                        pick = std::uniform_int_distribution<size_t>{
+                            0, heldOut.size() - 1}(heldOutRandom);
+                    const TrainingBatch heldOutBatch =
+                        createBatch(heldOut, heldOutPicks, heldOutRandom);
+                    const Loss loss = network->loss(parameters, heldOutBatch);
+                    mlx::core::eval({loss.policy, loss.value});
+                    heldOutPolicy += loss.policy.item<float>();
+                    heldOutValue += loss.value.item<float>();
+                }
+                report("[holdout] step {}: policy {:.4f} vs train {:.4f}, "
+                       "value {:.4f} vs train {:.4f}, {} positions",
+                       step, heldOutPolicy / heldOutBatchCount,
+                       heldOutTrainPolicy / static_cast<double>(heldOutTrainSteps),
+                       heldOutValue / heldOutBatchCount,
+                       heldOutTrainValue / static_cast<double>(heldOutTrainSteps),
+                       heldOut.size());
+                heldOutTrainPolicy = 0.0;
+                heldOutTrainValue = 0.0;
+                heldOutTrainSteps = 0;
             }
             if (step % selfPlayRefreshSteps == 0)
             {
