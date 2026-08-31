@@ -54,18 +54,28 @@ constexpr int evaluationOpeningPlyCount = 4;
 constexpr int randomGameCount = 100;
 constexpr int rolloutGameCount = 100;
 constexpr int baselineScreenGameCount = 16;
-constexpr int concurrentEvaluationGames = 64;
+// Batch 128 evaluates at 6,118 positions/s against 4,905 at 64, and the time
+// the gate does not spend is time self-play gets back. Not higher: slotCount is
+// min(GameCount, this), so at 200 the 200-game champion match would never
+// refill a slot and would decay from a full field to a single game.
+constexpr int concurrentEvaluationGames = 128;
 constexpr int samplingPlyCount = 20;
 constexpr float rootNoise = 0.25f;
 constexpr float noiseAlpha = 0.35f;
-// Reuse and capacity are one decision. A position is drawn targetReuse times
-// on average whatever the capacity - the credit accounting enforces that - so
-// capacity sets the age of the data instead: a position survives
-// capacity * targetReuse / trainingBatchSize steps, 4,688 at these values,
-// which is what 300k at reuse 4 gave. Doubling reuse without halving capacity
-// would have doubled that age and trained on positions from a network 17%
-// away in relative L2.
-constexpr size_t replayBufferCapacity = 150'000;
+// Reuse and capacity control different things. Reuse fixes how many times one
+// game's outcome label is used - plies * targetReuse, about 800 - and capacity
+// cannot change that. Capacity decides how thinly those uses are spread, which
+// is what governs whether the value head can memorize them. At 150k the
+// network spent each 4,688-step window on ~1,500 game labels and the value
+// head's held-out loss ran 3.3x its training loss and climbing: it was
+// recognizing which game a position came from, not evaluating the position.
+// 400k holds ~4,000 labels across 12,500 steps.
+//
+// The cost is age - a game in here can be six hours old - and that is only
+// affordable while the network is barely improving, which a 200-game gate
+// confirmed by scoring a candidate 1,000 steps past its champion at exactly
+// 50.0%. Bring this back down when promotions start landing.
+constexpr size_t replayBufferCapacity = 400'000;
 constexpr size_t minimumReplaySize = 2'048;
 constexpr size_t trainingBatchSize = 256;
 constexpr double targetReuse = 8.0;
@@ -75,10 +85,10 @@ constexpr double targetReuse = 8.0;
 // split leaves a held-out position's own game in training and the value head
 // scores it by recognizing the game.
 constexpr uint64_t heldOutGameFraction = 32;
-// Sized so the held-out pool spans about as many steps as the replay buffer
-// (~1 held-out position arrives per step). A staler pool would report drift
-// as overfitting.
-constexpr size_t heldOutCapacity = 4'096;
+// About 160 games. Sized so the value figure is trustworthy rather than to
+// match the replay buffer's age: the value target is one label per game, so a
+// 4,096-entry pool made that number an average over only ~40 of them.
+constexpr size_t heldOutCapacity = 16'384;
 constexpr uint64_t heldOutSteps = 200;
 constexpr int heldOutBatchCount = 4;
 // At 1e-3 the parameters diffused rather than converged: the whole distance
@@ -96,7 +106,12 @@ constexpr float learningRate = 3e-4f;
 // ever being a force on the same order as the gradient.
 constexpr float weightDecay = 1e-2f;
 constexpr uint64_t selfPlayRefreshSteps = 50;
-constexpr uint64_t evaluationSteps = 1'000;
+// A gate takes ~50 minutes at concurrentEvaluationGames = 128 and 1,000 steps
+// takes about half that, so evaluationBusy was discarding every other
+// candidate. Matching the interval to the gate's own duration wastes none of
+// them and puts twice as much training between the champion and the candidate
+// measured against it.
+constexpr uint64_t evaluationSteps = 2'000;
 constexpr float promotionThreshold = 0.55f;
 constexpr float clearBaselineScore = 14.0f / baselineScreenGameCount;
 constexpr int workerSocket = 3;
