@@ -3,19 +3,13 @@
 #include "mcts.hpp"
 #include "network.hpp"
 
-#include <limits.h>
-#include <mach-o/dyld.h>
-#include <poll.h>
 #include <signal.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cerrno>
-#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -33,8 +27,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -46,85 +38,49 @@ namespace
 {
 
 constexpr uint64_t seed = 20260819;
-constexpr int selfPlaySimulationCount = 200;
-constexpr int evaluationSimulationCount = 200;
-constexpr int selfPlayLaneSize = 256;
-constexpr int championGameCount = 200;
+// A 256-visit search is large enough to make the policy target materially less
+// sparse than the old 200-visit target without doubling the dominant cost of
+// every generation. Self-play and the gate use the same search budget so the
+// comparison does not reward a candidate under different search conditions.
+constexpr int selfPlaySimulationCount = 256;
+constexpr int evaluationSimulationCount = 256;
+// One lane is one MLX inference batch. While its 128 leaves are on the GPU,
+// the host advances MCTS for the other lane.
+constexpr int selfPlayLaneSize = 128;
+constexpr int selfPlayGameCount = 2 * selfPlayLaneSize;
+// Two hundred paired openings give 400 games. Promotion uses the lower bound
+// across the 200 pair scores, rather than a raw win-rate threshold.
+constexpr int championGameCount = 400;
 constexpr int evaluationOpeningPlyCount = 4;
-constexpr int randomGameCount = 100;
-constexpr int rolloutGameCount = 100;
-constexpr int baselineScreenGameCount = 16;
-// Batch 128 evaluates at 6,118 positions/s against 4,905 at 64, and the time
-// the gate does not spend is time self-play gets back. Not higher: slotCount is
-// min(GameCount, this), so at 200 the 200-game champion match would never
-// refill a slot and would decay from a full field to a single game.
+constexpr int randomGameCount = 128;
+constexpr int rolloutGameCount = 128;
 constexpr int concurrentEvaluationGames = 128;
 constexpr int samplingPlyCount = 20;
 constexpr float rootNoise = 0.25f;
 constexpr float noiseAlpha = 0.35f;
-// Reuse and capacity control different things. Reuse fixes how many times one
-// game's outcome label is used - plies * targetReuse, about 800 - and capacity
-// cannot change that. Capacity decides how thinly those uses are spread, which
-// is what governs whether the value head can memorize them. At 150k the
-// network spent each 4,688-step window on ~1,500 game labels and the value
-// head's held-out loss ran 3.3x its training loss and climbing: it was
-// recognizing which game a position came from, not evaluating the position.
-// 400k holds ~4,000 labels across 12,500 steps.
-//
-// The cost is age - a game in here can be six hours old - and that is only
-// affordable while the network is barely improving, which a 200-game gate
-// confirmed by scoring a candidate 1,000 steps past its champion at exactly
-// 50.0%. Bring this back down when promotions start landing.
-constexpr size_t replayBufferCapacity = 400'000;
-constexpr size_t minimumReplaySize = 2'048;
 constexpr size_t trainingBatchSize = 256;
-constexpr double targetReuse = 8.0;
-// One game in 32 never trains, so a held-out loss can be compared against the
-// training loss. The split is by game and never by position: positions inside
-// one game are near-copies carrying the same outcome label, so a by-position
-// split leaves a held-out position's own game in training and the value head
-// scores it by recognizing the game.
-constexpr uint64_t heldOutGameFraction = 32;
-// About 160 games. Sized so the value figure is trustworthy rather than to
-// match the replay buffer's age: the value target is one label per game, so a
-// 4,096-entry pool made that number an average over only ~40 of them.
-constexpr size_t heldOutCapacity = 16'384;
-constexpr uint64_t heldOutSteps = 200;
-constexpr int heldOutBatchCount = 4;
-// At 1e-3 the parameters diffused rather than converged: the whole distance
-// a candidate travelled from its champion over 7000 steps was accounted for
-// by rate * sqrt(steps) to within 1%, and no candidate passed the gate.
-constexpr float learningRate = 3e-4f;
-// Decoupled decay removes variance at 2 * rate * weightDecay * w^2 per step
-// against Adam's rate^2, so tensor rms settles at sqrt(rate / (2 *
-// weightDecay)). The old 1e-3 / 1e-4 pairing put that at 2.24, which is no
-// bound at all: rms climbed monotonically and the residual output
-// projections reached 12x their initialization, erasing the 1/sqrt(2 *
-// blocks) scaling they are built with. This pairing settles at 0.12, the
-// scale the last promoted champion actually had, and takes 1 / (2 * rate *
-// weightDecay) = 167k steps to get there, so it corrects a drift without
-// ever being a force on the same order as the gradient.
+// The split is by game, never by position. Thirty-two of each generation's
+// 256 games are expected to be validation-only, which is enough to stop an
+// epoch sequence that has begun fitting its game outcomes instead of learning
+// a better position evaluator.
+constexpr uint64_t heldOutGameFraction = 8;
+constexpr int maximumTrainingEpochs = 8;
+constexpr int earlyStoppingPatience = 2;
+constexpr float validationImprovement = 1e-4f;
+// Each generation fine-tunes an already trained champion on only 256 new
+// games. AdamW at 1e-4 makes that update deliberate; the gate, not a large
+// optimizer jump, decides whether it was useful.
+constexpr float learningRate = 1e-4f;
 constexpr float weightDecay = 1e-2f;
-constexpr uint64_t selfPlayRefreshSteps = 50;
-// A gate takes ~50 minutes at concurrentEvaluationGames = 128 and 1,000 steps
-// takes about half that, so evaluationBusy was discarding every other
-// candidate. Matching the interval to the gate's own duration wastes none of
-// them and puts twice as much training between the champion and the candidate
-// measured against it.
-constexpr uint64_t evaluationSteps = 2'000;
-constexpr float promotionThreshold = 0.55f;
-constexpr float clearBaselineScore = 14.0f / baselineScreenGameCount;
-constexpr int workerSocket = 3;
-constexpr char workerRoleEnvironment[] = "AMOEBA_TRAINING_WORKER";
-constexpr char workerSocketEnvironment[] = "AMOEBA_TRAINING_SOCKET";
+constexpr double gateConfidenceZ = 1.645; // one-sided 95% lower bound
 
 volatile sig_atomic_t stopRequested = 0;
 
 struct SelfPlayStatus
 {
-    uint64_t rounds = 0;
-    uint64_t totalRounds = 0;
-    double roundsPerSecond = 0.0;
+    uint64_t positions = 0;
+    uint64_t totalPositions = 0;
+    double positionsPerSecond = 0.0;
     std::chrono::steady_clock::time_point startedAt =
         std::chrono::steady_clock::now();
     bool visible = false;
@@ -145,8 +101,8 @@ void drawSelfPlayStatus()
 {
     if (!selfPlayStatus.visible || !isatty(STDOUT_FILENO))
         return;
-    std::print("\r\x1b[2K[selfplay] received {} rounds, {:.1f} rounds/s average",
-               selfPlayStatus.rounds, selfPlayStatus.roundsPerSecond);
+    std::print("\r\x1b[2K[selfplay] generated {} positions, {:.1f} positions/s average",
+               selfPlayStatus.positions, selfPlayStatus.positionsPerSecond);
     std::fflush(stdout);
 }
 
@@ -158,23 +114,23 @@ void report(std::format_string<Args...> format, Args&&... args)
     std::println(format, std::forward<Args>(args)...);
     std::fflush(stdout);
     if (selfPlayStatus.visible)
-        selfPlayStatus.rounds = 0;
+        selfPlayStatus.positions = 0;
 }
 
-void reportSelfPlayStatus(uint64_t receivedRounds)
+void reportSelfPlayStatus(uint64_t generatedPositions)
 {
-    selfPlayStatus.rounds += receivedRounds;
-    selfPlayStatus.totalRounds += receivedRounds;
+    selfPlayStatus.positions += generatedPositions;
+    selfPlayStatus.totalPositions += generatedPositions;
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - selfPlayStatus.startedAt).count();
-    selfPlayStatus.roundsPerSecond = selfPlayStatus.totalRounds / elapsed;
+    selfPlayStatus.positionsPerSecond = selfPlayStatus.totalPositions / elapsed;
     selfPlayStatus.visible = true;
     if (isatty(STDOUT_FILENO))
         drawSelfPlayStatus();
     else
     {
-        std::println("[selfplay] received {} rounds, {:.1f} rounds/s average",
-                     selfPlayStatus.rounds, selfPlayStatus.roundsPerSecond);
+        std::println("[selfplay] generated {} positions, {:.1f} positions/s average",
+                     selfPlayStatus.positions, selfPlayStatus.positionsPerSecond);
         std::fflush(stdout);
     }
 }
@@ -209,8 +165,6 @@ struct TrainingSample
     float outcome;
     uint64_t gameId;
 };
-
-static_assert(std::is_trivially_copyable_v<TrainingSample>);
 
 // splitmix64's finalizer, so the split depends on the game id alone and is
 // identical across restarts. Game ids are unique across generations, so a game
@@ -378,7 +332,8 @@ void advance(ActiveGame<SimulationCount>& game)
             return;
         }
         const VisitCounts visits = game.search->visits();
-        game.samples.push_back({game.board, visits, 0.0f, game.gameId});
+        if constexpr (SampleOpeningMoves)
+            game.samples.push_back({game.board, visits, 0.0f, game.gameId});
         const uint16_t moveId = SampleOpeningMoves
             ? selectMoveFromVisits(visits, game.board.plyCount, game.moveRandom)
             : bestMove(visits);
@@ -423,8 +378,6 @@ void addExplorationNoise(Evaluation& evaluation, const Board& board,
     });
 }
 
-bool stopCommandReceived(int socket);
-
 template<int SimulationCount>
 class NetworkMatchRunner
 {
@@ -436,7 +389,7 @@ public:
     }
 
     template<int GameCount, typename GameFinished>
-    bool play(uint64_t firstGameId, uint64_t randomSeed, int socket,
+    bool play(uint64_t firstGameId, uint64_t randomSeed,
               GameFinished&& gameFinished)
     {
         static_assert(GameCount > 0);
@@ -512,7 +465,7 @@ public:
                 game.firstLeafOfSearch = false;
                 game.pendingLeaf = nullptr;
             }
-            if (stopCommandReceived(socket))
+            if (stopRequested)
                 return false;
         }
         return true;
@@ -525,20 +478,24 @@ private:
 class SelfPlayLane
 {
 public:
-    SelfPlayLane(uint64_t& nextGameId, uint64_t randomSeed)
-        : m_nextGameId(nextGameId), m_randomSeed(randomSeed), m_games(selfPlayLaneSize)
+    SelfPlayLane(uint64_t firstGameId, uint64_t randomSeed)
+        : m_games(selfPlayLaneSize), m_activeGames(selfPlayLaneSize)
     {
-        for (ActiveGame<selfPlaySimulationCount>& game : m_games)
-            initializeNext(game);
+        for (size_t gameIndex = 0; gameIndex < m_games.size(); ++gameIndex)
+            initialize(m_games[gameIndex], firstGameId + gameIndex,
+                       NetworkPairing{0, 0}, randomSeed);
     }
 
     std::vector<TrainingSample> prepare()
     {
         assert(!m_pending.has_value());
+        assert(!m_prepared);
         m_pendingBoards.clear();
         std::vector<TrainingSample> completed;
         for (ActiveGame<selfPlaySimulationCount>& game : m_games)
         {
+            if (!game.active)
+                continue;
             advance<selfPlaySimulationCount, true>(game);
             if (game.pendingLeaf == nullptr)
             {
@@ -546,22 +503,24 @@ public:
                 completed.insert(completed.end(),
                                  std::make_move_iterator(game.samples.begin()),
                                  std::make_move_iterator(game.samples.end()));
-                initializeNext(game);
-                advance<selfPlaySimulationCount, true>(game);
+                game.active = false;
+                --m_activeGames;
+                continue;
             }
             game.evaluationOffset = m_pendingBoards.size();
             m_pendingBoards.push_back(game.pendingLeaf);
         }
-        assert(m_pendingBoards.size() == selfPlayLaneSize);
+        m_prepared = !m_pendingBoards.empty();
         return completed;
     }
 
     void submit(const Network& network)
     {
-        assert(!m_pendingBoards.empty());
+        assert(m_prepared);
         assert(!m_pending.has_value());
         m_evaluations.resize(m_pendingBoards.size());
         m_pending.emplace(network.submit(m_pendingBoards));
+        m_prepared = false;
     }
 
     void absorb(const Network& network)
@@ -571,6 +530,9 @@ public:
         m_pending.reset();
         for (ActiveGame<selfPlaySimulationCount>& game : m_games)
         {
+            if (!game.active)
+                continue;
+            assert(game.pendingLeaf != nullptr);
             Evaluation& evaluation = m_evaluations[game.evaluationOffset];
             if (game.firstLeafOfSearch)
                 addExplorationNoise(evaluation, *game.pendingLeaf, game.noiseRandom);
@@ -580,18 +542,87 @@ public:
         }
     }
 
-private:
-    void initializeNext(ActiveGame<selfPlaySimulationCount>& game)
+    bool hasPreparedEvaluations() const { return m_prepared; }
+    bool finished() const
     {
-        initialize(game, m_nextGameId++, NetworkPairing{0, 0}, m_randomSeed);
+        return m_activeGames == 0 && !m_prepared && !m_pending.has_value();
     }
-    uint64_t& m_nextGameId;
-    uint64_t m_randomSeed;
+    size_t completedGames() const { return selfPlayLaneSize - m_activeGames; }
+
+private:
     std::vector<ActiveGame<selfPlaySimulationCount>> m_games;
     std::vector<const Board*> m_pendingBoards;
     std::vector<Evaluation> m_evaluations;
     std::optional<PendingEvaluations> m_pending;
+    size_t m_activeGames;
+    bool m_prepared = false;
 };
+
+std::vector<TrainingSample> generateSelfPlay(const Network& network,
+                                             uint64_t& nextGameId)
+{
+    selfPlayStatus = SelfPlayStatus{};
+    std::array<SelfPlayLane, 2> lanes{
+        SelfPlayLane{nextGameId, seed ^ nextGameId},
+        SelfPlayLane{nextGameId + selfPlayLaneSize,
+                     seed ^ (nextGameId + selfPlayLaneSize)},
+    };
+    nextGameId += selfPlayGameCount;
+
+    std::vector<TrainingSample> samples;
+    const auto prepare = [&](SelfPlayLane& lane) {
+        std::vector<TrainingSample> completed = lane.prepare();
+        if (!completed.empty())
+        {
+            reportSelfPlayStatus(completed.size());
+            samples.insert(samples.end(),
+                           std::make_move_iterator(completed.begin()),
+                           std::make_move_iterator(completed.end()));
+        }
+    };
+
+    int submitted = 0;
+    prepare(lanes[submitted]);
+    assert(lanes[submitted].hasPreparedEvaluations());
+    lanes[submitted].submit(network);
+    for (;;)
+    {
+        const int preparing = 1 - submitted;
+        if (!lanes[preparing].finished()
+            && !lanes[preparing].hasPreparedEvaluations())
+            prepare(lanes[preparing]);
+
+        // finish() is the synchronization point. Everything in prepare() above
+        // ran while this lane's MLX batch was executing on the GPU.
+        lanes[submitted].absorb(network);
+        if (stopRequested)
+            break;
+
+        if (lanes[preparing].hasPreparedEvaluations())
+        {
+            lanes[preparing].submit(network);
+            submitted = preparing;
+            continue;
+        }
+
+        if (!lanes[submitted].finished())
+        {
+            prepare(lanes[submitted]);
+            if (lanes[submitted].hasPreparedEvaluations())
+            {
+                lanes[submitted].submit(network);
+                continue;
+            }
+        }
+        break;
+    }
+
+    finishSelfPlayStatus();
+    if (!stopRequested)
+        assert(lanes[0].completedGames() + lanes[1].completedGames()
+               == selfPlayGameCount);
+    return samples;
+}
 
 constexpr Coordinate transformCoordinate(Coordinate coordinate, uint8_t symmetry)
 {
@@ -691,8 +722,9 @@ TrainingSample transformSample(const TrainingSample& sample, uint8_t symmetry)
 }
 
 TrainingBatch createBatch(const std::vector<TrainingSample>& replay,
-                          std::span<const size_t, trainingBatchSize> picks,
-                          std::mt19937_64& randomEngine)
+                          std::span<const size_t> picks,
+                          std::mt19937_64& randomEngine,
+                          bool augment)
 {
     const auto policyIndexToMoveId = [](uint16_t policyIndex, bool whiteToMove) {
         Move move = Move::fromId(policyIndex);
@@ -703,15 +735,22 @@ TrainingBatch createBatch(const std::vector<TrainingSample>& replay,
         }
         return move.id();
     };
+    assert(!picks.empty());
+    assert(picks.size() <= trainingBatchSize);
+    const size_t batchSize = picks.size();
     std::vector<mlx::core::array> inputs;
-    inputs.reserve(trainingBatchSize);
-    std::vector<float> legal(trainingBatchSize * moveIdCount);
-    std::vector<float> policy(trainingBatchSize * moveIdCount);
-    std::array<float, trainingBatchSize> outcomes{};
-    for (size_t batchIndex = 0; batchIndex < trainingBatchSize; ++batchIndex)
+    inputs.reserve(batchSize);
+    std::vector<float> legal(batchSize * moveIdCount);
+    std::vector<float> policy(batchSize * moveIdCount);
+    std::vector<float> outcomes(batchSize);
+    for (size_t batchIndex = 0; batchIndex < batchSize; ++batchIndex)
     {
-        const uint8_t symmetry =
-            std::uniform_int_distribution<uint8_t>{0, 11}(randomEngine);
+        // Training uses the six rotations requested by the owner. Validation
+        // stays at identity so its epoch-to-epoch comparison has no augmentation
+        // noise in it.
+        const uint8_t symmetry = augment
+            ? std::uniform_int_distribution<uint8_t>{0, 5}(randomEngine)
+            : 0;
         const TrainingSample sample = transformSample(replay[picks[batchIndex]], symmetry);
         inputs.push_back(sample.board.tensorEncoding());
         const uint64_t totalVisits =
@@ -730,89 +769,10 @@ TrainingBatch createBatch(const std::vector<TrainingSample>& replay,
     }
     return {
         mlx::core::stack(inputs),
-        mlx::core::array(legal.data(), {static_cast<int>(trainingBatchSize), moveIdCount}, mlx::core::float32),
-        mlx::core::array(policy.data(), {static_cast<int>(trainingBatchSize), moveIdCount}, mlx::core::float32),
-        mlx::core::array(outcomes.data(), {static_cast<int>(trainingBatchSize)}, mlx::core::float32),
+        mlx::core::array(legal.data(), {static_cast<int>(batchSize), moveIdCount}, mlx::core::float32),
+        mlx::core::array(policy.data(), {static_cast<int>(batchSize), moveIdCount}, mlx::core::float32),
+        mlx::core::array(outcomes.data(), {static_cast<int>(batchSize)}, mlx::core::float32),
     };
-}
-
-enum class MessageType : uint32_t
-{
-    start,
-    samples,
-    liveWeights,
-    liveWeightsApplied,
-    evaluate,
-    evaluationResult,
-    stop,
-};
-
-struct Message
-{
-    MessageType type{};
-    uint32_t count{};
-    uint64_t version{};
-    std::array<uint32_t, 3> gameCounts{};
-    std::array<double, 3> scores{};
-    uint32_t promoted{};
-};
-
-bool readAll(int socket, void* output, size_t size)
-{
-    char* destination = static_cast<char*>(output);
-    while (size > 0)
-    {
-        const ssize_t received = recv(socket, destination, size, 0);
-        if (received == 0)
-            return false;
-        if (received < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            throw std::runtime_error(std::format("recv: {}", std::strerror(errno)));
-        }
-        destination += received;
-        size -= static_cast<size_t>(received);
-    }
-    return true;
-}
-
-void writeAll(int socket, const void* input, size_t size)
-{
-    const char* source = static_cast<const char*>(input);
-    while (size > 0)
-    {
-        const ssize_t written = send(socket, source, size, MSG_NOSIGNAL);
-        if (written < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            throw std::runtime_error(std::format("send: {}", std::strerror(errno)));
-        }
-        source += written;
-        size -= static_cast<size_t>(written);
-    }
-}
-
-void sendMessage(int socket, const Message& message) { writeAll(socket, &message, sizeof(message)); }
-bool receiveMessage(int socket, Message& message) { return readAll(socket, &message, sizeof(message)); }
-
-void sendSamples(int socket, const std::vector<TrainingSample>& samples)
-{
-    if (samples.empty())
-        return;
-    assert(samples.size() <= std::numeric_limits<uint32_t>::max());
-    sendMessage(socket, Message{.type = MessageType::samples,
-                                .count = static_cast<uint32_t>(samples.size())});
-    writeAll(socket, samples.data(), samples.size() * sizeof(TrainingSample));
-}
-
-std::filesystem::path internalPath(const std::filesystem::path& weights,
-                                   std::string_view suffix)
-{
-    std::filesystem::path result = weights;
-    result += suffix;
-    return result;
 }
 
 std::filesystem::path temporaryPath(const std::filesystem::path& path)
@@ -829,131 +789,82 @@ void saveAtomically(const Network& network, const std::filesystem::path& path)
     std::filesystem::rename(temporary, path);
 }
 
-void saveTrainingAtomically(const Network& network, const Adam& adam,
-                            const std::filesystem::path& path)
-{
-    const std::filesystem::path temporary = temporaryPath(path);
-    std::filesystem::remove(temporary);
-    network.save(temporary);
-    auto [tensors, metadata] = mlx::core::load_safetensors(temporary.string());
-    for (size_t index = 0; index < adam.mean().size(); ++index)
-    {
-        tensors.emplace(std::format("adam.mean.{}", index), adam.mean()[index]);
-        tensors.emplace(std::format("adam.variance.{}", index), adam.variance()[index]);
-    }
-    metadata["adam_steps"] = std::to_string(adam.steps());
-    std::filesystem::remove(temporary);
-    mlx::core::save_safetensors(temporary.string(), tensors, metadata);
-    std::filesystem::rename(temporary, path);
-}
-
-bool restoreAdam(const std::filesystem::path& path, Adam& adam)
-{
-    auto [tensors, metadata] = mlx::core::load_safetensors(path.string());
-    const auto storedSteps = metadata.find("adam_steps");
-    if (storedSteps == metadata.end())
-        return false;
-    int steps = 0;
-    const char* begin = storedSteps->second.data();
-    const char* end = begin + storedSteps->second.size();
-    const auto [position, error] = std::from_chars(begin, end, steps);
-    if (error != std::errc{} || position != end)
-        throw std::runtime_error("Adam checkpoint has an invalid step count");
-    std::vector<mlx::core::array> mean;
-    std::vector<mlx::core::array> variance;
-    mean.reserve(adam.mean().size());
-    variance.reserve(adam.variance().size());
-    for (size_t index = 0; index < adam.mean().size(); ++index)
-    {
-        const auto storedMean = tensors.find(std::format("adam.mean.{}", index));
-        const auto storedVariance = tensors.find(std::format("adam.variance.{}", index));
-        if (storedMean == tensors.end() || storedVariance == tensors.end())
-            throw std::runtime_error(std::format("Adam checkpoint is missing tensor {}", index));
-        mean.push_back(storedMean->second);
-        variance.push_back(storedVariance->second);
-    }
-    adam.restore(std::move(mean), std::move(variance), steps);
-    return true;
-}
-
-bool stopCommandReceived(int socket)
-{
-    if (stopRequested)
-        return true;
-    pollfd descriptor{.fd = socket, .events = POLLIN, .revents = 0};
-    const int ready = poll(&descriptor, 1, 0);
-    if (ready < 0)
-    {
-        if (errno == EINTR)
-            return stopRequested;
-        throw std::runtime_error(std::format("poll: {}", std::strerror(errno)));
-    }
-    if (ready == 0)
-        return false;
-    if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
-        return true;
-    Message message;
-    if (!receiveMessage(socket, message))
-        return true;
-    if (message.type != MessageType::stop)
-        throw std::runtime_error("worker received an invalid command while busy");
-    return true;
-}
-
-bool refreshSelfPlayNetwork(int socket, const std::filesystem::path& liveWeights,
-                            std::unique_ptr<Network>& network)
-{
-    if (stopRequested)
-        return false;
-    std::optional<uint64_t> newestVersion;
-    for (;;)
-    {
-        pollfd descriptor{.fd = socket, .events = POLLIN, .revents = 0};
-        const int ready = poll(&descriptor, 1, 0);
-        if (ready < 0)
-        {
-            if (errno == EINTR)
-                continue;
-            throw std::runtime_error(std::format("poll: {}", std::strerror(errno)));
-        }
-        if (ready == 0)
-            break;
-        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
-            return false;
-        Message message;
-        if (!receiveMessage(socket, message) || message.type == MessageType::stop)
-            return false;
-        if (message.type != MessageType::liveWeights)
-            throw std::runtime_error("self-play worker received an invalid command");
-        newestVersion = message.version;
-    }
-    if (newestVersion.has_value())
-    {
-        network = loadNetwork(liveWeights);
-        sendMessage(socket, Message{
-            .type = MessageType::liveWeightsApplied,
-            .version = *newestVersion,
-        });
-    }
-    return true;
-}
-
 struct MatchScore
 {
     int wins = 0;
     int draws = 0;
     int losses = 0;
+    std::vector<double> observations;
+
     void add(Outcome outcome, bool candidateWhite)
     {
         if (outcome == Outcome::draw)
+        {
             ++draws;
+            observations.push_back(0.5);
+        }
         else if ((outcome == Outcome::whiteWins) == candidateWhite)
+        {
             ++wins;
+            observations.push_back(1.0);
+        }
         else
+        {
             ++losses;
+            observations.push_back(0.0);
+        }
     }
     int games() const { return wins + draws + losses; }
     double score() const { return (wins + 0.5 * draws) / games(); }
+    double lowerConfidenceBound() const;
+};
+
+double lowerConfidenceBound(std::span<const double> observations)
+{
+    assert(observations.size() >= 2);
+    const double mean = std::accumulate(
+        observations.begin(), observations.end(), 0.0) / observations.size();
+    double squaredError = 0.0;
+    for (const double observation : observations)
+        squaredError += (observation - mean) * (observation - mean);
+    const double variance = squaredError / (observations.size() - 1);
+    return std::max(0.0, mean - gateConfidenceZ
+        * std::sqrt(variance / observations.size()));
+}
+
+double MatchScore::lowerConfidenceBound() const
+{
+    return amoeba_bot::lowerConfidenceBound(observations);
+}
+
+struct PairedMatchScore
+{
+    explicit PairedMatchScore(size_t pairCount)
+        : pairScores(pairCount), gamesPerPair(pairCount)
+    {
+    }
+
+    void add(size_t gameIndex, Outcome outcome, bool candidateWhite)
+    {
+        assert(gameIndex / 2 < pairScores.size());
+        games.add(outcome, candidateWhite);
+        const double gameScore = games.observations.back();
+        pairScores[gameIndex / 2] += 0.5 * gameScore;
+        ++gamesPerPair[gameIndex / 2];
+    }
+
+    double score() const { return games.score(); }
+    int gameCount() const { return games.games(); }
+    double lowerConfidenceBound() const
+    {
+        assert(std::ranges::all_of(gamesPerPair,
+                                  [](uint8_t count) { return count == 2; }));
+        return amoeba_bot::lowerConfidenceBound(pairScores);
+    }
+
+    MatchScore games;
+    std::vector<double> pairScores;
+    std::vector<uint8_t> gamesPerPair;
 };
 
 Evaluation rolloutEvaluation(const Board& leaf, std::mt19937_64& randomEngine)
@@ -1048,7 +959,7 @@ void advance(BaselineGame& game, Baseline baseline)
 template<int GameCount>
 bool playBaselineGames(const Network& candidate, Baseline baseline,
                        uint64_t firstGameId, uint64_t randomSeed,
-                       MatchScore& score, int socket)
+                       MatchScore& score)
 {
     const int slotCount = std::min(GameCount, concurrentEvaluationGames);
     std::vector<BaselineGame> games(static_cast<size_t>(slotCount));
@@ -1093,242 +1004,10 @@ bool playBaselineGames(const Network& candidate, Baseline baseline,
             game.search->absorb(evaluation.policy, evaluation.value);
             game.pendingLeaf = nullptr;
         }
-        if (stopCommandReceived(socket))
+        if (stopRequested)
             return false;
     }
     return true;
-}
-
-template<int TotalGameCount>
-bool playBaselineMatch(const Network& candidate, Baseline baseline,
-                       uint64_t firstGameId, uint64_t randomSeed,
-                       MatchScore& score, int socket)
-{
-    static_assert(TotalGameCount >= baselineScreenGameCount);
-    if (!playBaselineGames<baselineScreenGameCount>(
-            candidate, baseline, firstGameId, randomSeed, score, socket))
-        return false;
-    if (score.score() >= clearBaselineScore)
-        return true;
-    return playBaselineGames<TotalGameCount - baselineScreenGameCount>(
-        candidate, baseline, firstGameId + baselineScreenGameCount,
-        randomSeed, score, socket);
-}
-
-int runSelfPlayWorker(const std::filesystem::path& weights, int socket)
-try
-{
-    Message start;
-    if (!receiveMessage(socket, start) || start.type == MessageType::stop)
-        return EXIT_SUCCESS;
-    if (start.type != MessageType::start)
-        throw std::runtime_error("self-play worker did not receive its start command");
-    const std::filesystem::path liveWeights = internalPath(weights, ".live.safetensors");
-    std::unique_ptr<Network> network = loadNetwork(liveWeights);
-    uint64_t nextGameId = 0;
-    std::array<SelfPlayLane, 2> lanes{
-        SelfPlayLane{nextGameId, seed},
-        SelfPlayLane{nextGameId, seed + selfPlayLaneSize},
-    };
-    int submitted = 0;
-    int preparing = 1;
-    sendSamples(socket, lanes[submitted].prepare());
-    lanes[submitted].submit(*network);
-    for (;;)
-    {
-        sendSamples(socket, lanes[preparing].prepare());
-        lanes[submitted].absorb(*network);
-        if (!refreshSelfPlayNetwork(socket, liveWeights, network))
-            return EXIT_SUCCESS;
-        std::swap(submitted, preparing);
-        lanes[submitted].submit(*network);
-    }
-}
-catch (const std::exception& error)
-{
-    clearTerminalLine();
-    std::println(stderr, "[selfplay] {}", error.what());
-    return EXIT_FAILURE;
-}
-
-int runEvaluationWorker(const std::filesystem::path& weights, int socket)
-try
-{
-    Message start;
-    if (!receiveMessage(socket, start) || start.type == MessageType::stop)
-        return EXIT_SUCCESS;
-    if (start.type != MessageType::start)
-        throw std::runtime_error("evaluation worker did not receive its start command");
-    const std::filesystem::path candidateWeights =
-        internalPath(weights, ".candidate.safetensors");
-    for (;;)
-    {
-        Message command;
-        if (!receiveMessage(socket, command) || command.type == MessageType::stop)
-            return EXIT_SUCCESS;
-        if (command.type != MessageType::evaluate)
-            throw std::runtime_error("evaluation worker received an invalid command");
-        std::unique_ptr<Network> candidate = loadNetwork(candidateWeights);
-        std::unique_ptr<Network> champion = loadNetwork(weights);
-        std::array<MatchScore, 3> scores;
-        const Network* networks[]{candidate.get(), champion.get()};
-        NetworkMatchRunner<evaluationSimulationCount> championRunner{networks};
-        const bool championComplete = championRunner.template play<championGameCount>(
-            command.version * 1'000, seed + 7777 + command.version, socket,
-            [&](uint64_t gameId, Outcome outcome) {
-                scores[0].add(outcome, gameId % 2 == 0);
-            });
-        if (!championComplete)
-            return EXIT_SUCCESS;
-        if (!playBaselineMatch<randomGameCount>(
-                *candidate, Baseline::random, command.version * 1'000 + 200,
-                seed + 8888 + command.version, scores[1], socket))
-            return EXIT_SUCCESS;
-        if (!playBaselineMatch<rolloutGameCount>(
-                *candidate, Baseline::rollout, command.version * 1'000 + 300,
-                seed + 9999 + command.version, scores[2], socket))
-            return EXIT_SUCCESS;
-        const bool promoted = std::ranges::all_of(scores, [](const MatchScore& score) {
-            return score.score() >= promotionThreshold;
-        });
-        if (promoted)
-            saveAtomically(*candidate, weights);
-        sendMessage(socket, Message{
-            .type = MessageType::evaluationResult,
-            .version = command.version,
-            .gameCounts = {static_cast<uint32_t>(scores[0].games()),
-                           static_cast<uint32_t>(scores[1].games()),
-                           static_cast<uint32_t>(scores[2].games())},
-            .scores = {scores[0].score(), scores[1].score(), scores[2].score()},
-            .promoted = promoted,
-        });
-    }
-}
-catch (const std::exception& error)
-{
-    clearTerminalLine();
-    std::println(stderr, "[evaluation] {}", error.what());
-    return EXIT_FAILURE;
-}
-
-struct Worker { pid_t process = -1; int socket = -1; };
-struct Workers { Worker selfPlay; Worker evaluation; };
-
-void stopWorker(Worker& worker)
-{
-    bool sent = false;
-    if (worker.socket >= 0)
-    {
-        const Message stop{.type = MessageType::stop};
-        sent = send(worker.socket, &stop, sizeof(stop), MSG_NOSIGNAL)
-            == static_cast<ssize_t>(sizeof(stop));
-        close(worker.socket);
-        worker.socket = -1;
-    }
-    if (worker.process > 0)
-    {
-        if (!sent)
-            kill(worker.process, SIGTERM);
-        while (waitpid(worker.process, nullptr, 0) < 0 && errno == EINTR) {}
-        worker.process = -1;
-    }
-}
-
-void stopWorkers(Workers& workers)
-{
-    stopWorker(workers.selfPlay);
-    stopWorker(workers.evaluation);
-}
-
-Workers forkWorkers(const std::filesystem::path& weights)
-{
-    int selfPlayChannels[2];
-    int evaluationChannels[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, selfPlayChannels) != 0)
-        throw std::runtime_error(std::format("socketpair: {}", std::strerror(errno)));
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, evaluationChannels) != 0)
-    {
-        close(selfPlayChannels[0]); close(selfPlayChannels[1]);
-        throw std::runtime_error(std::format("socketpair: {}", std::strerror(errno)));
-    }
-    std::array<char, PATH_MAX> executableBuffer{};
-    uint32_t executableSize = executableBuffer.size();
-    if (_NSGetExecutablePath(executableBuffer.data(), &executableSize) != 0)
-    {
-        close(selfPlayChannels[0]); close(selfPlayChannels[1]);
-        close(evaluationChannels[0]); close(evaluationChannels[1]);
-        throw std::runtime_error("executable path is too long");
-    }
-
-    std::string executable{executableBuffer.data()};
-    std::string weightsArgument = weights.string();
-    std::string socketArgument = std::to_string(workerSocket);
-    char trainArgument[] = "--train";
-    std::array<char*, 4> arguments{
-        executable.data(), trainArgument, weightsArgument.data(), nullptr};
-    const std::array<int, 4> channels{
-        selfPlayChannels[0], selfPlayChannels[1],
-        evaluationChannels[0], evaluationChannels[1]};
-
-    const auto startWorker = [&](std::string_view role, int socket) {
-        const std::string roleArgument{role};
-        if (setenv(workerRoleEnvironment, roleArgument.c_str(), 1) != 0)
-            throw std::runtime_error(std::format("setenv: {}", std::strerror(errno)));
-        if (setenv(workerSocketEnvironment, socketArgument.c_str(), 1) != 0)
-        {
-            const int environmentError = errno;
-            unsetenv(workerRoleEnvironment);
-            errno = environmentError;
-            throw std::runtime_error(std::format("setenv: {}", std::strerror(errno)));
-        }
-
-        const pid_t process = fork();
-        const int forkError = errno;
-        if (process == 0)
-        {
-            if (socket != workerSocket && dup2(socket, workerSocket) < 0)
-                _exit(EXIT_FAILURE);
-            for (int channel : channels)
-                if (channel != workerSocket)
-                    close(channel);
-            execv(executable.c_str(), arguments.data());
-            constexpr char message[] = "[worker] execv failed\n";
-            write(STDERR_FILENO, message, sizeof(message) - 1);
-            _exit(EXIT_FAILURE);
-        }
-
-        unsetenv(workerRoleEnvironment);
-        unsetenv(workerSocketEnvironment);
-        if (process < 0)
-        {
-            errno = forkError;
-            throw std::runtime_error(std::format("fork: {}", std::strerror(errno)));
-        }
-        return process;
-    };
-
-    pid_t selfPlayProcess = -1;
-    pid_t evaluationProcess = -1;
-    try
-    {
-        selfPlayProcess = startWorker("selfplay", selfPlayChannels[1]);
-        evaluationProcess = startWorker("evaluation", evaluationChannels[1]);
-    }
-    catch (...)
-    {
-        close(selfPlayChannels[0]); close(selfPlayChannels[1]);
-        close(evaluationChannels[0]); close(evaluationChannels[1]);
-        if (selfPlayProcess > 0)
-        {
-            kill(selfPlayProcess, SIGTERM);
-            waitpid(selfPlayProcess, nullptr, 0);
-        }
-        throw;
-    }
-    close(selfPlayChannels[1]);
-    close(evaluationChannels[1]);
-    return {.selfPlay = {selfPlayProcess, selfPlayChannels[0]},
-            .evaluation = {evaluationProcess, evaluationChannels[0]}};
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,8 +1081,9 @@ public:
         m_warnedHigh.assign(m_names.size(), 0);
     }
 
-    // Throws to stop the run. The caller quarantines the live checkpoint
-    // before letting the exception escape.
+    // Throws to stop the run. Generation training never touches the champion
+    // checkpoint until a candidate has passed the gate, so a failed candidate
+    // needs no checkpoint quarantine.
     void check(const std::vector<mlx::core::array>& parameters, uint64_t step)
     {
         assert(parameters.size() == m_names.size());
@@ -1497,334 +1177,282 @@ private:
 int runTraining(const std::filesystem::path& weights,
                 std::string_view networkIdentifier)
 {
-    if (const char* role = std::getenv(workerRoleEnvironment))
-    {
-        const char* socketText = std::getenv(workerSocketEnvironment);
-        int socket = -1;
-        if (socketText == nullptr)
-        {
-            std::println(stderr, "[worker] missing socket environment variable");
-            return EXIT_FAILURE;
-        }
-        const std::string_view text{socketText};
-        const auto [end, error] = std::from_chars(
-            text.data(), text.data() + text.size(), socket);
-        if (error != std::errc{} || end != text.data() + text.size() || socket < 0)
-        {
-            std::println(stderr, "[worker] invalid socket environment variable");
-            return EXIT_FAILURE;
-        }
-        if (std::string_view{role} == "selfplay")
-            return runSelfPlayWorker(weights, socket);
-        if (std::string_view{role} == "evaluation")
-            return runEvaluationWorker(weights, socket);
-        std::println(stderr, "[worker] invalid role {}", role);
-        return EXIT_FAILURE;
-    }
-
     stopRequested = 0;
-    Workers workers;
-    const std::filesystem::path liveWeights = internalPath(weights, ".live.safetensors");
-    const std::filesystem::path candidateWeights = internalPath(weights, ".candidate.safetensors");
     try
     {
         installSignalHandlers();
-        workers = forkWorkers(weights);
-        const bool resumed = std::filesystem::exists(liveWeights);
+        std::filesystem::path legacyLiveWeights = weights;
+        legacyLiveWeights += ".live.safetensors";
+        const bool importLegacyLive = std::filesystem::exists(legacyLiveWeights)
+            && (!std::filesystem::exists(weights)
+                || std::filesystem::last_write_time(legacyLiveWeights)
+                    > std::filesystem::last_write_time(weights));
         std::unique_ptr<Network> network;
-        if (std::filesystem::exists(weights))
-        {
+        if (importLegacyLive)
+            network = loadNetwork(legacyLiveWeights, networkIdentifier);
+        else if (std::filesystem::exists(weights))
             network = loadNetwork(weights, networkIdentifier);
-            if (resumed)
-                network = loadNetwork(liveWeights, network->name());
-        }
-        else if (resumed)
-            network = loadNetwork(liveWeights, networkIdentifier);
         else if (!networkIdentifier.empty())
             network = createNetwork(networkIdentifier, seed);
         else
             throw std::runtime_error(std::format(
                 "{} does not exist; select a network with --network",
                 weights.string()));
-        if (!std::filesystem::exists(weights))
-            saveAtomically(*network, weights);
-        std::vector<mlx::core::array> parameters = network->parameters();
-        Adam adam{parameters};
-        const bool restoredAdam = resumed && restoreAdam(liveWeights, adam);
-
         ParameterHealthMonitor healthMonitor{*network};
-        const auto checkParameterHealth = [&](uint64_t atStep)
+        healthMonitor.check(network->parameters(), 0);
+        if (importLegacyLive)
         {
-            try
-            {
-                healthMonitor.check(parameters, atStep);
-            }
-            catch (...)
-            {
-                // Never leave a condemned network where the next launch would
-                // resume it - that traps a relaunch loop in resume-abort
-                // cycles. Renamed aside, the next launch falls back to the
-                // champion file instead.
-                if (std::filesystem::exists(liveWeights))
-                {
-                    const std::filesystem::path aborted =
-                        internalPath(weights, ".aborted.safetensors");
-                    std::filesystem::remove(aborted);
-                    std::filesystem::rename(liveWeights, aborted);
-                }
-                throw;
-            }
-        };
-        if (restoredAdam)
-        {
-            // A NaN in a moment estimate is permanent (it is an exponential
-            // average), so a poisoned optimizer state must never resume.
-            for (const std::vector<mlx::core::array>* moments :
-                 {&adam.mean(), &adam.variance()})
-                for (const float momentRms : tensorRms(*moments))
-                    if (!std::isfinite(momentRms))
-                        throw std::runtime_error(
-                            "restored Adam state contains non-finite values");
+            // The previous method's .live file contains its newest network plus
+            // Adam state. Import only the network once: saving the champion now
+            // makes weights newer than the untouched legacy sidecar, so a later
+            // restart cannot roll a promoted champion back to stale live data.
+            saveAtomically(*network, weights);
+            report("[train] imported current network from {} and reset optimizer state",
+                   legacyLiveWeights.string());
         }
-        checkParameterHealth(0);
-
-        saveTrainingAtomically(*network, adam, liveWeights);
+        else if (!std::filesystem::exists(weights))
+            saveAtomically(*network, weights);
         report("[train] {}: {}, {} parameters", weights.string(),
                network->name(), network->parameterCount());
-        if (restoredAdam)
-            report("[train] restored Adam at optimizer step {}", adam.steps());
-        sendMessage(workers.selfPlay.socket, Message{.type = MessageType::start});
-        sendMessage(workers.evaluation.socket, Message{.type = MessageType::start});
+        report("[train] generation method: {} self-play games, {}+{} lanes, "
+               "{} visits, AdamW lr {}, up to {} epochs",
+               selfPlayGameCount, selfPlayLaneSize, selfPlayLaneSize,
+               selfPlaySimulationCount, learningRate, maximumTrainingEpochs);
 
-        std::vector<TrainingSample> replay;
-        replay.reserve(replayBufferCapacity);
-        size_t replayWrite = 0;
-        std::vector<TrainingSample> heldOut;
-        heldOut.reserve(heldOutCapacity);
-        size_t heldOutWrite = 0;
-        double heldOutTrainPolicy = 0.0;
-        double heldOutTrainValue = 0.0;
-        uint64_t heldOutTrainSteps = 0;
-        double credits = 0.0;
         std::mt19937_64 randomEngine{seed};
-        // Its own stream, so evaluating the held-out set never shifts the
-        // sequence the training batches draw from and SEED stays reproducible.
-        std::mt19937_64 heldOutRandom{seed ^ 0x5bf03635e1a2b9d7ULL};
-        const std::vector<uint8_t> decayMask = network->weightDecayMask();
-        const auto insertSample = [](std::vector<TrainingSample>& buffer, size_t capacity,
-                                     size_t& writeCursor, TrainingSample&& sample) {
-            if (buffer.size() < capacity)
-                buffer.push_back(std::move(sample));
-            else
-            {
-                buffer[writeCursor] = std::move(sample);
-                writeCursor = (writeCursor + 1) % capacity;
-            }
-        };
-        uint64_t step = 0;
-        int consecutiveNonFinite = 0;
-        int nonFiniteInWindow = 0;
-        size_t batchAttemptCount = 0;
-        std::array<bool, 1000> nonFiniteWindow{};
-        bool evaluationBusy = false;
-        const auto publishCandidate = [&] {
-            // A candidate that fails the health sweep must abort here, not be
-            // handed to the gate: a mutilated network can still clear 55%
-            // against fixed baselines.
-            checkParameterHealth(step);
-            network->replaceParameters(parameters);
-            saveAtomically(*network, candidateWeights);
-            report("[evaluation] step {}: started", step);
-            sendMessage(workers.evaluation.socket,
-                        Message{.type = MessageType::evaluate, .version = step});
-            evaluationBusy = true;
-        };
+        uint64_t nextGameId = 0;
+        uint64_t optimizerStep = 0;
+        uint64_t generation = 1;
+        bool firstGate = true;
 
         while (!stopRequested)
         {
-            const bool canTrain = replay.size() >= minimumReplaySize
-                                  && credits >= trainingBatchSize;
-            pollfd descriptors[]{
-                {.fd = workers.selfPlay.socket, .events = POLLIN, .revents = 0},
-                {.fd = workers.evaluation.socket, .events = POLLIN, .revents = 0},
-            };
-            const int ready = poll(descriptors, 2, canTrain ? 0 : -1);
-            if (ready < 0 && errno != EINTR)
-                throw std::runtime_error(std::format("poll: {}", std::strerror(errno)));
+            report("[generation {}] self-play started from the champion", generation);
+            std::vector<TrainingSample> generated =
+                generateSelfPlay(*network, nextGameId);
             if (stopRequested)
                 break;
-            if ((descriptors[0].revents & POLLIN) != 0)
+
+            std::vector<TrainingSample> training;
+            std::vector<TrainingSample> heldOut;
+            training.reserve(generated.size());
+            heldOut.reserve(generated.size() / heldOutGameFraction + 1);
+            for (TrainingSample& sample : generated)
             {
-                Message message;
-                if (!receiveMessage(workers.selfPlay.socket, message))
-                    throw std::runtime_error("self-play worker stopped");
-                if (message.type == MessageType::liveWeightsApplied)
+                std::vector<TrainingSample>& destination =
+                    isHeldOutGame(sample.gameId) ? heldOut : training;
+                destination.push_back(std::move(sample));
+            }
+            if (training.empty() || heldOut.empty())
+                throw std::runtime_error(
+                    "self-play generation did not produce both training and held-out positions");
+            report("[generation {}] {} positions: {} train, {} held out",
+                   generation, generated.size(), training.size(), heldOut.size());
+
+            std::vector<mlx::core::array> parameters = network->parameters();
+            Adam adam{parameters};
+            const std::vector<uint8_t> decayMask = network->weightDecayMask();
+            std::vector<size_t> trainingOrder(training.size());
+            std::iota(trainingOrder.begin(), trainingOrder.end(), size_t{0});
+            std::vector<size_t> heldOutOrder(heldOut.size());
+            std::iota(heldOutOrder.begin(), heldOutOrder.end(), size_t{0});
+            std::vector<mlx::core::array> bestParameters = parameters;
+            double bestValidation = std::numeric_limits<double>::infinity();
+            int bestEpoch = 0;
+            int staleEpochs = 0;
+            int consecutiveNonFinite = 0;
+            int nonFiniteInWindow = 0;
+            size_t batchAttemptCount = 0;
+            std::array<bool, 1000> nonFiniteWindow{};
+
+            const auto validationLoss = [&](const std::vector<mlx::core::array>& values) {
+                double policy = 0.0;
+                double value = 0.0;
+                size_t positions = 0;
+                for (size_t offset = 0; offset < heldOutOrder.size();
+                     offset += trainingBatchSize)
                 {
-                    report("[selfplay] network replaced at step {}", message.version);
-                    continue;
-                }
-                if (message.type != MessageType::samples)
-                    throw std::runtime_error("trainer received an invalid self-play message");
-                std::vector<TrainingSample> fresh(message.count);
-                if (!readAll(workers.selfPlay.socket, fresh.data(),
-                             fresh.size() * sizeof(TrainingSample)))
-                    throw std::runtime_error("self-play worker stopped inside a sample message");
-                size_t trainable = 0;
-                for (TrainingSample& sample : fresh)
-                {
-                    if (isHeldOutGame(sample.gameId))
-                        insertSample(heldOut, heldOutCapacity, heldOutWrite, std::move(sample));
-                    else
-                    {
-                        insertSample(replay, replayBufferCapacity, replayWrite, std::move(sample));
-                        ++trainable;
-                    }
-                }
-                // Held-out positions grant no credit: they are never trained on,
-                // so counting them would let training outrun its data.
-                credits += trainable * targetReuse;
-                reportSelfPlayStatus(fresh.size());
-            }
-            if ((descriptors[1].revents & POLLIN) != 0)
-            {
-                Message result;
-                if (!receiveMessage(workers.evaluation.socket, result))
-                    throw std::runtime_error("evaluation worker stopped");
-                if (result.type != MessageType::evaluationResult)
-                    throw std::runtime_error("trainer received an invalid evaluation message");
-                constexpr std::array<std::string_view, 3> opponentNames{
-                    "champion", "random", "rollout-mcts"};
-                for (size_t index = 0; index < opponentNames.size(); ++index)
-                    report("[evaluation] step {} vs {}: {:.1f}% over {} games",
-                           result.version, opponentNames[index],
-                           100.0 * result.scores[index], result.gameCounts[index]);
-                report("[evaluation] step {}: {}", result.version,
-                       result.promoted ? "PROMOTED" : "rejected");
-                evaluationBusy = false;
-            }
-            if ((descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
-                throw std::runtime_error("self-play worker failed");
-            if ((descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
-                throw std::runtime_error("evaluation worker failed");
-            if (!canTrain)
-                continue;
-
-            std::array<size_t, trainingBatchSize> picks;
-            for (size_t& pick : picks)
-                pick = std::uniform_int_distribution<size_t>{0, replay.size() - 1}(randomEngine);
-            const TrainingBatch batch = createBatch(replay, picks, randomEngine);
-            const LossAndGrad result = network->valueAndGrad(parameters, batch);
-
-            // Losses and one scalar covering every gradient value are checked
-            // BEFORE Adam sees the gradients: the moment estimates are
-            // exponential averages, so a single NaN batch would poison them
-            // permanently. A bad batch is skipped, not fatal - but a streak,
-            // or a steady trickle, means something is broken and stops the run.
-            mlx::core::array gradientNormSquared = mlx::core::array(0.0f);
-            for (const mlx::core::array& gradient : result.gradients)
-                gradientNormSquared =
-                    gradientNormSquared + mlx::core::sum(mlx::core::square(gradient));
-            mlx::core::eval({result.loss.policy, result.loss.value, gradientNormSquared});
-            const float policyLoss = result.loss.policy.item<float>();
-            const float valueLoss = result.loss.value.item<float>();
-            const float gradientNorm = std::sqrt(gradientNormSquared.item<float>());
-
-            const bool nonFinite = !std::isfinite(policyLoss) || !std::isfinite(valueLoss)
-                                   || !std::isfinite(gradientNorm);
-            nonFiniteInWindow -= nonFiniteWindow[batchAttemptCount % nonFiniteWindow.size()];
-            nonFiniteWindow[batchAttemptCount % nonFiniteWindow.size()] = nonFinite;
-            nonFiniteInWindow += nonFinite;
-            ++batchAttemptCount;
-            if (nonFinite)
-            {
-                ++consecutiveNonFinite;
-                report("[train] skipped a non-finite batch ({} consecutive, {} in the last {} attempts)",
-                       consecutiveNonFinite, nonFiniteInWindow, nonFiniteWindow.size());
-                if (consecutiveNonFinite >= nonFiniteAbortConsecutive
-                    || nonFiniteInWindow > nonFiniteAbortPerWindow)
-                    throw std::runtime_error("training keeps producing non-finite batches");
-                // The skipped batch still consumes credits, so persistent
-                // trouble paces against self-play instead of spinning the GPU.
-                credits -= trainingBatchSize;
-                continue;
-            }
-            consecutiveNonFinite = 0;
-
-            parameters = adam.updateParameters(
-                parameters, result.gradients, learningRate, weightDecay, decayMask);
-            mlx::core::eval(parameters);
-            credits -= trainingBatchSize;
-            ++step;
-            heldOutTrainPolicy += policyLoss;
-            heldOutTrainValue += valueLoss;
-            ++heldOutTrainSteps;
-            if (step % 10 == 0)
-            {
-                report("[train] step {}, policy {:.4f}, value {:.4f}, |g| {:.2f}, credits {:.0f}",
-                       step, policyLoss, valueLoss, gradientNorm, credits);
-            }
-            // The number to watch is the gap, not either loss alone: both fall
-            // together while the network is still learning, and the held-out
-            // loss turning up while training loss keeps falling is what says
-            // targetReuse is too high. Nothing here tunes on it.
-            if (step % heldOutSteps == 0 && heldOut.size() >= trainingBatchSize
-                && heldOutTrainSteps > 0)
-            {
-                double heldOutPolicy = 0.0;
-                double heldOutValue = 0.0;
-                for (int batchIndex = 0; batchIndex < heldOutBatchCount; ++batchIndex)
-                {
-                    std::array<size_t, trainingBatchSize> heldOutPicks;
-                    for (size_t& pick : heldOutPicks)
-                        pick = std::uniform_int_distribution<size_t>{
-                            0, heldOut.size() - 1}(heldOutRandom);
-                    const TrainingBatch heldOutBatch =
-                        createBatch(heldOut, heldOutPicks, heldOutRandom);
-                    const Loss loss = network->loss(parameters, heldOutBatch);
+                    const size_t count = std::min(
+                        trainingBatchSize, heldOutOrder.size() - offset);
+                    const TrainingBatch batch = createBatch(
+                        heldOut,
+                        std::span<const size_t>{heldOutOrder.data() + offset, count},
+                        randomEngine, false);
+                    const Loss loss = network->loss(values, batch);
                     mlx::core::eval({loss.policy, loss.value});
-                    heldOutPolicy += loss.policy.item<float>();
-                    heldOutValue += loss.value.item<float>();
+                    policy += count * loss.policy.item<float>();
+                    value += count * loss.value.item<float>();
+                    positions += count;
                 }
-                report("[holdout] step {}: policy {:.4f} vs train {:.4f}, "
-                       "value {:.4f} vs train {:.4f}, {} positions",
-                       step, heldOutPolicy / heldOutBatchCount,
-                       heldOutTrainPolicy / static_cast<double>(heldOutTrainSteps),
-                       heldOutValue / heldOutBatchCount,
-                       heldOutTrainValue / static_cast<double>(heldOutTrainSteps),
-                       heldOut.size());
-                heldOutTrainPolicy = 0.0;
-                heldOutTrainValue = 0.0;
-                heldOutTrainSteps = 0;
-            }
-            if (step % selfPlayRefreshSteps == 0)
+                return std::array<double, 2>{policy / positions, value / positions};
+            };
+
+            for (int epoch = 1; epoch <= maximumTrainingEpochs && !stopRequested;
+                 ++epoch)
             {
-                // Health is checked before anything is written or pushed, so a
-                // condemned network is never published to self-play or disk.
-                checkParameterHealth(step);
-                network->replaceParameters(parameters);
-                saveTrainingAtomically(*network, adam, liveWeights);
-                sendMessage(workers.selfPlay.socket,
-                            Message{.type = MessageType::liveWeights, .version = step});
+                std::ranges::shuffle(trainingOrder, randomEngine);
+                double trainPolicy = 0.0;
+                double trainValue = 0.0;
+                double gradientNormTotal = 0.0;
+                size_t trainedPositions = 0;
+                size_t completedBatches = 0;
+                for (size_t offset = 0; offset < trainingOrder.size();
+                     offset += trainingBatchSize)
+                {
+                    const size_t count = std::min(
+                        trainingBatchSize, trainingOrder.size() - offset);
+                    const TrainingBatch batch = createBatch(
+                        training,
+                        std::span<const size_t>{trainingOrder.data() + offset, count},
+                        randomEngine, true);
+                    const LossAndGrad result = network->valueAndGrad(parameters, batch);
+                    mlx::core::array gradientNormSquared = mlx::core::array(0.0f);
+                    for (const mlx::core::array& gradient : result.gradients)
+                        gradientNormSquared = gradientNormSquared
+                            + mlx::core::sum(mlx::core::square(gradient));
+                    mlx::core::eval(
+                        {result.loss.policy, result.loss.value, gradientNormSquared});
+                    const float policyLoss = result.loss.policy.item<float>();
+                    const float valueLoss = result.loss.value.item<float>();
+                    const float gradientNorm =
+                        std::sqrt(gradientNormSquared.item<float>());
+                    const bool nonFinite = !std::isfinite(policyLoss)
+                        || !std::isfinite(valueLoss) || !std::isfinite(gradientNorm);
+                    nonFiniteInWindow -=
+                        nonFiniteWindow[batchAttemptCount % nonFiniteWindow.size()];
+                    nonFiniteWindow[batchAttemptCount % nonFiniteWindow.size()] = nonFinite;
+                    nonFiniteInWindow += nonFinite;
+                    ++batchAttemptCount;
+                    if (nonFinite)
+                    {
+                        ++consecutiveNonFinite;
+                        report("[train] skipped a non-finite batch ({} consecutive, "
+                               "{} in the last {} attempts)",
+                               consecutiveNonFinite, nonFiniteInWindow,
+                               nonFiniteWindow.size());
+                        if (consecutiveNonFinite >= nonFiniteAbortConsecutive
+                            || nonFiniteInWindow > nonFiniteAbortPerWindow)
+                            throw std::runtime_error(
+                                "training keeps producing non-finite batches");
+                        continue;
+                    }
+                    consecutiveNonFinite = 0;
+                    parameters = adam.updateParameters(
+                        parameters, result.gradients, learningRate,
+                        weightDecay, decayMask);
+                    mlx::core::eval(parameters);
+                    ++optimizerStep;
+                    trainPolicy += count * policyLoss;
+                    trainValue += count * valueLoss;
+                    gradientNormTotal += gradientNorm;
+                    trainedPositions += count;
+                    ++completedBatches;
+                    if (stopRequested)
+                        break;
+                }
+                if (stopRequested)
+                    break;
+                if (trainedPositions == 0)
+                    throw std::runtime_error("an epoch contained no finite training batch");
+
+                healthMonitor.check(parameters, optimizerStep);
+                const std::array<double, 2> heldOutLoss = validationLoss(parameters);
+                const double validation = heldOutLoss[0] + heldOutLoss[1];
+                report("[train] generation {}, epoch {}/{}, step {}: policy {:.4f}, "
+                       "value {:.4f}, held-out {:.4f}+{:.4f}, |g| {:.2f}",
+                       generation, epoch, maximumTrainingEpochs, optimizerStep,
+                       trainPolicy / trainedPositions, trainValue / trainedPositions,
+                       heldOutLoss[0], heldOutLoss[1],
+                       gradientNormTotal / completedBatches);
+                if (validation + validationImprovement < bestValidation)
+                {
+                    bestValidation = validation;
+                    bestParameters = parameters;
+                    bestEpoch = epoch;
+                    staleEpochs = 0;
+                }
+                else if (++staleEpochs >= earlyStoppingPatience)
+                {
+                    report("[train] generation {} stopped after epoch {}; "
+                           "held-out loss last improved at epoch {}",
+                           generation, epoch, bestEpoch);
+                    break;
+                }
             }
-            if (step % evaluationSteps == 0)
+            if (stopRequested)
+                break;
+            if (bestEpoch == 0)
+                throw std::runtime_error("training did not produce a candidate epoch");
+            parameters = std::move(bestParameters);
+            healthMonitor.check(parameters, optimizerStep);
+            network->replaceParameters(parameters);
+            report("[train] generation {} candidate uses epoch {}", generation, bestEpoch);
+
+            const uint64_t gateBase = generation * 1'000'000;
+            bool baselinesPassed = true;
+            if (firstGate)
             {
-                if (!evaluationBusy)
-                    publishCandidate();
+                MatchScore randomScore;
+                if (!playBaselineGames<randomGameCount>(
+                        *network, Baseline::random, gateBase + championGameCount,
+                        seed + 8888 + generation, randomScore))
+                    break;
+                report("[gate] generation {} vs random: {:.1f}% "
+                       "(95% lower {:.1f}%) over {} games",
+                       generation, 100.0 * randomScore.score(),
+                       100.0 * randomScore.lowerConfidenceBound(), randomScore.games());
+
+                MatchScore rolloutScore;
+                if (!playBaselineGames<rolloutGameCount>(
+                        *network, Baseline::rollout,
+                        gateBase + championGameCount + randomGameCount,
+                        seed + 9999 + generation, rolloutScore))
+                    break;
+                report("[gate] generation {} vs rollout-mcts: {:.1f}% "
+                       "(95% lower {:.1f}%) over {} games",
+                       generation, 100.0 * rolloutScore.score(),
+                       100.0 * rolloutScore.lowerConfidenceBound(), rolloutScore.games());
+                baselinesPassed = randomScore.lowerConfidenceBound() > 0.5
+                    && rolloutScore.lowerConfidenceBound() > 0.5;
             }
+            if (stopRequested)
+                break;
+
+            std::unique_ptr<Network> champion = loadNetwork(weights, network->name());
+            PairedMatchScore championScore(championGameCount / 2);
+            const Network* gateNetworks[]{network.get(), champion.get()};
+            NetworkMatchRunner<evaluationSimulationCount> championRunner{gateNetworks};
+            if (!championRunner.template play<championGameCount>(
+                    gateBase, seed + 7777 + generation,
+                    [&](uint64_t gameId, Outcome outcome) {
+                        const size_t gameIndex = static_cast<size_t>(gameId - gateBase);
+                        championScore.add(gameIndex, outcome, gameIndex % 2 == 0);
+                    }))
+                break;
+            const double championLowerBound =
+                championScore.lowerConfidenceBound();
+            report("[gate] generation {} vs champion: {:.1f}% "
+                   "(paired 95% lower {:.1f}%) over {} games",
+                   generation, 100.0 * championScore.score(),
+                   100.0 * championLowerBound, championScore.gameCount());
+
+            const bool promoted = baselinesPassed && championLowerBound > 0.5;
+            report("[gate] generation {}: {}", generation,
+                   promoted ? "PROMOTED" : "rejected");
+            firstGate = false;
+            if (promoted)
+                saveAtomically(*network, weights);
+            else
+                network = std::move(champion);
+            ++generation;
         }
 
         finishSelfPlayStatus();
-        network->replaceParameters(parameters);
-        report("[train] stopping, saving {}", liveWeights.string());
-        saveTrainingAtomically(*network, adam, liveWeights);
-        stopWorkers(workers);
-        std::filesystem::remove(candidateWeights);
-        report("[train] shutdown complete");
+        report("[train] shutdown complete; champion remains {}", weights.string());
         return EXIT_SUCCESS;
     }
     catch (const std::exception& error)
     {
-        stopWorkers(workers);
         finishSelfPlayStatus();
         std::println(stderr, "[train] {}", error.what());
         return EXIT_FAILURE;

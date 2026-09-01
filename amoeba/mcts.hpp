@@ -65,7 +65,7 @@ private:
 uint16_t bestMove(const VisitCounts&);
 float outcomeFor(Outcome, bool whiteToMove);
 
-extern template class MCTS<200>;
+extern template class MCTS<256>;
 extern template class MCTS<1000>;
 
 } // namespace amoeba_bot
