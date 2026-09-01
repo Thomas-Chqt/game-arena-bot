@@ -45,20 +45,20 @@ constexpr uint64_t evaluationOpeningSeed = healthReferenceSeed + 7777;
 // comparison does not reward a candidate under different search conditions.
 constexpr int selfPlaySimulationCount = 256;
 constexpr int evaluationSimulationCount = 256;
-// One lane is one MLX inference batch. While its 128 leaves are on the GPU,
+// One lane is one MLX inference batch. While its 256 leaves are on the GPU,
 // the host advances MCTS for the other lane.
-constexpr int selfPlayLaneSize = 128;
+constexpr int selfPlayLaneSize = 256;
 constexpr int selfPlayLaneCount = 2;
 constexpr int selfPlayGameCount = 1024;
 static_assert(selfPlayGameCount % selfPlayLaneCount == 0);
 constexpr int selfPlayGamesPerLane = selfPlayGameCount / selfPlayLaneCount;
-// Two hundred paired openings give 400 games. Promotion uses the lower bound
-// across the 200 pair scores, rather than a raw win-rate threshold.
-constexpr int championGameCount = 400;
+// Two hundred fifty-six paired openings give 512 games. Promotion uses the
+// lower bound across the 256 pair scores, rather than a raw win-rate threshold.
+constexpr int championGameCount = 512;
 constexpr int evaluationOpeningPlyCount = 4;
-constexpr int randomGameCount = 128;
-constexpr int rolloutGameCount = 128;
-constexpr int concurrentEvaluationGames = 128;
+constexpr int randomGameCount = 256;
+constexpr int rolloutGameCount = 256;
+constexpr int concurrentEvaluationGames = 512;
 constexpr int samplingPlyCount = 20;
 constexpr float rootNoise = 0.25f;
 constexpr float noiseAlpha = 0.35f;
@@ -97,6 +97,7 @@ struct GateStatus
     std::string_view opponent;
     int completedGames = 0;
     int totalGames = 0;
+    double score = 0.0;
     bool visible = false;
 };
 
@@ -126,10 +127,16 @@ void drawGateStatus()
 {
     if (!gateStatus.visible || !isatty(STDOUT_FILENO))
         return;
-    std::print("\r\x1b[2K[gate] generation {} vs {}: {}/{} games ({:.1f}%)",
-               gateStatus.generation, gateStatus.opponent,
-               gateStatus.completedGames, gateStatus.totalGames,
-               100.0 * gateStatus.completedGames / gateStatus.totalGames);
+    if (gateStatus.completedGames == 0)
+        std::print("\r\x1b[2K[gate] generation {} vs {}: 0/{} games",
+                   gateStatus.generation, gateStatus.opponent,
+                   gateStatus.totalGames);
+    else
+        std::print("\r\x1b[2K[gate] generation {} vs {}: {}/{} games "
+                   "({:.1f}% win rate)",
+                   gateStatus.generation, gateStatus.opponent,
+                   gateStatus.completedGames, gateStatus.totalGames,
+                   100.0 * gateStatus.score);
     std::fflush(stdout);
 }
 
@@ -143,17 +150,20 @@ void startGateStatus(uint64_t generation, std::string_view opponent,
         .opponent = opponent,
         .completedGames = 0,
         .totalGames = totalGames,
+        .score = 0.0,
         .visible = true,
     };
     drawGateStatus();
 }
 
-void updateGateStatus(int completedGames)
+void updateGateStatus(int completedGames, double score)
 {
     assert(gateStatus.visible);
     assert(completedGames > gateStatus.completedGames);
     assert(completedGames <= gateStatus.totalGames);
+    assert(score >= 0.0 && score <= 1.0);
     gateStatus.completedGames = completedGames;
+    gateStatus.score = score;
     drawGateStatus();
 }
 
@@ -493,9 +503,9 @@ public:
                 if (game.pendingLeaf == nullptr)
                 {
                     finish(game);
-                    gameFinished(game.gameId, *game.outcome);
+                    const double score = gameFinished(game.gameId, *game.outcome);
                     ++completed;
-                    updateGateStatus(completed);
+                    updateGateStatus(completed, score);
                     if (started < GameCount)
                     {
                         initializeGame(game);
@@ -1075,7 +1085,7 @@ bool playBaselineGames(const Network& candidate, Baseline baseline,
             {
                 score.add(*game.outcome, game.candidateWhite);
                 ++completed;
-                updateGateStatus(completed);
+                updateGateStatus(completed, score.score());
                 if (started >= GameCount)
                     continue;
                 initialize(game, firstGameId + started++, randomSeed);
@@ -1539,6 +1549,7 @@ int runTraining(const std::filesystem::path& weights,
                     [&](uint64_t gameId, Outcome outcome) {
                         const size_t gameIndex = static_cast<size_t>(gameId - gateBase);
                         championScore.add(gameIndex, outcome, gameIndex % 2 == 0);
+                        return championScore.score();
                     });
             finishGateStatus();
             if (!championCompleted)
