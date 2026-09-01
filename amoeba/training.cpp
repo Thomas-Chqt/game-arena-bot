@@ -37,7 +37,8 @@ namespace amoeba_bot
 namespace
 {
 
-constexpr uint64_t seed = 20260819;
+constexpr uint64_t healthReferenceSeed = 20260819;
+constexpr uint64_t evaluationOpeningSeed = healthReferenceSeed + 7777;
 // A 256-visit search is large enough to make the policy target materially less
 // sparse than the old 200-visit target without doubling the dominant cost of
 // every generation. Self-play and the gate use the same search budget so the
@@ -47,7 +48,10 @@ constexpr int evaluationSimulationCount = 256;
 // One lane is one MLX inference batch. While its 128 leaves are on the GPU,
 // the host advances MCTS for the other lane.
 constexpr int selfPlayLaneSize = 128;
-constexpr int selfPlayGameCount = 2 * selfPlayLaneSize;
+constexpr int selfPlayLaneCount = 2;
+constexpr int selfPlayGameCount = 1024;
+static_assert(selfPlayGameCount % selfPlayLaneCount == 0);
+constexpr int selfPlayGamesPerLane = selfPlayGameCount / selfPlayLaneCount;
 // Two hundred paired openings give 400 games. Promotion uses the lower bound
 // across the 200 pair scores, rather than a raw win-rate threshold.
 constexpr int championGameCount = 400;
@@ -59,17 +63,16 @@ constexpr int samplingPlyCount = 20;
 constexpr float rootNoise = 0.25f;
 constexpr float noiseAlpha = 0.35f;
 constexpr size_t trainingBatchSize = 256;
-// The split is by game, never by position. Thirty-two of each generation's
-// 256 games are expected to be validation-only, which is enough to stop an
-// epoch sequence that has begun fitting its game outcomes instead of learning
-// a better position evaluator.
+// The split is by game, never by position. One eighth of the games generated
+// by a champion are validation-only, including games retained after a rejected
+// candidate.
 constexpr uint64_t heldOutGameFraction = 8;
 constexpr int maximumTrainingEpochs = 8;
 constexpr int earlyStoppingPatience = 2;
 constexpr float validationImprovement = 1e-4f;
-// Each generation fine-tunes an already trained champion on only 256 new
-// games. AdamW at 1e-4 makes that update deliberate; the gate, not a large
-// optimizer jump, decides whether it was useful.
+// Each candidate fine-tunes an already trained champion. AdamW at 1e-4 makes
+// that update deliberate; the gate, not a large optimizer jump, decides
+// whether it was useful.
 constexpr float learningRate = 1e-4f;
 constexpr float weightDecay = 1e-2f;
 constexpr double gateConfidenceZ = 1.645; // one-sided 95% lower bound
@@ -88,6 +91,28 @@ struct SelfPlayStatus
 
 SelfPlayStatus selfPlayStatus;
 
+struct GateStatus
+{
+    uint64_t generation = 0;
+    std::string_view opponent;
+    int completedGames = 0;
+    int totalGames = 0;
+    bool visible = false;
+};
+
+GateStatus gateStatus;
+
+uint64_t makeRunSeed()
+{
+    std::random_device randomDevice;
+    const uint64_t entropy =
+        (static_cast<uint64_t>(randomDevice()) << 32) ^ randomDevice();
+    const uint64_t time = static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+    const uint64_t process = static_cast<uint64_t>(getpid());
+    return entropy ^ time ^ (0x9e3779b97f4a7c15ULL * process);
+}
+
 void clearTerminalLine()
 {
     if (isatty(STDOUT_FILENO))
@@ -95,6 +120,49 @@ void clearTerminalLine()
         std::print("\r\x1b[2K");
         std::fflush(stdout);
     }
+}
+
+void drawGateStatus()
+{
+    if (!gateStatus.visible || !isatty(STDOUT_FILENO))
+        return;
+    std::print("\r\x1b[2K[gate] generation {} vs {}: {}/{} games ({:.1f}%)",
+               gateStatus.generation, gateStatus.opponent,
+               gateStatus.completedGames, gateStatus.totalGames,
+               100.0 * gateStatus.completedGames / gateStatus.totalGames);
+    std::fflush(stdout);
+}
+
+void startGateStatus(uint64_t generation, std::string_view opponent,
+                     int totalGames)
+{
+    assert(totalGames > 0);
+    assert(!gateStatus.visible);
+    gateStatus = GateStatus{
+        .generation = generation,
+        .opponent = opponent,
+        .completedGames = 0,
+        .totalGames = totalGames,
+        .visible = true,
+    };
+    drawGateStatus();
+}
+
+void updateGateStatus(int completedGames)
+{
+    assert(gateStatus.visible);
+    assert(completedGames > gateStatus.completedGames);
+    assert(completedGames <= gateStatus.totalGames);
+    gateStatus.completedGames = completedGames;
+    drawGateStatus();
+}
+
+void finishGateStatus()
+{
+    if (!gateStatus.visible)
+        return;
+    clearTerminalLine();
+    gateStatus.visible = false;
 }
 
 void drawSelfPlayStatus()
@@ -306,7 +374,7 @@ std::vector<EvaluationOpening> makeEvaluationOpenings(size_t count)
 {
     // Every candidate sees this same suite. Pairing both colours from each
     // position adds position diversity without injecting noise into search.
-    std::mt19937_64 randomEngine{seed + 7777};
+    std::mt19937_64 randomEngine{evaluationOpeningSeed};
     std::unordered_set<uint64_t> positionHashes;
     std::vector<EvaluationOpening> openings;
     openings.reserve(count);
@@ -427,6 +495,7 @@ public:
                     finish(game);
                     gameFinished(game.gameId, *game.outcome);
                     ++completed;
+                    updateGateStatus(completed);
                     if (started < GameCount)
                     {
                         initializeGame(game);
@@ -478,12 +547,14 @@ private:
 class SelfPlayLane
 {
 public:
-    SelfPlayLane(uint64_t firstGameId, uint64_t randomSeed)
-        : m_games(selfPlayLaneSize), m_activeGames(selfPlayLaneSize)
+    SelfPlayLane(uint64_t firstGameId, size_t gameCount, uint64_t randomSeed)
+        : m_games(std::min<size_t>(selfPlayLaneSize, gameCount)),
+          m_firstGameId(firstGameId), m_randomSeed(randomSeed),
+          m_gameCount(gameCount), m_activeGames(m_games.size())
     {
-        for (size_t gameIndex = 0; gameIndex < m_games.size(); ++gameIndex)
-            initialize(m_games[gameIndex], firstGameId + gameIndex,
-                       NetworkPairing{0, 0}, randomSeed);
+        assert(gameCount > 0);
+        for (ActiveGame<selfPlaySimulationCount>& game : m_games)
+            initializeNext(game);
     }
 
     std::vector<TrainingSample> prepare()
@@ -503,9 +574,18 @@ public:
                 completed.insert(completed.end(),
                                  std::make_move_iterator(game.samples.begin()),
                                  std::make_move_iterator(game.samples.end()));
-                game.active = false;
-                --m_activeGames;
-                continue;
+                ++m_completedGames;
+                if (m_startedGames < m_gameCount)
+                {
+                    initializeNext(game);
+                    advance<selfPlaySimulationCount, true>(game);
+                }
+                else
+                {
+                    game.active = false;
+                    --m_activeGames;
+                    continue;
+                }
             }
             game.evaluationOffset = m_pendingBoards.size();
             m_pendingBoards.push_back(game.pendingLeaf);
@@ -547,25 +627,39 @@ public:
     {
         return m_activeGames == 0 && !m_prepared && !m_pending.has_value();
     }
-    size_t completedGames() const { return selfPlayLaneSize - m_activeGames; }
+    size_t completedGames() const { return m_completedGames; }
 
 private:
+    void initializeNext(ActiveGame<selfPlaySimulationCount>& game)
+    {
+        assert(m_startedGames < m_gameCount);
+        initialize(game, m_firstGameId + m_startedGames,
+                   NetworkPairing{0, 0}, m_randomSeed);
+        ++m_startedGames;
+    }
+
     std::vector<ActiveGame<selfPlaySimulationCount>> m_games;
     std::vector<const Board*> m_pendingBoards;
     std::vector<Evaluation> m_evaluations;
     std::optional<PendingEvaluations> m_pending;
+    uint64_t m_firstGameId;
+    uint64_t m_randomSeed;
+    size_t m_gameCount;
+    size_t m_startedGames = 0;
+    size_t m_completedGames = 0;
     size_t m_activeGames;
     bool m_prepared = false;
 };
 
 std::vector<TrainingSample> generateSelfPlay(const Network& network,
-                                             uint64_t& nextGameId)
+                                             uint64_t& nextGameId,
+                                             uint64_t runSeed)
 {
     selfPlayStatus = SelfPlayStatus{};
     std::array<SelfPlayLane, 2> lanes{
-        SelfPlayLane{nextGameId, seed ^ nextGameId},
-        SelfPlayLane{nextGameId + selfPlayLaneSize,
-                     seed ^ (nextGameId + selfPlayLaneSize)},
+        SelfPlayLane{nextGameId, selfPlayGamesPerLane, runSeed ^ nextGameId},
+        SelfPlayLane{nextGameId + selfPlayGamesPerLane, selfPlayGamesPerLane,
+                     runSeed ^ (nextGameId + selfPlayGamesPerLane)},
     };
     nextGameId += selfPlayGameCount;
 
@@ -981,6 +1075,7 @@ bool playBaselineGames(const Network& candidate, Baseline baseline,
             {
                 score.add(*game.outcome, game.candidateWhite);
                 ++completed;
+                updateGateStatus(completed);
                 if (started >= GameCount)
                     continue;
                 initialize(game, firstGameId + started++, randomSeed);
@@ -1071,7 +1166,8 @@ public:
         // The reference is always a fresh network built from the layout's own
         // initialization, never from loaded weights: re-anchoring to a resumed
         // checkpoint would silently accept whatever erosion it already has.
-        const std::unique_ptr<Network> reference = createNetwork(network.name(), seed);
+        const std::unique_ptr<Network> reference =
+            createNetwork(network.name(), healthReferenceSeed);
         m_referenceRms = tensorRms(reference->parameters());
         m_names.reserve(m_referenceRms.size());
         for (size_t index = 0; index < m_referenceRms.size(); ++index)
@@ -1181,6 +1277,7 @@ int runTraining(const std::filesystem::path& weights,
     try
     {
         installSignalHandlers();
+        const uint64_t runSeed = makeRunSeed();
         std::filesystem::path legacyLiveWeights = weights;
         legacyLiveWeights += ".live.safetensors";
         const bool importLegacyLive = std::filesystem::exists(legacyLiveWeights)
@@ -1193,7 +1290,7 @@ int runTraining(const std::filesystem::path& weights,
         else if (std::filesystem::exists(weights))
             network = loadNetwork(weights, networkIdentifier);
         else if (!networkIdentifier.empty())
-            network = createNetwork(networkIdentifier, seed);
+            network = createNetwork(networkIdentifier, runSeed);
         else
             throw std::runtime_error(std::format(
                 "{} does not exist; select a network with --network",
@@ -1214,40 +1311,47 @@ int runTraining(const std::filesystem::path& weights,
             saveAtomically(*network, weights);
         report("[train] {}: {}, {} parameters", weights.string(),
                network->name(), network->parameterCount());
+        report("[train] run seed: {}", runSeed);
         report("[train] generation method: {} self-play games, {}+{} lanes, "
                "{} visits, AdamW lr {}, up to {} epochs",
                selfPlayGameCount, selfPlayLaneSize, selfPlayLaneSize,
                selfPlaySimulationCount, learningRate, maximumTrainingEpochs);
 
-        std::mt19937_64 randomEngine{seed};
+        std::mt19937_64 randomEngine{runSeed};
         uint64_t nextGameId = 0;
         uint64_t optimizerStep = 0;
         uint64_t generation = 1;
         bool firstGate = true;
+        size_t pooledGames = 0;
+        std::vector<TrainingSample> training;
+        std::vector<TrainingSample> heldOut;
 
         while (!stopRequested)
         {
             report("[generation {}] self-play started from the champion", generation);
             std::vector<TrainingSample> generated =
-                generateSelfPlay(*network, nextGameId);
+                generateSelfPlay(*network, nextGameId, runSeed);
             if (stopRequested)
                 break;
 
-            std::vector<TrainingSample> training;
-            std::vector<TrainingSample> heldOut;
-            training.reserve(generated.size());
-            heldOut.reserve(generated.size() / heldOutGameFraction + 1);
+            const size_t generatedPositionCount = generated.size();
+            training.reserve(training.size() + generatedPositionCount);
+            heldOut.reserve(
+                heldOut.size() + generatedPositionCount / heldOutGameFraction + 1);
             for (TrainingSample& sample : generated)
             {
                 std::vector<TrainingSample>& destination =
                     isHeldOutGame(sample.gameId) ? heldOut : training;
                 destination.push_back(std::move(sample));
             }
+            pooledGames += selfPlayGameCount;
             if (training.empty() || heldOut.empty())
                 throw std::runtime_error(
                     "self-play generation did not produce both training and held-out positions");
-            report("[generation {}] {} positions: {} train, {} held out",
-                   generation, generated.size(), training.size(), heldOut.size());
+            report("[generation {}] {} new positions; champion pool: {} games, "
+                   "{} positions ({} train, {} held out)",
+                   generation, generatedPositionCount, pooledGames,
+                   training.size() + heldOut.size(), training.size(), heldOut.size());
 
             std::vector<mlx::core::array> parameters = network->parameters();
             Adam adam{parameters};
@@ -1393,9 +1497,12 @@ int runTraining(const std::filesystem::path& weights,
             if (firstGate)
             {
                 MatchScore randomScore;
-                if (!playBaselineGames<randomGameCount>(
-                        *network, Baseline::random, gateBase + championGameCount,
-                        seed + 8888 + generation, randomScore))
+                startGateStatus(generation, "random", randomGameCount);
+                const bool randomCompleted = playBaselineGames<randomGameCount>(
+                    *network, Baseline::random, gateBase + championGameCount,
+                    runSeed + 8888 + generation, randomScore);
+                finishGateStatus();
+                if (!randomCompleted)
                     break;
                 report("[gate] generation {} vs random: {:.1f}% "
                        "(95% lower {:.1f}%) over {} games",
@@ -1403,10 +1510,13 @@ int runTraining(const std::filesystem::path& weights,
                        100.0 * randomScore.lowerConfidenceBound(), randomScore.games());
 
                 MatchScore rolloutScore;
-                if (!playBaselineGames<rolloutGameCount>(
-                        *network, Baseline::rollout,
-                        gateBase + championGameCount + randomGameCount,
-                        seed + 9999 + generation, rolloutScore))
+                startGateStatus(generation, "rollout-mcts", rolloutGameCount);
+                const bool rolloutCompleted = playBaselineGames<rolloutGameCount>(
+                    *network, Baseline::rollout,
+                    gateBase + championGameCount + randomGameCount,
+                    runSeed + 9999 + generation, rolloutScore);
+                finishGateStatus();
+                if (!rolloutCompleted)
                     break;
                 report("[gate] generation {} vs rollout-mcts: {:.1f}% "
                        "(95% lower {:.1f}%) over {} games",
@@ -1422,12 +1532,16 @@ int runTraining(const std::filesystem::path& weights,
             PairedMatchScore championScore(championGameCount / 2);
             const Network* gateNetworks[]{network.get(), champion.get()};
             NetworkMatchRunner<evaluationSimulationCount> championRunner{gateNetworks};
-            if (!championRunner.template play<championGameCount>(
-                    gateBase, seed + 7777 + generation,
+            startGateStatus(generation, "champion", championGameCount);
+            const bool championCompleted =
+                championRunner.template play<championGameCount>(
+                    gateBase, runSeed + 7777 + generation,
                     [&](uint64_t gameId, Outcome outcome) {
                         const size_t gameIndex = static_cast<size_t>(gameId - gateBase);
                         championScore.add(gameIndex, outcome, gameIndex % 2 == 0);
-                    }))
+                    });
+            finishGateStatus();
+            if (!championCompleted)
                 break;
             const double championLowerBound =
                 championScore.lowerConfidenceBound();
@@ -1441,9 +1555,20 @@ int runTraining(const std::filesystem::path& weights,
                    promoted ? "PROMOTED" : "rejected");
             firstGate = false;
             if (promoted)
+            {
                 saveAtomically(*network, weights);
+                report("[generation {}] promoted; cleared {} champion self-play games",
+                       generation, pooledGames);
+                std::vector<TrainingSample>{}.swap(training);
+                std::vector<TrainingSample>{}.swap(heldOut);
+                pooledGames = 0;
+            }
             else
+            {
                 network = std::move(champion);
+                report("[generation {}] rejected; retaining {} champion self-play games",
+                       generation, pooledGames);
+            }
             ++generation;
         }
 
@@ -1454,6 +1579,7 @@ int runTraining(const std::filesystem::path& weights,
     catch (const std::exception& error)
     {
         finishSelfPlayStatus();
+        finishGateStatus();
         std::println(stderr, "[train] {}", error.what());
         return EXIT_FAILURE;
     }
