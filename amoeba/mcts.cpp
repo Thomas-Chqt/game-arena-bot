@@ -352,5 +352,6 @@ void MCTS<SimulationCount>::backpropagate(float value)
 
 template class MCTS<256>;
 template class MCTS<1000>;
+template class MCTS<1500>;
 
 } // namespace amoeba_bot
