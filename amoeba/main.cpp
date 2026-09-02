@@ -1,13 +1,13 @@
 // amoeba_bot either plays Amoeba on Game Arena or trains the same network:
 //
-//   amoeba_bot [--network <identifier>] <weights.safetensors>
+//   amoeba_bot [--continuous] [--network <identifier>] <weights.safetensors>
 //   amoeba_bot --train [--network <identifier>] <weights.safetensors>
 //
 // An existing checkpoint identifies its own architecture. --network checks that
 // identifier, or selects the architecture when creating a missing checkpoint.
 //
 // Credentials come from BOT1_ID and BOT1_KEY; ROOM_ID picks a practice room, and
-// without it the bot queues for ranked games back to back.
+// without it the bot queues for one ranked game, or back to back with --continuous.
 //
 // The SDK side is the same shape as the random bot in the reference: fill
 // arena_move_t with the strings the server sent, and copy the piece's splitting
@@ -46,9 +46,9 @@ namespace amoeba_bot
 namespace
 {
 
-// Every move starts a fresh search and runs to the full simulation count. There
-// is no clock on it, so elapsed time is a measurement rather than a limit. The
-// server allows 5 s a move, and nothing here enforces that.
+// Every move starts a fresh search, stopping at a proven result or the simulation
+// count. Elapsed time is a measurement rather than a limit: the server allows
+// 5 s a move, and nothing here enforces that.
 constexpr int searchSimulationCount = 1000;
 constexpr uint64_t initializationSeed = 20260819;
 
@@ -96,7 +96,7 @@ bool hasSamePosition(const Board& left, const Board& right)
 
 void startSearch(BotContext& context)
 {
-    context.search.emplace(context.board, context.positionHistory);
+    context.search.emplace(context.board, context.positionHistory, true);
 }
 
 VisitCounts finishSearch(MCTS<searchSimulationCount>& search, const Network& network)
@@ -196,7 +196,7 @@ Move selectMove(BotContext& context, std::chrono::steady_clock::time_point turnS
     }
 
     const VisitCounts visitCounts = finishSearch(*context.search, *context.network);
-    const uint16_t chosenMoveId = bestMove(visitCounts);
+    const uint16_t chosenMoveId = context.search->bestMove();
 
     if (!context.board.isLegal(chosenMoveId))
     {
@@ -286,7 +286,7 @@ void onDisconnect(const char* reason, void*)
 }
 
 int runBot(const std::filesystem::path& weights,
-           std::string_view networkIdentifier)
+           std::string_view networkIdentifier, bool continuous)
 {
     const char* botId = std::getenv("BOT1_ID");
     const char* apiKey = std::getenv("BOT1_KEY");
@@ -334,11 +334,14 @@ int runBot(const std::filesystem::path& weights,
         .user_data = &context,
     };
 
-    // A practice room when one is named, otherwise ranked games back to back for
-    // as long as the process lives. arena_start_continuous only returns on error.
+    // A practice room when one is named, otherwise one ranked game by default.
     if (const char* roomId = std::getenv("ROOM_ID"))
         return arena_start_practice(&config, roomId);
 
+    if (!continuous)
+        return arena_start(&config, ARENA_GAME_AMOEBA);
+
+    // Continuous play queues again after each game and only returns on error.
     const int status = arena_start_continuous(&config, ARENA_GAME_AMOEBA);
     std::println(stderr, "[bot] continuous play stopped with status {}", status);
     return status;
@@ -351,6 +354,7 @@ int runBot(const std::filesystem::path& weights,
 int main(int argc, char** argv)
 {
     bool train = false;
+    bool continuous = false;
     bool valid = true;
     bool networkSpecified = false;
     std::string_view networkIdentifier;
@@ -360,6 +364,8 @@ int main(int argc, char** argv)
         const std::string_view argument{argv[index]};
         if (argument == "--train")
             train = true;
+        else if (argument == "--continuous")
+            continuous = true;
         else if (argument == "--network" && !networkSpecified
                  && index + 1 < argc)
         {
@@ -374,15 +380,15 @@ int main(int argc, char** argv)
             weights = argument;
     }
 
-    if (valid && !weights.empty())
+    if (valid && !weights.empty() && !(train && continuous))
     {
         if (train)
             return amoeba_bot::runTraining(weights, networkIdentifier);
-        return amoeba_bot::runBot(weights, networkIdentifier);
+        return amoeba_bot::runBot(weights, networkIdentifier, continuous);
     }
 
     std::println(stderr,
-                 "usage: amoeba_bot [--network <identifier>] <weights.safetensors>");
+                 "usage: amoeba_bot [--continuous] [--network <identifier>] <weights.safetensors>");
     std::println(stderr,
                  "       amoeba_bot --train [--network <identifier>] <weights.safetensors>");
     return EXIT_FAILURE;

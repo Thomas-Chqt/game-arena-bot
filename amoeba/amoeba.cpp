@@ -437,9 +437,10 @@ Board::Board(const arena_game_state_t& state)
     refreshKernelPositions(*this);
     positionHash = computeHash(*this);
 
-    if (state.legal_moves == nullptr)
+    // The server supplies moves for the recipient, not necessarily the side to move.
+    assert(state.legal_moves != nullptr || state.legal_moves_count == 0);
+    if (state.legal_moves == nullptr || state.my_side != state.current_turn)
     {
-        assert(state.legal_moves_count == 0);
         generateLegalMoves(*this);
         return;
     }

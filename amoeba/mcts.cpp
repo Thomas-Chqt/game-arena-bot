@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <limits>
 #include <ranges>
+#include <tuple>
 #include <utility>
 
 namespace amoeba_bot
@@ -22,12 +24,14 @@ uint16_t bestMove(const VisitCounts& counts)
 }
 
 template<int SimulationCount>
-MCTS<SimulationCount>::MCTS(const Board& root, std::span<const uint64_t> history)
+MCTS<SimulationCount>::MCTS(const Board& root, std::span<const uint64_t> history, bool proveOutcomes)
     : m_gameHistorySize(history.size())
+    , m_proveOutcomes(proveOutcomes)
     , m_pendingLeaf(root)
 {
     assert(history.size() <= m_gameHistory.size());
-    m_nodes.reserve(SimulationCount + 1);
+    // The root's tactical pass can add solved children before any simulations.
+    m_nodes.reserve(SimulationCount + 1 + (proveOutcomes ? root.legalMoveCount : 0));
     std::ranges::copy(history, m_gameHistory.begin());
 }
 
@@ -38,6 +42,7 @@ const Board* MCTS<SimulationCount>::pendingLeaf()
         return &*m_pendingLeaf;
 
     while (std::get<Node>(m_nodes[0]).edgeCount != 0
+           && (!m_proveOutcomes || !provenValue(0).has_value())
            && std::get<Node>(m_nodes[0]).visits < SimulationCount)
     {
         if (descend())
@@ -54,6 +59,8 @@ void MCTS<SimulationCount>::absorb(std::span<const float, moveIdCount> policy, f
     if (m_nodes.empty())
     {
         addNode(*m_pendingLeaf, policy);
+        if (m_proveOutcomes)
+            checkRootTactics();
     }
     else
     {
@@ -84,6 +91,28 @@ VisitCounts MCTS<SimulationCount>::visits() const
 }
 
 template<int SimulationCount>
+uint16_t MCTS<SimulationCount>::bestMove() const
+{
+    assert(!m_nodes.empty());
+    if (!m_proveOutcomes)
+        return amoeba_bot::bestMove(visits());
+
+    const Node& root = std::get<Node>(m_nodes[0]);
+    assert(root.edgeCount > 0);
+    const auto rank = [&](uint32_t edgeIndex) {
+        const Edge& edge = m_edges[edgeIndex];
+        const std::optional<float> childValue = edge.node.has_value()
+            ? provenValue(*edge.node) : std::nullopt;
+        // Values belong to the child side: its loss is our proven win.
+        const int outcomeRank = childValue == -1.0f ? 2 : childValue == 1.0f ? 0 : 1;
+        return std::tuple{outcomeRank, edge.visits, edge.prior};
+    };
+    const uint32_t edgeIndex = *std::ranges::max_element(
+        std::views::iota(root.firstEdgeIndex, root.firstEdgeIndex + root.edgeCount), {}, rank);
+    return m_edges[edgeIndex].moveId;
+}
+
+template<int SimulationCount>
 uint32_t MCTS<SimulationCount>::addNode(
     const Board& board, std::span<const float, moveIdCount> policy)
 {
@@ -97,6 +126,7 @@ uint32_t MCTS<SimulationCount>::addNode(
         .visits = 0,
         .firstEdgeIndex = static_cast<uint32_t>(m_edges.size()),
         .edgeCount = board.legalMoveCount,
+        .provenValue = std::nullopt,
     });
 
     board.forEachLegal([&](uint16_t moveId) {
@@ -112,11 +142,89 @@ uint32_t MCTS<SimulationCount>::addNode(
 }
 
 template<int SimulationCount>
-uint32_t MCTS<SimulationCount>::addTerminalNode(float value)
+uint32_t MCTS<SimulationCount>::addSolvedNode(float value)
 {
     const uint32_t index = static_cast<uint32_t>(m_nodes.size());
     m_nodes.push_back(value);
     return index;
+}
+
+template<int SimulationCount>
+std::optional<float> MCTS<SimulationCount>::provenValue(uint32_t nodeIndex) const
+{
+    if (const float* value = std::get_if<float>(&m_nodes[nodeIndex]))
+        return *value;
+    return std::get<Node>(m_nodes[nodeIndex]).provenValue;
+}
+
+template<int SimulationCount>
+void MCTS<SimulationCount>::updateProvenValue(uint32_t nodeIndex)
+{
+    Node& node = std::get<Node>(m_nodes[nodeIndex]);
+    bool allProven = true;
+    float bestValue = -1.0f;
+    for (uint32_t edgeIndex = node.firstEdgeIndex;
+         edgeIndex < node.firstEdgeIndex + node.edgeCount; ++edgeIndex)
+    {
+        const Edge& edge = m_edges[edgeIndex];
+        const std::optional<float> childValue = edge.node.has_value()
+            ? provenValue(*edge.node) : std::nullopt;
+        if (!childValue.has_value())
+        {
+            allProven = false;
+            continue;
+        }
+        bestValue = std::max(bestValue, -*childValue);
+        if (bestValue == 1.0f)
+        {
+            node.provenValue = bestValue;
+            return;
+        }
+    }
+    // One winning move proves a win. A draw or loss needs every move solved.
+    if (allProven)
+        node.provenValue = bestValue;
+}
+
+template<int SimulationCount>
+void MCTS<SimulationCount>::checkRootTactics()
+{
+    const Node& root = std::get<Node>(m_nodes[0]);
+    std::array<uint64_t, moveLimit + 1> history;
+    std::ranges::copy_n(m_gameHistory.begin(), m_gameHistorySize, history.begin());
+    const std::span<const uint64_t> rootHistory{history.data(), m_gameHistorySize};
+
+    for (uint32_t edgeIndex = root.firstEdgeIndex;
+         edgeIndex < root.firstEdgeIndex + root.edgeCount; ++edgeIndex)
+    {
+        Edge& edge = m_edges[edgeIndex];
+        const MoveResult result = applyMove(root.board, Move::fromId(edge.moveId), rootHistory);
+        if (const auto* outcome = std::get_if<Outcome>(&result))
+        {
+            const float childValue = outcomeFor(*outcome, !root.board.whiteToMove);
+            edge.node = addSolvedNode(childValue);
+            if (childValue == -1.0f)
+                break;
+            continue;
+        }
+
+        const Board& child = std::get<Board>(result);
+        assert(m_gameHistorySize < history.size());
+        history[m_gameHistorySize] = child.positionHash;
+        child.forEachLegal([&](uint16_t replyId) {
+            if (edge.node.has_value())
+                return;
+            const MoveResult reply = applyMove(child, Move::fromId(replyId),
+                std::span<const uint64_t>{history.data(), m_gameHistorySize + 1});
+            if (const auto* outcome = std::get_if<Outcome>(&reply);
+                outcome != nullptr && outcomeFor(*outcome, child.whiteToMove) == 1.0f)
+            {
+                // The opponent can force a win immediately after this move.
+                edge.node = addSolvedNode(1.0f);
+            }
+        });
+    }
+    updateProvenValue(0);
 }
 
 template<int SimulationCount>
@@ -126,10 +234,39 @@ uint32_t MCTS<SimulationCount>::selectEdgeToExplore(uint32_t nodeIndex) const
     const Node& node = std::get<Node>(m_nodes[nodeIndex]);
     const float exploration = explorationConstant * std::sqrt(static_cast<float>(node.visits));
 
+    const auto provenLoss = [&](const Edge& edge) {
+        return m_proveOutcomes && edge.node.has_value() && provenValue(*edge.node) == 1.0f;
+    };
+    float availablePrior = 0.0f;
+    uint32_t availableMoves = 0;
+    if (m_proveOutcomes)
+    {
+        for (uint32_t edgeIndex = node.firstEdgeIndex;
+             edgeIndex < node.firstEdgeIndex + node.edgeCount; ++edgeIndex)
+        {
+            const Edge& edge = m_edges[edgeIndex];
+            if (!provenLoss(edge))
+            {
+                availablePrior += edge.prior;
+                ++availableMoves;
+            }
+        }
+        assert(availableMoves > 0);
+    }
+
     const auto score = [&](uint32_t edgeIndex) {
         const Edge& edge = m_edges[edgeIndex];
-        const float meanValue = edge.visits == 0 ? 0.0f : edge.valueSum / edge.visits;
-        return meanValue + exploration * edge.prior / static_cast<float>(1 + edge.visits);
+        if (provenLoss(edge))
+            return -std::numeric_limits<float>::infinity();
+        // Filtering a high-prior losing move must not suppress exploration of
+        // the remaining moves, even if their probabilities underflowed to zero.
+        const float prior = !m_proveOutcomes ? edge.prior
+            : availablePrior > 0.0f ? edge.prior / availablePrior : 1.0f / availableMoves;
+        const std::optional<float> childValue = m_proveOutcomes && edge.node.has_value()
+            ? provenValue(*edge.node) : std::nullopt;
+        const float meanValue = childValue.has_value() ? -*childValue
+            : edge.visits == 0 ? 0.0f : edge.valueSum / edge.visits;
+        return meanValue + exploration * prior / static_cast<float>(1 + edge.visits);
     };
 
     return *std::ranges::max_element(
@@ -153,6 +290,12 @@ bool MCTS<SimulationCount>::descend()
             return false;
         }
 
+        if (m_proveOutcomes && provenValue(nodeIndex).has_value())
+        {
+            backpropagate(*provenValue(nodeIndex));
+            return false;
+        }
+
         Node& node = std::get<Node>(m_nodes[nodeIndex]);
         ++node.visits;
 
@@ -169,7 +312,7 @@ bool MCTS<SimulationCount>::descend()
             if (const auto* outcome = std::get_if<Outcome>(&result))
             {
                 const float value = outcomeFor(*outcome, !node.board.whiteToMove);
-                edge.node = addTerminalNode(value);
+                edge.node = addSolvedNode(value);
                 backpropagate(value);
                 return false;
             }
@@ -196,6 +339,14 @@ void MCTS<SimulationCount>::backpropagate(float value)
         Edge& edge = m_edges[m_edgeTrail[trailIndex]];
         edge.valueSum += value;
         ++edge.visits;
+        if (m_proveOutcomes)
+        {
+            const uint32_t parentIndex = trailIndex == 0
+                ? 0 : *m_edges[m_edgeTrail[trailIndex - 1]].node;
+            updateProvenValue(parentIndex);
+            if (const std::optional<float> proof = provenValue(parentIndex))
+                value = *proof;
+        }
     }
 }
 

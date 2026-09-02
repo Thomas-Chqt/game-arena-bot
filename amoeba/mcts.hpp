@@ -20,11 +20,15 @@ class MCTS
     static_assert(SimulationCount > 0);
 
 public:
-    MCTS(const Board& root, std::span<const uint64_t> history);
+    // Playing can prove outcomes and check every root move for an immediate
+    // winning reply. Training keeps the ordinary visit-based search by default.
+    MCTS(const Board& root, std::span<const uint64_t> history, bool proveOutcomes = false);
 
     const Board* pendingLeaf();
     void absorb(std::span<const float, moveIdCount> policy, float value);
     VisitCounts visits() const;
+    // Proven wins outrank visits; proven losses are used only if unavoidable.
+    uint16_t bestMove() const;
 
 private:
     struct Edge
@@ -42,10 +46,15 @@ private:
         uint32_t visits;
         uint32_t firstEdgeIndex;
         uint32_t edgeCount;
+        // Exact result for the side to move, established from solved children.
+        std::optional<float> provenValue;
     };
 
     uint32_t addNode(const Board&, std::span<const float, moveIdCount> policy);
-    uint32_t addTerminalNode(float value);
+    uint32_t addSolvedNode(float value);
+    std::optional<float> provenValue(uint32_t node) const;
+    void updateProvenValue(uint32_t node);
+    void checkRootTactics();
     uint32_t selectEdgeToExplore(uint32_t node) const;
     bool descend();
     void backpropagate(float value);
@@ -59,6 +68,7 @@ private:
     std::array<uint32_t, moveLimit> m_edgeTrail;
     size_t m_edgeTrailSize = 0;
 
+    bool m_proveOutcomes;
     std::optional<Board> m_pendingLeaf;
 };
 

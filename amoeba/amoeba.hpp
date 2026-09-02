@@ -311,8 +311,8 @@ struct Board
 
     constexpr Board() = default;
 
-    // if `*legal_moves` is null, it will be generated internally
-    // `my_side` is ignored
+    // Uses the server's legal moves when my_side == current_turn; otherwise
+    // generates moves for current_turn. A null legal_moves also generates them.
     Board(const arena_game_state_t&);
 
     static Board startingBoard()
