@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y \
+  build-essential \
+  clang-18 \
+  cmake \
+  curl \
+  git \
+  libblas-dev \
+  liblapack-dev \
+  liblapacke-dev \
+  pkg-config \
+  wget
+
+# The selected DLAMI supplies NVIDIA's driver. Install the CUDA compiler and
+# cuDNN headers needed when building MLX with -DMLX_BUILD_CUDA=ON.
+wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/cuda-keyring.deb
+dpkg -i /tmp/cuda-keyring.deb
+apt-get update
+apt-get install -y cuda-toolkit-12-9 libcudnn9-dev-cuda-12
+
+update-alternatives --install /usr/bin/c++ c++ /usr/bin/clang++-18 100
+update-alternatives --install /usr/bin/cc cc /usr/bin/clang-18 100
