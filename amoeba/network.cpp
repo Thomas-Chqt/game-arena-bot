@@ -239,6 +239,8 @@ std::unique_ptr<Network> createNetwork(std::string_view identifier, uint64_t see
 {
     if (identifier == TransformerNetwork::identifier)
         return std::make_unique<TransformerNetwork>(seed);
+    if (identifier == TransformerNetworkXL::identifier)
+        return std::make_unique<TransformerNetworkXL>(seed);
     if (identifier == HexRayLiteNetwork::identifier)
         return std::make_unique<HexRayLiteNetwork>(seed);
     throw std::runtime_error(std::format("unknown network identifier {}", identifier));
@@ -262,6 +264,8 @@ std::unique_ptr<Network> loadNetwork(
 
     if (identifier == TransformerNetwork::identifier)
         return std::make_unique<TransformerNetwork>(checkpoint);
+    if (identifier == TransformerNetworkXL::identifier)
+        return std::make_unique<TransformerNetworkXL>(checkpoint);
     if (identifier == HexRayLiteNetwork::identifier)
         return std::make_unique<HexRayLiteNetwork>(checkpoint);
     throw std::runtime_error(std::format(

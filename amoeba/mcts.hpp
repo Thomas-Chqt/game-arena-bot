@@ -76,6 +76,7 @@ uint16_t bestMove(const VisitCounts&);
 float outcomeFor(Outcome, bool whiteToMove);
 
 extern template class MCTS<256>;
+extern template class MCTS<512>;
 extern template class MCTS<1000>;
 extern template class MCTS<1500>;
 
