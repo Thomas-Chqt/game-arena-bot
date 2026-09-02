@@ -19,6 +19,8 @@ namespace
 constexpr int winScore = 1'000'000;
 constexpr int infinity = 2 * winScore;
 constexpr int maximumDepth = 32;
+constexpr int maximumTacticalExtensions = 2;
+constexpr uint16_t lowMobilityLimit = 2;
 
 enum class Bound : uint8_t { exact, lower, upper };
 
@@ -37,6 +39,22 @@ constexpr uint64_t mix(uint64_t value)
     value ^= value >> 27;
     value *= 0x94D049BB133111EBULL;
     return value ^ (value >> 31);
+}
+
+// Repetition depends on how often previous positions occurred.  XOR alone
+// would erase an even number of identical hashes, so pair it with a sum.
+struct HistorySignature
+{
+    uint64_t xorValue{};
+    uint64_t sumValue{};
+};
+
+constexpr HistorySignature appendHistory(HistorySignature signature, uint64_t positionHash)
+{
+    const uint64_t contribution = mix(positionHash + 0x9E3779B97F4A7C15ULL);
+    signature.xorValue ^= contribution;
+    signature.sumValue += contribution;
+    return signature;
 }
 
 bool isWhite(Piece piece)
@@ -104,26 +122,40 @@ public:
         std::copy(history.begin(), history.end(), m_history.begin());
         m_historySize = history.size();
         for (uint64_t hash : history)
-            m_historySignature ^= mix(hash + 0x9E3779B97F4A7C15ULL);
+            m_historySignature = appendHistory(m_historySignature, hash);
         m_table.reserve(1 << 20);
         root.forEachLegal([&](uint16_t moveId) { m_fallbackMove = moveId; });
     }
 
     SearchResult run(const Board& root)
     {
-        SearchResult result{.moveId = m_fallbackMove, .completedDepth = 0, .nodes = 0, .score = 0};
+        SearchResult result{.moveId = m_fallbackMove, .completedDepth = 0, .nodes = 0,
+                            .score = 0, .transpositionHits = 0, .betaCutoffs = 0,
+                            .tacticalExtensions = 0};
         for (int depth = 1; depth <= maximumDepth; ++depth)
         {
             m_stopped = false;
+            if (deadlineReached())
+                break;
             const RootResult iteration = searchRoot(root, depth);
             if (m_stopped)
                 break;
             result = {.moveId = iteration.moveId, .completedDepth = depth,
-                      .nodes = m_nodes, .score = iteration.score};
+                      .nodes = m_nodes, .score = iteration.score,
+                      .transpositionHits = m_transpositionHits,
+                      .betaCutoffs = m_betaCutoffs,
+                      .tacticalExtensions = m_tacticalExtensions};
             m_previousBestMove = iteration.moveId;
             if (std::abs(iteration.score) >= winScore - maximumDepth)
                 break;
         }
+        // The move/score must come from the last complete iteration, but the
+        // node and pruning counters should include useful work in the final
+        // interrupted iteration as well.
+        result.nodes = m_nodes;
+        result.transpositionHits = m_transpositionHits;
+        result.betaCutoffs = m_betaCutoffs;
+        result.tacticalExtensions = m_tacticalExtensions;
         return result;
     }
 
@@ -138,23 +170,92 @@ private:
         return m_stopped;
     }
 
-    uint64_t key(const Board& board, uint64_t historySignature) const
+    bool deadlineReached()
     {
-        return board.positionHash ^ mix(historySignature)
-            ^ mix((static_cast<uint64_t>(board.plyCount) << 16) | board.stalenessCount);
+        if (std::chrono::steady_clock::now() < m_deadline)
+            return false;
+        m_stopped = true;
+        return true;
     }
 
-    std::vector<uint16_t> moves(const Board& board, std::optional<uint16_t> preferred) const
+    uint64_t key(const Board& board, HistorySignature historySignature, int extensionsRemaining) const
     {
-        std::vector<uint16_t> result;
-        result.reserve(board.legalMoveCount);
-        board.forEachLegal([&](uint16_t moveId) { result.push_back(moveId); });
-        if (preferred.has_value())
+        return board.positionHash ^ mix(historySignature.xorValue) ^ mix(historySignature.sumValue)
+            ^ mix((static_cast<uint64_t>(board.plyCount) << 16) | board.stalenessCount)
+            ^ mix(static_cast<uint64_t>(extensionsRemaining));
+    }
+
+    struct OrderedMove
+    {
+        uint16_t moveId;
+        int order;
+        std::optional<MoveResult> result;
+    };
+
+    int staticMoveOrder(const Board& board, Move move) const
+    {
+        const uint8_t height = board.hexes[move.sourceCoord].height();
+        const uint8_t destination = destinationHex(
+            move.sourceCoord, directions[move.direction], height).value();
+        const Piece destinationTop = board.hexes[destination].topPiece();
+        int order = 0;
+        const uint8_t opponentKernel = board.whiteToMove ? board.blackKernelIndex : board.whiteKernelIndex;
+        if (destination == opponentKernel)
+            order += 900'000;
+        if (destinationTop != Piece::empty && isWhite(destinationTop) != board.whiteToMove)
+            order += 600;
+
+        if (move.splitsStack)
         {
-            const auto found = std::find(result.begin(), result.end(), *preferred);
-            if (found != result.end())
-                std::iter_swap(result.begin(), found);
+            bool pure = true;
+            for (uint8_t depth = 0; depth < height; ++depth)
+                pure &= isWhite(board.hexes[move.sourceCoord].pieceAt(depth)) == board.whiteToMove;
+            if (pure)
+                order += 80;
         }
+        return order;
+    }
+
+    // Exact reply-count ordering is valuable at the top of the tree.  Further
+    // down it costs a full move generation for branches alpha-beta may prune,
+    // so use only the cheap structural ordering there.
+    const std::vector<OrderedMove>& orderedMoves(const Board& board, std::optional<uint16_t> preferred,
+                                                 int ply, bool exactTacticalOrdering)
+    {
+        assert(ply >= 0 && static_cast<size_t>(ply) < m_moveBuffers.size());
+        std::vector<OrderedMove>& result = m_moveBuffers[ply];
+        result.clear();
+        if (result.capacity() < board.legalMoveCount)
+            result.reserve(board.legalMoveCount);
+        board.forEachLegal([&](uint16_t moveId) {
+            // Ordering evaluates every candidate, so it needs its own deadline
+            // check rather than waiting for negamax's periodic node check.
+            if (m_stopped || deadlineReached())
+                return;
+            const Move move = Move::fromId(moveId);
+            int order = staticMoveOrder(board, move);
+            std::optional<MoveResult> moveResult;
+            if (exactTacticalOrdering)
+            {
+                moveResult.emplace(applyMove(
+                    board, move, std::span{m_history.data(), m_historySize}));
+                if (const auto* outcome = std::get_if<Outcome>(&*moveResult))
+                    order += outcomeScore(*outcome, board.whiteToMove, 0) > 0 ? 1'000'000 : -1'000'000;
+                else
+                {
+                    const Board& child = std::get<Board>(*moveResult);
+                    // The child belongs to the opponent.  Fewer replies and a
+                    // large swing in the current side's static score are tactics.
+                    order += static_cast<int>(board.legalMoveCount - child.legalMoveCount) * 12;
+                    order += (16 - std::min(16, static_cast<int>(child.legalMoveCount))) * 48;
+                    order += -evaluate(child) / 16;
+                }
+            }
+            if (preferred == moveId)
+                order += 2'000'000;
+            result.push_back({moveId, order, std::move(moveResult)});
+        });
+        std::ranges::stable_sort(result, std::greater{}, &OrderedMove::order);
         return result;
     }
 
@@ -164,20 +265,23 @@ private:
         int beta = infinity;
         uint16_t bestMove = m_previousBestMove.value_or(m_fallbackMove);
         int bestScore = -infinity;
-        for (uint16_t moveId : moves(root, m_previousBestMove))
+        const std::vector<OrderedMove>& candidates = orderedMoves(root, m_previousBestMove, 0, true);
+        if (m_stopped)
+            return {bestMove, bestScore};
+        for (const OrderedMove& candidate : candidates)
         {
-            const MoveResult moveResult = applyMove(root, Move::fromId(moveId),
-                                                     std::span{m_history.data(), m_historySize});
             int score;
-            if (const auto* outcome = std::get_if<Outcome>(&moveResult))
+            assert(candidate.result.has_value());
+            if (const auto* outcome = std::get_if<Outcome>(&*candidate.result))
                 score = outcomeScore(*outcome, root.whiteToMove, 0);
             else
             {
-                const Board& child = std::get<Board>(moveResult);
+                const Board& child = std::get<Board>(*candidate.result);
                 assert(m_historySize < m_history.size());
                 m_history[m_historySize++] = child.positionHash;
-                const uint64_t childSignature = m_historySignature ^ mix(child.positionHash + 0x9E3779B97F4A7C15ULL);
-                score = -negamax(child, depth - 1, -beta, -alpha, 1, childSignature);
+                const HistorySignature childSignature = appendHistory(m_historySignature, child.positionHash);
+                score = -negamax(child, depth - 1, -beta, -alpha, 1, childSignature,
+                                 maximumTacticalExtensions);
                 --m_historySize;
             }
             if (m_stopped)
@@ -185,7 +289,7 @@ private:
             if (score > bestScore)
             {
                 bestScore = score;
-                bestMove = moveId;
+                bestMove = candidate.moveId;
             }
             alpha = std::max(alpha, score);
         }
@@ -193,18 +297,25 @@ private:
     }
 
     int negamax(const Board& board, int depth, int alpha, int beta, int ply,
-                uint64_t historySignature)
+                HistorySignature historySignature, int extensionsRemaining)
     {
         if (outOfTime())
             return 0;
         if (depth == 0)
-            return evaluate(board);
+        {
+            if (extensionsRemaining == 0 || board.legalMoveCount > lowMobilityLimit)
+                return evaluate(board);
+            depth = 1;
+            --extensionsRemaining;
+            ++m_tacticalExtensions;
+        }
 
-        const uint64_t positionKey = key(board, historySignature);
+        const uint64_t positionKey = key(board, historySignature, extensionsRemaining);
         std::optional<uint16_t> preferred;
         const auto found = m_table.find(positionKey);
         if (found != m_table.end())
         {
+            ++m_transpositionHits;
             preferred = found->second.bestMove;
             if (found->second.depth >= depth)
             {
@@ -215,7 +326,10 @@ private:
                 else
                     beta = std::min(beta, found->second.score);
                 if (alpha >= beta)
+                {
+                    ++m_betaCutoffs;
                     return found->second.score;
+                }
             }
         }
 
@@ -223,20 +337,31 @@ private:
         const int originalBeta = beta;
         int bestScore = -infinity;
         uint16_t bestMove = 0;
-        for (uint16_t moveId : moves(board, preferred))
+        const std::vector<OrderedMove>& candidates = orderedMoves(
+            board, preferred, ply, ply <= 1);
+        if (m_stopped)
+            return 0;
+        for (const OrderedMove& candidate : candidates)
         {
-            const MoveResult moveResult = applyMove(board, Move::fromId(moveId),
-                                                     std::span{m_history.data(), m_historySize});
+            MoveResult searchedResult;
+            const MoveResult* moveResult = candidate.result ? &*candidate.result : nullptr;
+            if (moveResult == nullptr)
+            {
+                searchedResult = applyMove(board, Move::fromId(candidate.moveId),
+                    std::span{m_history.data(), m_historySize});
+                moveResult = &searchedResult;
+            }
             int score;
-            if (const auto* outcome = std::get_if<Outcome>(&moveResult))
+            if (const auto* outcome = std::get_if<Outcome>(moveResult))
                 score = outcomeScore(*outcome, board.whiteToMove, ply);
             else
             {
-                const Board& child = std::get<Board>(moveResult);
+                const Board& child = std::get<Board>(*moveResult);
                 assert(m_historySize < m_history.size());
                 m_history[m_historySize++] = child.positionHash;
-                const uint64_t childSignature = historySignature ^ mix(child.positionHash + 0x9E3779B97F4A7C15ULL);
-                score = -negamax(child, depth - 1, -beta, -alpha, ply + 1, childSignature);
+                const HistorySignature childSignature = appendHistory(historySignature, child.positionHash);
+                score = -negamax(child, depth - 1, -beta, -alpha, ply + 1, childSignature,
+                                 extensionsRemaining);
                 --m_historySize;
             }
             if (m_stopped)
@@ -244,11 +369,14 @@ private:
             if (score > bestScore)
             {
                 bestScore = score;
-                bestMove = moveId;
+                bestMove = candidate.moveId;
             }
             alpha = std::max(alpha, score);
             if (alpha >= beta)
+            {
+                ++m_betaCutoffs;
                 break;
+            }
         }
 
         const Bound bound = bestScore <= originalAlpha ? Bound::upper
@@ -259,12 +387,18 @@ private:
 
     std::array<uint64_t, moveLimit + 1> m_history{};
     size_t m_historySize{};
-    uint64_t m_historySignature{};
+    HistorySignature m_historySignature{};
     std::chrono::steady_clock::time_point m_deadline;
     std::unordered_map<uint64_t, TranspositionEntry> m_table;
+    // A recursive child only needs a distinct list from its ancestors.  Keeping
+    // these buffers by ply lets iterative deepening reuse their allocations.
+    std::array<std::vector<OrderedMove>, maximumDepth + maximumTacticalExtensions + 1> m_moveBuffers;
     std::optional<uint16_t> m_previousBestMove;
     uint16_t m_fallbackMove{};
     uint64_t m_nodes{};
+    uint64_t m_transpositionHits{};
+    uint64_t m_betaCutoffs{};
+    uint64_t m_tacticalExtensions{};
     bool m_stopped{};
 };
 

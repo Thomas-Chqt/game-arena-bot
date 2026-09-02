@@ -156,12 +156,13 @@ void onDisconnect(const char* reason, void*)
 int runBot(bool continuous)
 {
     const char* botId = std::getenv("BOT1_ID");
+    if (botId == nullptr)
+        botId = "a35cc066-4a4f-439d-aec5-24d87551c264";
+
     const char* apiKey = std::getenv("BOT1_KEY");
-    if (botId == nullptr || apiKey == nullptr)
-    {
-        std::println(stderr, "set BOT1_ID and BOT1_KEY");
-        return EXIT_FAILURE;
-    }
+    if (apiKey == nullptr)
+        apiKey = "U152hYvdPuOkEOEs15lgVV4s0Tt3WZkxhwzCHVJPTUsODHFTpLLQl0jpDRY-msFk";
+
     BotContext context;
     const arena_bot_config_t config{
         .bot_id = botId, .api_key = apiKey,

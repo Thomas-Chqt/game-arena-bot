@@ -15,6 +15,9 @@ struct SearchResult
     int completedDepth;
     uint64_t nodes;
     int score;
+    uint64_t transpositionHits;
+    uint64_t betaCutoffs;
+    uint64_t tacticalExtensions;
 };
 
 // Iterative-deepening negamax.  The caller supplies the complete position
