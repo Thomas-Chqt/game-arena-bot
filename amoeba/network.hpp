@@ -29,6 +29,8 @@
 namespace amoeba_bot
 {
 
+using CheckpointMetadata = std::unordered_map<std::string, std::string>;
+
 std::string childName(std::string_view parent, std::string_view child);
 std::string indexedName(std::string_view parent, size_t index);
 
@@ -96,6 +98,10 @@ public:
     virtual ~Network() = default;
 
     std::string_view name() const { return m_name; }
+    const CheckpointMetadata& checkpointMetadata() const
+    {
+        return m_checkpointMetadata;
+    }
 
     // MCTS-facing inference. This fixed Amoeba adapter batches Board objects,
     // masks illegal moves, and returns probabilities indexed by absolute move id.
@@ -195,7 +201,8 @@ public:
         std::println("Total parameters: {}", parameterCount());
     }
 
-    void save(const std::filesystem::path& checkpoint) const;
+    void save(const std::filesystem::path& checkpoint,
+              const CheckpointMetadata& additionalMetadata = {}) const;
 
 protected:
     // The base is constructed before the derived module members, so setting the
@@ -214,6 +221,7 @@ protected:
         : m_name(other.m_name)
         , m_layout(other.m_layout)
         , m_parameters(other.m_parameters)
+        , m_checkpointMetadata(other.m_checkpointMetadata)
     {
     }
 
@@ -224,6 +232,7 @@ protected:
             m_name = other.m_name;
             m_layout = other.m_layout;
             m_parameters = other.m_parameters;
+            m_checkpointMetadata = other.m_checkpointMetadata;
             m_compiledForward = {};
         }
         return *this;
@@ -267,6 +276,7 @@ protected:
             loaded.push_back(found->second);
         }
         m_parameters = std::move(loaded);
+        m_checkpointMetadata = std::move(metadata);
         mlx::core::eval(m_parameters);
     }
 
@@ -281,11 +291,14 @@ private:
         const TrainingBatch& batch) const;
     void createCompiledForward() const;
 
-    // Metadata that belongs together is one structure. Values remain a flat
-    // vector because MLX transformations exchange parameters in that format.
+    // Each parameter's name and shape stay together in the layout. Values
+    // remain a flat vector because MLX transformations exchange them that way.
     const char* m_name;
     std::vector<ParameterDefinition> m_layout;
     std::vector<mlx::core::array> m_parameters;
+    // String metadata is carried through every checkpoint save. Training uses
+    // it for durable qualification facts that do not belong in weight tensors.
+    CheckpointMetadata m_checkpointMetadata;
     mutable CompiledForward m_compiledForward;
 };
 
