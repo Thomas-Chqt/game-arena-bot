@@ -70,18 +70,18 @@ constexpr size_t trainingBatchSize = 256;
 // candidate.
 constexpr uint64_t heldOutGameFraction = 8;
 constexpr int maximumTrainingEpochs = 8;
-constexpr int validationPointsPerEpoch = 4;
+constexpr int validationPointsPerEpoch = 8;
 constexpr int earlyStoppingPatience = 2;
 constexpr float validationImprovement = 1e-4f;
-// Each candidate fine-tunes an already trained champion. AdamW at 1e-4 makes
-// that update deliberate; the gate, not a large optimizer jump, decides
-// whether it was useful.
-constexpr float learningRate = 1e-4f;
+// Each candidate fine-tunes an already trained champion. Use deliberately
+// small AdamW updates so held-out validation can select the point before the
+// candidate begins fitting this generation's self-play too closely.
+constexpr float learningRate = 5e-5f;
 constexpr float weightDecay = 1e-2f;
 constexpr double gateConfidenceZ = 1.645; // one-sided 95% lower bound
 // Bump this when a fixed baseline, its game count, or its evaluation method
 // changes so an older checkpoint is qualified again under the new gate.
-constexpr std::string_view baselineGateVersion = "1";
+constexpr std::string_view baselineGateVersion = "2";
 constexpr std::string_view baselineMetadataPrefix = "training.baseline_gate.";
 constexpr std::string_view retainedStepMetadataName = "training.retained_step";
 
@@ -530,8 +530,16 @@ template<int SimulationCount>
 void finish(ActiveGame<SimulationCount>& game)
 {
     assert(game.outcome.has_value());
+    const uint64_t completedRounds = completedGameRounds(game.board);
     for (TrainingSample& sample : game.samples)
-        sample.outcome = outcomeFor(*game.outcome, sample.board.whiteToMove);
+    {
+        assert(completedRounds > sample.board.plyCount);
+        const uint64_t remainingMoves = completedRounds - sample.board.plyCount;
+        const float timeDiscount = std::pow(
+            terminalValueDiscountPerMove, static_cast<float>(remainingMoves));
+        sample.outcome = timeDiscount
+            * outcomeFor(*game.outcome, sample.board.whiteToMove);
+    }
 }
 
 void addExplorationNoise(Evaluation& evaluation, const Board& board,
@@ -1481,9 +1489,11 @@ int runTraining(const std::filesystem::path& weights,
                    "skipping random and rollout-mcts",
                    baselineGateVersion);
         report("[train] generation method: {} self-play games, {}+{} lanes, "
-               "{} visits, AdamW lr {}, up to {} epochs, {} validations/epoch",
+               "{} visits, AdamW lr {}, terminal discount/move {}, up to {} epochs, "
+               "{} validations/epoch",
                selfPlayGameCount, selfPlayLaneSize, selfPlayLaneSize,
-               selfPlaySimulationCount, learningRate, maximumTrainingEpochs,
+               selfPlaySimulationCount, learningRate, terminalValueDiscountPerMove,
+               maximumTrainingEpochs,
                validationPointsPerEpoch);
 
         std::mt19937_64 randomEngine{runSeed};
