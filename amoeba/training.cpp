@@ -10,6 +10,7 @@
 #include <array>
 #include <cassert>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -27,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -49,7 +51,7 @@ constexpr int evaluationSimulationCount = 256;
 // the host advances MCTS for the other lane.
 constexpr int selfPlayLaneSize = 256;
 constexpr int selfPlayLaneCount = 2;
-constexpr int selfPlayGameCount = 1024;
+constexpr int selfPlayGameCount = 2048;
 static_assert(selfPlayGameCount % selfPlayLaneCount == 0);
 constexpr int selfPlayGamesPerLane = selfPlayGameCount / selfPlayLaneCount;
 // Two hundred fifty-six paired openings give 512 games. Promotion uses the
@@ -68,6 +70,7 @@ constexpr size_t trainingBatchSize = 256;
 // candidate.
 constexpr uint64_t heldOutGameFraction = 8;
 constexpr int maximumTrainingEpochs = 8;
+constexpr int validationPointsPerEpoch = 4;
 constexpr int earlyStoppingPatience = 2;
 constexpr float validationImprovement = 1e-4f;
 // Each candidate fine-tunes an already trained champion. AdamW at 1e-4 makes
@@ -76,13 +79,61 @@ constexpr float validationImprovement = 1e-4f;
 constexpr float learningRate = 1e-4f;
 constexpr float weightDecay = 1e-2f;
 constexpr double gateConfidenceZ = 1.645; // one-sided 95% lower bound
+// Bump this when a fixed baseline, its game count, or its evaluation method
+// changes so an older checkpoint is qualified again under the new gate.
+constexpr std::string_view baselineGateVersion = "1";
+constexpr std::string_view baselineMetadataPrefix = "training.baseline_gate.";
+constexpr std::string_view retainedStepMetadataName = "training.retained_step";
 
 volatile sig_atomic_t stopRequested = 0;
+
+struct MatchScore
+{
+    int wins = 0;
+    int draws = 0;
+    int losses = 0;
+    uint64_t totalPlies = 0;
+    std::vector<double> observations;
+
+    void add(Outcome outcome, bool candidateWhite, uint64_t plyCount)
+    {
+        if (outcome == Outcome::draw)
+        {
+            ++draws;
+            observations.push_back(0.5);
+        }
+        else if ((outcome == Outcome::whiteWins) == candidateWhite)
+        {
+            ++wins;
+            observations.push_back(1.0);
+        }
+        else
+        {
+            ++losses;
+            observations.push_back(0.0);
+        }
+        totalPlies += plyCount;
+    }
+    int games() const { return wins + draws + losses; }
+    double score() const
+    {
+        assert(games() > 0);
+        return (wins + 0.5 * draws) / games();
+    }
+    double averagePlies() const
+    {
+        assert(games() > 0);
+        return static_cast<double>(totalPlies) / games();
+    }
+    double lowerConfidenceBound() const;
+};
 
 struct SelfPlayStatus
 {
     uint64_t positions = 0;
     uint64_t totalPositions = 0;
+    uint64_t games = 0;
+    uint64_t totalPlies = 0;
     double positionsPerSecond = 0.0;
     std::chrono::steady_clock::time_point startedAt =
         std::chrono::steady_clock::now();
@@ -98,10 +149,21 @@ struct GateStatus
     int completedGames = 0;
     int totalGames = 0;
     double score = 0.0;
+    int wins = 0;
+    int draws = 0;
+    int losses = 0;
+    uint64_t totalPlies = 0;
     bool visible = false;
 };
 
 GateStatus gateStatus;
+
+uint64_t completedGameRounds(const Board& board)
+{
+    // applyMove returns an Outcome instead of the terminal Board, so the board
+    // retained by a finished runner is still one move behind the game result.
+    return static_cast<uint64_t>(board.plyCount) + 1;
+}
 
 uint64_t makeRunSeed()
 {
@@ -133,10 +195,13 @@ void drawGateStatus()
                    gateStatus.totalGames);
     else
         std::print("\r\x1b[2K[gate] generation {} vs {}: {}/{} games "
-                   "({:.1f}% win rate)",
+                   "({:.1f}% win rate, {}W/{}D/{}L, {:.1f} rounds/game)",
                    gateStatus.generation, gateStatus.opponent,
                    gateStatus.completedGames, gateStatus.totalGames,
-                   100.0 * gateStatus.score);
+                   100.0 * gateStatus.score, gateStatus.wins,
+                   gateStatus.draws, gateStatus.losses,
+                   static_cast<double>(gateStatus.totalPlies)
+                       / gateStatus.completedGames);
     std::fflush(stdout);
 }
 
@@ -151,19 +216,26 @@ void startGateStatus(uint64_t generation, std::string_view opponent,
         .completedGames = 0,
         .totalGames = totalGames,
         .score = 0.0,
+        .wins = 0,
+        .draws = 0,
+        .losses = 0,
+        .totalPlies = 0,
         .visible = true,
     };
     drawGateStatus();
 }
 
-void updateGateStatus(int completedGames, double score)
+void updateGateStatus(const MatchScore& score)
 {
     assert(gateStatus.visible);
-    assert(completedGames > gateStatus.completedGames);
-    assert(completedGames <= gateStatus.totalGames);
-    assert(score >= 0.0 && score <= 1.0);
-    gateStatus.completedGames = completedGames;
-    gateStatus.score = score;
+    assert(score.games() > gateStatus.completedGames);
+    assert(score.games() <= gateStatus.totalGames);
+    gateStatus.completedGames = score.games();
+    gateStatus.score = score.score();
+    gateStatus.wins = score.wins;
+    gateStatus.draws = score.draws;
+    gateStatus.losses = score.losses;
+    gateStatus.totalPlies = score.totalPlies;
     drawGateStatus();
 }
 
@@ -179,8 +251,11 @@ void drawSelfPlayStatus()
 {
     if (!selfPlayStatus.visible || !isatty(STDOUT_FILENO))
         return;
-    std::print("\r\x1b[2K[selfplay] generated {} positions, {:.1f} positions/s average",
-               selfPlayStatus.positions, selfPlayStatus.positionsPerSecond);
+    std::print("\r\x1b[2K[selfplay] generated {} positions from {} games, "
+               "{:.1f} rounds/game, {:.1f} positions/s average",
+               selfPlayStatus.totalPositions, selfPlayStatus.games,
+               static_cast<double>(selfPlayStatus.totalPlies) / selfPlayStatus.games,
+               selfPlayStatus.positionsPerSecond);
     std::fflush(stdout);
 }
 
@@ -195,10 +270,14 @@ void report(std::format_string<Args...> format, Args&&... args)
         selfPlayStatus.positions = 0;
 }
 
-void reportSelfPlayStatus(uint64_t generatedPositions)
+void reportSelfPlayStatus(uint64_t generatedPositions, uint64_t completedGames,
+                          uint64_t completedPlies)
 {
+    assert(completedGames > 0);
     selfPlayStatus.positions += generatedPositions;
     selfPlayStatus.totalPositions += generatedPositions;
+    selfPlayStatus.games += completedGames;
+    selfPlayStatus.totalPlies += completedPlies;
     const double elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - selfPlayStatus.startedAt).count();
     selfPlayStatus.positionsPerSecond = selfPlayStatus.totalPositions / elapsed;
@@ -207,8 +286,12 @@ void reportSelfPlayStatus(uint64_t generatedPositions)
         drawSelfPlayStatus();
     else
     {
-        std::println("[selfplay] generated {} positions, {:.1f} positions/s average",
-                     selfPlayStatus.positions, selfPlayStatus.positionsPerSecond);
+        std::println("[selfplay] generated {} positions from {} games, "
+                     "{:.1f} rounds/game, {:.1f} positions/s average",
+                     selfPlayStatus.totalPositions, selfPlayStatus.games,
+                     static_cast<double>(selfPlayStatus.totalPlies)
+                         / selfPlayStatus.games,
+                     selfPlayStatus.positionsPerSecond);
         std::fflush(stdout);
     }
 }
@@ -242,6 +325,20 @@ struct TrainingSample
     VisitCounts visits;
     float outcome;
     uint64_t gameId;
+};
+
+struct CompletedSelfPlay
+{
+    std::vector<TrainingSample> samples;
+    uint64_t games = 0;
+    uint64_t totalPlies = 0;
+    double positionsPerSecond = 0.0;
+
+    double averagePlies() const
+    {
+        assert(games > 0);
+        return static_cast<double>(totalPlies) / games;
+    }
 };
 
 // splitmix64's finalizer, so the split depends on the game id alone and is
@@ -503,9 +600,12 @@ public:
                 if (game.pendingLeaf == nullptr)
                 {
                     finish(game);
-                    const double score = gameFinished(game.gameId, *game.outcome);
+                    const MatchScore& score = gameFinished(
+                        game.gameId, *game.outcome,
+                        completedGameRounds(game.board));
                     ++completed;
-                    updateGateStatus(completed, score);
+                    assert(score.games() == completed);
+                    updateGateStatus(score);
                     if (started < GameCount)
                     {
                         initializeGame(game);
@@ -567,12 +667,12 @@ public:
             initializeNext(game);
     }
 
-    std::vector<TrainingSample> prepare()
+    CompletedSelfPlay prepare()
     {
         assert(!m_pending.has_value());
         assert(!m_prepared);
         m_pendingBoards.clear();
-        std::vector<TrainingSample> completed;
+        CompletedSelfPlay completed;
         for (ActiveGame<selfPlaySimulationCount>& game : m_games)
         {
             if (!game.active)
@@ -581,9 +681,12 @@ public:
             if (game.pendingLeaf == nullptr)
             {
                 finish(game);
-                completed.insert(completed.end(),
-                                 std::make_move_iterator(game.samples.begin()),
-                                 std::make_move_iterator(game.samples.end()));
+                completed.samples.insert(
+                    completed.samples.end(),
+                    std::make_move_iterator(game.samples.begin()),
+                    std::make_move_iterator(game.samples.end()));
+                ++completed.games;
+                completed.totalPlies += completedGameRounds(game.board);
                 ++m_completedGames;
                 if (m_startedGames < m_gameCount)
                 {
@@ -661,9 +764,9 @@ private:
     bool m_prepared = false;
 };
 
-std::vector<TrainingSample> generateSelfPlay(const Network& network,
-                                             uint64_t& nextGameId,
-                                             uint64_t runSeed)
+CompletedSelfPlay generateSelfPlay(const Network& network,
+                                   uint64_t& nextGameId,
+                                   uint64_t runSeed)
 {
     selfPlayStatus = SelfPlayStatus{};
     std::array<SelfPlayLane, 2> lanes{
@@ -673,15 +776,19 @@ std::vector<TrainingSample> generateSelfPlay(const Network& network,
     };
     nextGameId += selfPlayGameCount;
 
-    std::vector<TrainingSample> samples;
+    CompletedSelfPlay result;
     const auto prepare = [&](SelfPlayLane& lane) {
-        std::vector<TrainingSample> completed = lane.prepare();
-        if (!completed.empty())
+        CompletedSelfPlay completed = lane.prepare();
+        if (!completed.samples.empty())
         {
-            reportSelfPlayStatus(completed.size());
-            samples.insert(samples.end(),
-                           std::make_move_iterator(completed.begin()),
-                           std::make_move_iterator(completed.end()));
+            reportSelfPlayStatus(
+                completed.samples.size(), completed.games, completed.totalPlies);
+            result.games += completed.games;
+            result.totalPlies += completed.totalPlies;
+            result.samples.insert(
+                result.samples.end(),
+                std::make_move_iterator(completed.samples.begin()),
+                std::make_move_iterator(completed.samples.end()));
         }
     };
 
@@ -722,10 +829,14 @@ std::vector<TrainingSample> generateSelfPlay(const Network& network,
     }
 
     finishSelfPlayStatus();
+    result.positionsPerSecond = selfPlayStatus.positionsPerSecond;
     if (!stopRequested)
+    {
         assert(lanes[0].completedGames() + lanes[1].completedGames()
                == selfPlayGameCount);
-    return samples;
+        assert(result.games == selfPlayGameCount);
+    }
+    return result;
 }
 
 constexpr Coordinate transformCoordinate(Coordinate coordinate, uint8_t symmetry)
@@ -885,43 +996,14 @@ std::filesystem::path temporaryPath(const std::filesystem::path& path)
         / (path.filename().string() + ".tmp.safetensors");
 }
 
-void saveAtomically(const Network& network, const std::filesystem::path& path)
+void saveAtomically(const Network& network, const std::filesystem::path& path,
+                    const CheckpointMetadata& metadata = {})
 {
     const std::filesystem::path temporary = temporaryPath(path);
     std::filesystem::remove(temporary);
-    network.save(temporary);
+    network.save(temporary, metadata);
     std::filesystem::rename(temporary, path);
 }
-
-struct MatchScore
-{
-    int wins = 0;
-    int draws = 0;
-    int losses = 0;
-    std::vector<double> observations;
-
-    void add(Outcome outcome, bool candidateWhite)
-    {
-        if (outcome == Outcome::draw)
-        {
-            ++draws;
-            observations.push_back(0.5);
-        }
-        else if ((outcome == Outcome::whiteWins) == candidateWhite)
-        {
-            ++wins;
-            observations.push_back(1.0);
-        }
-        else
-        {
-            ++losses;
-            observations.push_back(0.0);
-        }
-    }
-    int games() const { return wins + draws + losses; }
-    double score() const { return (wins + 0.5 * draws) / games(); }
-    double lowerConfidenceBound() const;
-};
 
 double lowerConfidenceBound(std::span<const double> observations)
 {
@@ -948,10 +1030,11 @@ struct PairedMatchScore
     {
     }
 
-    void add(size_t gameIndex, Outcome outcome, bool candidateWhite)
+    void add(size_t gameIndex, Outcome outcome, bool candidateWhite,
+             uint64_t plyCount)
     {
         assert(gameIndex / 2 < pairScores.size());
-        games.add(outcome, candidateWhite);
+        games.add(outcome, candidateWhite, plyCount);
         const double gameScore = games.observations.back();
         pairScores[gameIndex / 2] += 0.5 * gameScore;
         ++gamesPerPair[gameIndex / 2];
@@ -970,6 +1053,70 @@ struct PairedMatchScore
     std::vector<double> pairScores;
     std::vector<uint8_t> gamesPerPair;
 };
+
+std::string baselineMetadataName(std::string_view suffix)
+{
+    return std::format("{}{}", baselineMetadataPrefix, suffix);
+}
+
+bool hasBaselineQualification(const CheckpointMetadata& metadata)
+{
+    const auto version = metadata.find(baselineMetadataName("version"));
+    const auto passed = metadata.find(baselineMetadataName("passed"));
+    return version != metadata.end() && version->second == baselineGateVersion
+        && passed != metadata.end() && passed->second == "true";
+}
+
+void storeBaselineScore(CheckpointMetadata& metadata, std::string_view opponent,
+                        const MatchScore& score)
+{
+    const auto name = [&](std::string_view field) {
+        return baselineMetadataName(std::format("{}.{}", opponent, field));
+    };
+    metadata.insert_or_assign(name("score"), std::format("{}", score.score()));
+    metadata.insert_or_assign(
+        name("lower_bound"), std::format("{}", score.lowerConfidenceBound()));
+    metadata.insert_or_assign(name("wins"), std::format("{}", score.wins));
+    metadata.insert_or_assign(name("draws"), std::format("{}", score.draws));
+    metadata.insert_or_assign(name("losses"), std::format("{}", score.losses));
+    metadata.insert_or_assign(name("games"), std::format("{}", score.games()));
+    metadata.insert_or_assign(
+        name("total_plies"), std::format("{}", score.totalPlies));
+}
+
+void storeBaselineQualification(CheckpointMetadata& metadata,
+                                const MatchScore& randomScore,
+                                const MatchScore& rolloutScore)
+{
+    metadata.insert_or_assign(
+        baselineMetadataName("version"), std::string{baselineGateVersion});
+    metadata.insert_or_assign(baselineMetadataName("passed"), "true");
+    storeBaselineScore(metadata, "random", randomScore);
+    storeBaselineScore(metadata, "rollout_mcts", rolloutScore);
+}
+
+uint64_t loadRetainedStep(const CheckpointMetadata& metadata)
+{
+    const auto found = metadata.find(std::string{retainedStepMetadataName});
+    if (found == metadata.end())
+        return 0;
+
+    uint64_t step = 0;
+    const char* const begin = found->second.data();
+    const char* const end = begin + found->second.size();
+    const auto [parsedEnd, error] = std::from_chars(begin, end, step);
+    if (error != std::errc{} || parsedEnd != end)
+        throw std::runtime_error(std::format(
+            "checkpoint metadata {} is not a valid step: {}",
+            retainedStepMetadataName, found->second));
+    return step;
+}
+
+void storeRetainedStep(CheckpointMetadata& metadata, uint64_t step)
+{
+    metadata.insert_or_assign(
+        std::string{retainedStepMetadataName}, std::format("{}", step));
+}
 
 Evaluation rolloutEvaluation(const Board& leaf, std::mt19937_64& randomEngine)
 {
@@ -1083,9 +1230,11 @@ bool playBaselineGames(const Network& candidate, Baseline baseline,
             advance(game, baseline);
             if (game.outcome.has_value())
             {
-                score.add(*game.outcome, game.candidateWhite);
+                score.add(*game.outcome, game.candidateWhite,
+                          completedGameRounds(game.board));
                 ++completed;
-                updateGateStatus(completed, score.score());
+                assert(score.games() == completed);
+                updateGateStatus(score);
                 if (started >= GameCount)
                     continue;
                 initialize(game, firstGameId + started++, randomSeed);
@@ -1305,50 +1454,59 @@ int runTraining(const std::filesystem::path& weights,
             throw std::runtime_error(std::format(
                 "{} does not exist; select a network with --network",
                 weights.string()));
+        CheckpointMetadata checkpointMetadata = network->checkpointMetadata();
+        bool baselineQualified = hasBaselineQualification(checkpointMetadata);
+        uint64_t optimizerStep = loadRetainedStep(checkpointMetadata);
+        storeRetainedStep(checkpointMetadata, optimizerStep);
         ParameterHealthMonitor healthMonitor{*network};
-        healthMonitor.check(network->parameters(), 0);
+        healthMonitor.check(network->parameters(), optimizerStep);
         if (importLegacyLive)
         {
             // The previous method's .live file contains its newest network plus
             // Adam state. Import only the network once: saving the champion now
             // makes weights newer than the untouched legacy sidecar, so a later
             // restart cannot roll a promoted champion back to stale live data.
-            saveAtomically(*network, weights);
+            saveAtomically(*network, weights, checkpointMetadata);
             report("[train] imported current network from {} and reset optimizer state",
                    legacyLiveWeights.string());
         }
         else if (!std::filesystem::exists(weights))
-            saveAtomically(*network, weights);
+            saveAtomically(*network, weights, checkpointMetadata);
         report("[train] {}: {}, {} parameters", weights.string(),
                network->name(), network->parameterCount());
         report("[train] run seed: {}", runSeed);
+        report("[train] retained step: {}", optimizerStep);
+        if (baselineQualified)
+            report("[train] checkpoint already passed baseline gate version {}; "
+                   "skipping random and rollout-mcts",
+                   baselineGateVersion);
         report("[train] generation method: {} self-play games, {}+{} lanes, "
-               "{} visits, AdamW lr {}, up to {} epochs",
+               "{} visits, AdamW lr {}, up to {} epochs, {} validations/epoch",
                selfPlayGameCount, selfPlayLaneSize, selfPlayLaneSize,
-               selfPlaySimulationCount, learningRate, maximumTrainingEpochs);
+               selfPlaySimulationCount, learningRate, maximumTrainingEpochs,
+               validationPointsPerEpoch);
 
         std::mt19937_64 randomEngine{runSeed};
         uint64_t nextGameId = 0;
-        uint64_t optimizerStep = 0;
         uint64_t generation = 1;
-        bool firstGate = true;
         size_t pooledGames = 0;
         std::vector<TrainingSample> training;
         std::vector<TrainingSample> heldOut;
 
         while (!stopRequested)
         {
+            const uint64_t championStep = optimizerStep;
             report("[generation {}] self-play started from the champion", generation);
-            std::vector<TrainingSample> generated =
+            CompletedSelfPlay generated =
                 generateSelfPlay(*network, nextGameId, runSeed);
             if (stopRequested)
                 break;
 
-            const size_t generatedPositionCount = generated.size();
+            const size_t generatedPositionCount = generated.samples.size();
             training.reserve(training.size() + generatedPositionCount);
             heldOut.reserve(
                 heldOut.size() + generatedPositionCount / heldOutGameFraction + 1);
-            for (TrainingSample& sample : generated)
+            for (TrainingSample& sample : generated.samples)
             {
                 std::vector<TrainingSample>& destination =
                     isHeldOutGame(sample.gameId) ? heldOut : training;
@@ -1358,9 +1516,11 @@ int runTraining(const std::filesystem::path& weights,
             if (training.empty() || heldOut.empty())
                 throw std::runtime_error(
                     "self-play generation did not produce both training and held-out positions");
-            report("[generation {}] {} new positions; champion pool: {} games, "
+            report("[generation {}] {} new positions, {:.1f} rounds/game, "
+                   "{:.1f} positions/s; champion pool: {} games, "
                    "{} positions ({} train, {} held out)",
-                   generation, generatedPositionCount, pooledGames,
+                   generation, generatedPositionCount, generated.averagePlies(),
+                   generated.positionsPerSecond, pooledGames,
                    training.size() + heldOut.size(), training.size(), heldOut.size());
 
             std::vector<mlx::core::array> parameters = network->parameters();
@@ -1371,8 +1531,9 @@ int runTraining(const std::filesystem::path& weights,
             std::vector<size_t> heldOutOrder(heldOut.size());
             std::iota(heldOutOrder.begin(), heldOutOrder.end(), size_t{0});
             std::vector<mlx::core::array> bestParameters = parameters;
-            double bestValidation = std::numeric_limits<double>::infinity();
             int bestEpoch = 0;
+            int bestEpochPercent = 0;
+            uint64_t bestOptimizerStep = optimizerStep;
             int staleEpochs = 0;
             int consecutiveNonFinite = 0;
             int nonFiniteInWindow = 0;
@@ -1401,10 +1562,22 @@ int runTraining(const std::filesystem::path& weights,
                 return std::array<double, 2>{policy / positions, value / positions};
             };
 
+            const std::array<double, 2> baselineHeldOutLoss =
+                validationLoss(parameters);
+            double bestValidation =
+                baselineHeldOutLoss[0] + baselineHeldOutLoss[1];
+            report("[train] generation {}, baseline step {}: held-out {:.4f}+{:.4f}",
+                   generation, optimizerStep,
+                   baselineHeldOutLoss[0], baselineHeldOutLoss[1]);
+
             for (int epoch = 1; epoch <= maximumTrainingEpochs && !stopRequested;
                  ++epoch)
             {
                 std::ranges::shuffle(trainingOrder, randomEngine);
+                const size_t epochBatchCount =
+                    (trainingOrder.size() + trainingBatchSize - 1) / trainingBatchSize;
+                int nextValidationPoint = 1;
+                bool epochImproved = false;
                 double trainPolicy = 0.0;
                 double trainValue = 0.0;
                 double gradientNormTotal = 0.0;
@@ -1448,21 +1621,50 @@ int runTraining(const std::filesystem::path& weights,
                             || nonFiniteInWindow > nonFiniteAbortPerWindow)
                             throw std::runtime_error(
                                 "training keeps producing non-finite batches");
-                        continue;
                     }
-                    consecutiveNonFinite = 0;
-                    parameters = adam.updateParameters(
-                        parameters, result.gradients, learningRate,
-                        weightDecay, decayMask);
-                    mlx::core::eval(parameters);
-                    ++optimizerStep;
-                    trainPolicy += count * policyLoss;
-                    trainValue += count * valueLoss;
-                    gradientNormTotal += gradientNorm;
-                    trainedPositions += count;
-                    ++completedBatches;
+                    else
+                    {
+                        consecutiveNonFinite = 0;
+                        parameters = adam.updateParameters(
+                            parameters, result.gradients, learningRate,
+                            weightDecay, decayMask);
+                        mlx::core::eval(parameters);
+                        ++optimizerStep;
+                        trainPolicy += count * policyLoss;
+                        trainValue += count * valueLoss;
+                        gradientNormTotal += gradientNorm;
+                        trainedPositions += count;
+                        ++completedBatches;
+                    }
                     if (stopRequested)
                         break;
+
+                    const size_t processedBatches =
+                        offset / trainingBatchSize + 1;
+                    while (nextValidationPoint <= validationPointsPerEpoch
+                           && processedBatches * validationPointsPerEpoch
+                               >= epochBatchCount * nextValidationPoint)
+                    {
+                        const int epochPercent =
+                            100 * nextValidationPoint / validationPointsPerEpoch;
+                        const std::array<double, 2> heldOutLoss =
+                            validationLoss(parameters);
+                        const double validation = heldOutLoss[0] + heldOutLoss[1];
+                        report("[train] generation {}, epoch {}/{} {}%, step {}: "
+                               "held-out {:.4f}+{:.4f}",
+                               generation, epoch, maximumTrainingEpochs, epochPercent,
+                               optimizerStep, heldOutLoss[0], heldOutLoss[1]);
+                        if (validation + validationImprovement < bestValidation)
+                        {
+                            bestValidation = validation;
+                            bestParameters = parameters;
+                            bestEpoch = epoch;
+                            bestEpochPercent = epochPercent;
+                            bestOptimizerStep = optimizerStep;
+                            epochImproved = true;
+                        }
+                        ++nextValidationPoint;
+                    }
                 }
                 if (stopRequested)
                     break;
@@ -1470,70 +1672,84 @@ int runTraining(const std::filesystem::path& weights,
                     throw std::runtime_error("an epoch contained no finite training batch");
 
                 healthMonitor.check(parameters, optimizerStep);
-                const std::array<double, 2> heldOutLoss = validationLoss(parameters);
-                const double validation = heldOutLoss[0] + heldOutLoss[1];
-                report("[train] generation {}, epoch {}/{}, step {}: policy {:.4f}, "
-                       "value {:.4f}, held-out {:.4f}+{:.4f}, |g| {:.2f}",
+                report("[train] generation {}, epoch {}/{} complete, step {}: "
+                       "policy {:.4f}, value {:.4f}, |g| {:.2f}",
                        generation, epoch, maximumTrainingEpochs, optimizerStep,
                        trainPolicy / trainedPositions, trainValue / trainedPositions,
-                       heldOutLoss[0], heldOutLoss[1],
                        gradientNormTotal / completedBatches);
-                if (validation + validationImprovement < bestValidation)
-                {
-                    bestValidation = validation;
-                    bestParameters = parameters;
-                    bestEpoch = epoch;
+                if (epochImproved)
                     staleEpochs = 0;
-                }
                 else if (++staleEpochs >= earlyStoppingPatience)
                 {
-                    report("[train] generation {} stopped after epoch {}; "
-                           "held-out loss last improved at epoch {}",
-                           generation, epoch, bestEpoch);
+                    if (bestEpoch == 0)
+                        report("[train] generation {} stopped after epoch {}; "
+                               "held-out loss never improved on the baseline",
+                               generation, epoch);
+                    else
+                        report("[train] generation {} stopped after epoch {}; "
+                               "held-out loss last improved at epoch {} {}%",
+                               generation, epoch, bestEpoch, bestEpochPercent);
                     break;
                 }
             }
             if (stopRequested)
                 break;
-            if (bestEpoch == 0)
-                throw std::runtime_error("training did not produce a candidate epoch");
             parameters = std::move(bestParameters);
+            optimizerStep = bestOptimizerStep;
             healthMonitor.check(parameters, optimizerStep);
             network->replaceParameters(parameters);
-            report("[train] generation {} candidate uses epoch {}", generation, bestEpoch);
+            if (bestEpoch == 0)
+            {
+                report("[train] generation {}: no checkpoint improved on the baseline; "
+                       "gate skipped", generation);
+                report("[generation {}] retaining {} champion self-play games and "
+                       "generating more", generation, pooledGames);
+                ++generation;
+                continue;
+            }
+            report("[train] generation {} candidate uses epoch {} {}%, step {}",
+                   generation, bestEpoch, bestEpochPercent, optimizerStep);
 
             const uint64_t gateBase = generation * 1'000'000;
             bool baselinesPassed = true;
-            if (firstGate)
+            std::optional<MatchScore> randomScore;
+            std::optional<MatchScore> rolloutScore;
+            if (!baselineQualified)
             {
-                MatchScore randomScore;
+                randomScore.emplace();
                 startGateStatus(generation, "random", randomGameCount);
                 const bool randomCompleted = playBaselineGames<randomGameCount>(
                     *network, Baseline::random, gateBase + championGameCount,
-                    runSeed + 8888 + generation, randomScore);
+                    runSeed + 8888 + generation, *randomScore);
                 finishGateStatus();
                 if (!randomCompleted)
                     break;
                 report("[gate] generation {} vs random: {:.1f}% "
-                       "(95% lower {:.1f}%) over {} games",
-                       generation, 100.0 * randomScore.score(),
-                       100.0 * randomScore.lowerConfidenceBound(), randomScore.games());
+                       "({}W/{}D/{}L, 95% lower {:.1f}%, {:.1f} rounds/game) "
+                       "over {} games",
+                       generation, 100.0 * randomScore->score(),
+                       randomScore->wins, randomScore->draws, randomScore->losses,
+                       100.0 * randomScore->lowerConfidenceBound(),
+                       randomScore->averagePlies(), randomScore->games());
 
-                MatchScore rolloutScore;
+                rolloutScore.emplace();
                 startGateStatus(generation, "rollout-mcts", rolloutGameCount);
                 const bool rolloutCompleted = playBaselineGames<rolloutGameCount>(
                     *network, Baseline::rollout,
                     gateBase + championGameCount + randomGameCount,
-                    runSeed + 9999 + generation, rolloutScore);
+                    runSeed + 9999 + generation, *rolloutScore);
                 finishGateStatus();
                 if (!rolloutCompleted)
                     break;
                 report("[gate] generation {} vs rollout-mcts: {:.1f}% "
-                       "(95% lower {:.1f}%) over {} games",
-                       generation, 100.0 * rolloutScore.score(),
-                       100.0 * rolloutScore.lowerConfidenceBound(), rolloutScore.games());
-                baselinesPassed = randomScore.lowerConfidenceBound() > 0.5
-                    && rolloutScore.lowerConfidenceBound() > 0.5;
+                       "({}W/{}D/{}L, 95% lower {:.1f}%, {:.1f} rounds/game) "
+                       "over {} games",
+                       generation, 100.0 * rolloutScore->score(),
+                       rolloutScore->wins, rolloutScore->draws, rolloutScore->losses,
+                       100.0 * rolloutScore->lowerConfidenceBound(),
+                       rolloutScore->averagePlies(), rolloutScore->games());
+                baselinesPassed = randomScore->lowerConfidenceBound() > 0.5
+                    && rolloutScore->lowerConfidenceBound() > 0.5;
             }
             if (stopRequested)
                 break;
@@ -1546,10 +1762,12 @@ int runTraining(const std::filesystem::path& weights,
             const bool championCompleted =
                 championRunner.template play<championGameCount>(
                     gateBase, runSeed + 7777 + generation,
-                    [&](uint64_t gameId, Outcome outcome) {
+                    [&](uint64_t gameId, Outcome outcome,
+                        uint64_t plyCount) -> const MatchScore& {
                         const size_t gameIndex = static_cast<size_t>(gameId - gateBase);
-                        championScore.add(gameIndex, outcome, gameIndex % 2 == 0);
-                        return championScore.score();
+                        championScore.add(
+                            gameIndex, outcome, gameIndex % 2 == 0, plyCount);
+                        return championScore.games;
                     });
             finishGateStatus();
             if (!championCompleted)
@@ -1557,17 +1775,34 @@ int runTraining(const std::filesystem::path& weights,
             const double championLowerBound =
                 championScore.lowerConfidenceBound();
             report("[gate] generation {} vs champion: {:.1f}% "
-                   "(paired 95% lower {:.1f}%) over {} games",
+                   "({}W/{}D/{}L, paired 95% lower {:.1f}%, "
+                   "{:.1f} rounds/game) over {} games",
                    generation, 100.0 * championScore.score(),
-                   100.0 * championLowerBound, championScore.gameCount());
+                   championScore.games.wins, championScore.games.draws,
+                   championScore.games.losses, 100.0 * championLowerBound,
+                   championScore.games.averagePlies(), championScore.gameCount());
 
             const bool promoted = baselinesPassed && championLowerBound > 0.5;
             report("[gate] generation {}: {}", generation,
                    promoted ? "PROMOTED" : "rejected");
-            firstGate = false;
             if (promoted)
             {
-                saveAtomically(*network, weights);
+                bool storedBaselineQualification = false;
+                if (!baselineQualified)
+                {
+                    assert(randomScore.has_value());
+                    assert(rolloutScore.has_value());
+                    assert(baselinesPassed);
+                    storeBaselineQualification(
+                        checkpointMetadata, *randomScore, *rolloutScore);
+                    baselineQualified = true;
+                    storedBaselineQualification = true;
+                }
+                storeRetainedStep(checkpointMetadata, optimizerStep);
+                saveAtomically(*network, weights, checkpointMetadata);
+                if (storedBaselineQualification)
+                    report("[gate] generation {} baseline qualification saved "
+                           "in the champion checkpoint", generation);
                 report("[generation {}] promoted; cleared {} champion self-play games",
                        generation, pooledGames);
                 std::vector<TrainingSample>{}.swap(training);
@@ -1576,9 +1811,11 @@ int runTraining(const std::filesystem::path& weights,
             }
             else
             {
+                optimizerStep = championStep;
                 network = std::move(champion);
-                report("[generation {}] rejected; retaining {} champion self-play games",
-                       generation, pooledGames);
+                report("[generation {}] rejected; restored champion step {}, "
+                       "retaining {} champion self-play games",
+                       generation, optimizerStep, pooledGames);
             }
             ++generation;
         }

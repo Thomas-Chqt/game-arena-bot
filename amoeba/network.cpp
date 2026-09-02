@@ -210,24 +210,28 @@ std::string indexedName(std::string_view parent, size_t index)
     return childName(parent, std::format("{}", index));
 }
 
-void Network::save(const std::filesystem::path& checkpoint) const
+void Network::save(const std::filesystem::path& checkpoint,
+                   const CheckpointMetadata& additionalMetadata) const
 {
     std::unordered_map<std::string, mlx::core::array> tensors;
     for (size_t index = 0; index < m_layout.size(); ++index)
         tensors.emplace(m_layout[index].name, m_parameters[index]);
 
+    CheckpointMetadata metadata = m_checkpointMetadata;
+    for (const auto& [name, value] : additionalMetadata)
+        metadata.insert_or_assign(name, value);
+    metadata.insert_or_assign("network", m_name);
+
     if (checkpoint.extension() == ".safetensors")
     {
-        mlx::core::save_safetensors(
-            checkpoint.string(), tensors, {{"network", m_name}});
+        mlx::core::save_safetensors(checkpoint.string(), tensors, metadata);
         return;
     }
 
     std::filesystem::path temporary = checkpoint;
     temporary += ".tmp.safetensors";
     std::filesystem::remove(temporary);
-    mlx::core::save_safetensors(
-        temporary.string(), tensors, {{"network", m_name}});
+    mlx::core::save_safetensors(temporary.string(), tensors, metadata);
     std::filesystem::rename(temporary, checkpoint);
 }
 
