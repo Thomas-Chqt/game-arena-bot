@@ -353,6 +353,41 @@ void drawSelfPlayStatus()
     std::fflush(stdout);
 }
 
+void reportCudaMemory(std::string_view phase = {}, bool force = false)
+{
+#if defined(__APPLE__)
+    (void)phase;
+    (void)force;
+#else
+    static std::optional<std::pair<size_t, size_t>> previous;
+    size_t freeBytes = 0;
+    size_t totalBytes = 0;
+    const cudaError_t error = cudaMemGetInfo(&freeBytes, &totalBytes);
+    if (error != cudaSuccess)
+    {
+        std::println("[cuda-memory] {}cudaMemGetInfo failed: {}",
+                     phase.empty() ? "" : std::format("{}: ", phase),
+                     cudaGetErrorString(error));
+        std::fflush(stdout);
+        return;
+    }
+    if (!force && previous == std::pair{freeBytes, totalBytes})
+        return;
+    previous = std::pair{freeBytes, totalBytes};
+    constexpr double bytesPerMiB = 1024.0 * 1024.0;
+    const double totalMiB = static_cast<double>(totalBytes) / bytesPerMiB;
+    const double freeMiB = static_cast<double>(freeBytes) / bytesPerMiB;
+    if (selfPlayStatus.visible && isatty(STDOUT_FILENO))
+        clearTerminalLine();
+    std::println("[cuda-memory] {}{:.0f}/{:.0f} MiB used, {:.0f} MiB free",
+                 phase.empty() ? "" : std::format("{}: ", phase),
+                 totalMiB - freeMiB, totalMiB, freeMiB);
+    std::fflush(stdout);
+    if (selfPlayStatus.visible && isatty(STDOUT_FILENO))
+        drawSelfPlayStatus();
+#endif
+}
+
 template<typename... Args>
 void report(std::format_string<Args...> format, Args&&... args)
 {
@@ -362,30 +397,7 @@ void report(std::format_string<Args...> format, Args&&... args)
     std::fflush(stdout);
     if (selfPlayStatus.visible)
         selfPlayStatus.positions = 0;
-}
-
-void reportCudaMemory(std::string_view phase, size_t inferenceCount, size_t batchSize)
-{
-#if defined(__APPLE__)
-    (void)phase;
-    (void)inferenceCount;
-    (void)batchSize;
-#else
-    size_t freeBytes = 0;
-    size_t totalBytes = 0;
-    const cudaError_t error = cudaMemGetInfo(&freeBytes, &totalBytes);
-    if (error != cudaSuccess)
-    {
-        report("[cuda-memory] inference {} {} batch {}: cudaMemGetInfo failed: {}",
-               inferenceCount, phase, batchSize, cudaGetErrorString(error));
-        return;
-    }
-    constexpr double bytesPerMiB = 1024.0 * 1024.0;
-    const double totalMiB = static_cast<double>(totalBytes) / bytesPerMiB;
-    const double freeMiB = static_cast<double>(freeBytes) / bytesPerMiB;
-    report("[cuda-memory] inference {} {} batch {}: {:.0f}/{:.0f} MiB used, {:.0f} MiB free",
-           inferenceCount, phase, batchSize, totalMiB - freeMiB, totalMiB, freeMiB);
-#endif
+    reportCudaMemory();
 }
 
 void reportSelfPlayStatus(uint64_t generatedPositions, uint64_t completedGames,
@@ -412,6 +424,7 @@ void reportSelfPlayStatus(uint64_t generatedPositions, uint64_t completedGames,
                      selfPlayStatus.positionsPerSecond);
         std::fflush(stdout);
     }
+    reportCudaMemory();
 }
 
 void finishSelfPlayStatus()
@@ -960,6 +973,7 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
         std::vector<const Board*> boards;
         std::vector<size_t> offsets;
         std::vector<Evaluation> evaluations;
+        size_t realBoardCount = 0;
     };
     const auto prepare = [&](std::vector<SelfPlayLane>& lanes) {
         InferenceBatch batch;
@@ -983,6 +997,15 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
             batch.boards.insert(batch.boards.end(), pending.begin(), pending.end());
         }
         batch.offsets.push_back(batch.boards.size());
+        batch.realBoardCount = batch.boards.size();
+        if (!batch.boards.empty())
+        {
+            assert(batch.realBoardCount <= selfPlayEvaluationBatchSize);
+            // MLX compiles a separate CUDA graph for each input shape. Reuse the
+            // final valid Board for padding so every non-empty self-play inference
+            // has the same batch dimension; only the real prefix is absorbed.
+            batch.boards.resize(selfPlayEvaluationBatchSize, batch.boards.back());
+        }
         batch.evaluations.resize(batch.boards.size());
         return batch;
     };
@@ -1006,12 +1029,17 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
         // submit() queues the CUDA work, then prepare() uses the MCTS workers
         // on the other group while that CUDA work is running.
         ++inferenceCount;
-        reportCudaMemory("before submit", inferenceCount, current.boards.size());
+        reportCudaMemory(
+            std::format("self-play inference {} before submit, {} real boards padded to {}",
+                        inferenceCount, current.realBoardCount, current.boards.size()),
+            true);
         PendingEvaluations pending = network.submit(current.boards);
         const size_t otherGroup = 1 - currentGroup;
         InferenceBatch other = prepare(groups[otherGroup]);
         network.finish(std::move(pending), current.evaluations);
-        reportCudaMemory("after finish", inferenceCount, current.boards.size());
+        reportCudaMemory(
+            std::format("self-play inference {} after finish, {} real boards padded to {}",
+                        inferenceCount, current.realBoardCount, current.boards.size()));
         absorb(groups[currentGroup], current);
 
         if (!other.boards.empty())
@@ -1718,6 +1746,7 @@ int runTraining(const std::filesystem::path& weights,
             report("[generation {}] self-play started from the champion", generation);
             CompletedSelfPlay generated =
                 generateSelfPlay(*network, nextGameId, runSeed);
+            reportCudaMemory(std::format("after self-play generation {}", generation), true);
             if (stopRequested)
                 break;
 
@@ -1744,6 +1773,7 @@ int runTraining(const std::filesystem::path& weights,
 
             std::vector<mlx::core::array> parameters = network->parameters();
             Adam adam{parameters};
+            reportCudaMemory("after Adam state creation");
             const std::vector<uint8_t> decayMask = network->weightDecayMask();
             std::vector<size_t> trainingOrder(training.size());
             std::iota(trainingOrder.begin(), trainingOrder.end(), size_t{0});
@@ -1772,8 +1802,10 @@ int runTraining(const std::filesystem::path& weights,
                         heldOut,
                         std::span<const size_t>{heldOutOrder.data() + offset, count},
                         randomEngine, false);
+                    reportCudaMemory(std::format("validation before eval, batch {}", count), true);
                     const Loss loss = network->loss(values, batch);
                     mlx::core::eval({loss.policy, loss.value});
+                    reportCudaMemory(std::format("validation after eval, batch {}", count));
                     policy += count * loss.policy.item<float>();
                     value += count * loss.value.item<float>();
                     positions += count;
@@ -1816,8 +1848,11 @@ int runTraining(const std::filesystem::path& weights,
                     for (const mlx::core::array& gradient : result.gradients)
                         gradientNormSquared = gradientNormSquared
                             + mlx::core::sum(mlx::core::square(gradient));
+                    reportCudaMemory(
+                        std::format("training gradient before eval, batch {}", count), true);
                     mlx::core::eval(
                         {result.loss.policy, result.loss.value, gradientNormSquared});
+                    reportCudaMemory(std::format("training gradient after eval, batch {}", count));
                     const float policyLoss = result.loss.policy.item<float>();
                     const float valueLoss = result.loss.value.item<float>();
                     const float gradientNorm =
@@ -1847,7 +1882,10 @@ int runTraining(const std::filesystem::path& weights,
                         parameters = adam.updateParameters(
                             parameters, result.gradients, learningRate,
                             weightDecay, decayMask);
+                        reportCudaMemory(
+                            std::format("Adam update before eval, batch {}", count), true);
                         mlx::core::eval(parameters);
+                        reportCudaMemory(std::format("Adam update after eval, batch {}", count));
                         ++optimizerStep;
                         trainPolicy += count * policyLoss;
                         trainValue += count * valueLoss;
