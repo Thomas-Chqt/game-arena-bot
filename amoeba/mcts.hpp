@@ -14,10 +14,17 @@ namespace amoeba_bot
 
 using VisitCounts = std::array<uint32_t, moveIdCount>;
 
+// MCTS and its training targets share this objective: a terminal result is
+// worth slightly more when it is reached sooner. At 100 remaining moves its
+// magnitude is about 0.905, so winning remains much more important than speed.
+inline constexpr float terminalValueDiscountPerMove = 0.999f;
+
 template<int SimulationCount>
 class MCTS
 {
     static_assert(SimulationCount > 0);
+    static_assert(terminalValueDiscountPerMove > 0.0f
+                  && terminalValueDiscountPerMove <= 1.0f);
 
 public:
     // Playing can prove outcomes and check every root move for an immediate
@@ -76,6 +83,7 @@ uint16_t bestMove(const VisitCounts&);
 float outcomeFor(Outcome, bool whiteToMove);
 
 extern template class MCTS<256>;
+extern template class MCTS<512>;
 extern template class MCTS<1000>;
 extern template class MCTS<1500>;
 

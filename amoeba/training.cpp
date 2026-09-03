@@ -12,13 +12,18 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <format>
+#include <functional>
+#include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <print>
@@ -29,6 +34,8 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -41,19 +48,24 @@ namespace
 
 constexpr uint64_t healthReferenceSeed = 20260819;
 constexpr uint64_t evaluationOpeningSeed = healthReferenceSeed + 7777;
-// A 256-visit search is large enough to make the policy target materially less
-// sparse than the old 200-visit target without doubling the dominant cost of
-// every generation. Self-play and the gate use the same search budget so the
-// comparison does not reward a candidate under different search conditions.
+#if AMOEBA_BIG_GPU_TRAINING
+// Self-play and the gate use the same search budget so the comparison does not
+// reward a candidate under different search conditions.
+constexpr int selfPlaySimulationCount = 512;
+constexpr int evaluationSimulationCount = 512;
+// CPU lanes are sized at runtime from the available hardware threads. Their
+// combined pending leaves stay capped here, so a machine with more CPU cores
+// creates more, smaller lanes without silently increasing GPU memory use.
+constexpr size_t selfPlayEvaluationBatchSize = 4096;
+constexpr int selfPlayGameCount = 8192;
+#else
+// The default profile remains practical on an Apple-silicon laptop. It keeps
+// the old search/data sizes while retaining the newer training safeguards.
 constexpr int selfPlaySimulationCount = 256;
 constexpr int evaluationSimulationCount = 256;
-// One lane is one MLX inference batch. While its 256 leaves are on the GPU,
-// the host advances MCTS for the other lane.
-constexpr int selfPlayLaneSize = 256;
-constexpr int selfPlayLaneCount = 2;
+constexpr size_t selfPlayEvaluationBatchSize = 256;
 constexpr int selfPlayGameCount = 2048;
-static_assert(selfPlayGameCount % selfPlayLaneCount == 0);
-constexpr int selfPlayGamesPerLane = selfPlayGameCount / selfPlayLaneCount;
+#endif
 // Two hundred fifty-six paired openings give 512 games. Promotion uses the
 // lower bound across the 256 pair scores, rather than a raw win-rate threshold.
 constexpr int championGameCount = 512;
@@ -64,28 +76,106 @@ constexpr int concurrentEvaluationGames = 512;
 constexpr int samplingPlyCount = 20;
 constexpr float rootNoise = 0.25f;
 constexpr float noiseAlpha = 0.35f;
+#if AMOEBA_BIG_GPU_TRAINING
+constexpr size_t trainingBatchSize = 1024;
+#else
 constexpr size_t trainingBatchSize = 256;
+#endif
 // The split is by game, never by position. One eighth of the games generated
 // by a champion are validation-only, including games retained after a rejected
 // candidate.
 constexpr uint64_t heldOutGameFraction = 8;
 constexpr int maximumTrainingEpochs = 8;
-constexpr int validationPointsPerEpoch = 4;
+constexpr int validationPointsPerEpoch = 8;
 constexpr int earlyStoppingPatience = 2;
 constexpr float validationImprovement = 1e-4f;
-// Each candidate fine-tunes an already trained champion. AdamW at 1e-4 makes
-// that update deliberate; the gate, not a large optimizer jump, decides
-// whether it was useful.
-constexpr float learningRate = 1e-4f;
+// Each candidate fine-tunes an already trained champion. Use deliberately
+// small AdamW updates so held-out validation can select the point before the
+// candidate begins fitting this generation's self-play too closely.
+constexpr float learningRate = 5e-5f;
 constexpr float weightDecay = 1e-2f;
 constexpr double gateConfidenceZ = 1.645; // one-sided 95% lower bound
-// Bump this when a fixed baseline, its game count, or its evaluation method
-// changes so an older checkpoint is qualified again under the new gate.
-constexpr std::string_view baselineGateVersion = "1";
+// A baseline qualification is only valid at the visit count used to earn it.
+// The default v2 checkpoint stays usable locally; the high-GPU 512-visit gate
+// is v3 and therefore requalifies it before trusting the saved result.
+#if AMOEBA_BIG_GPU_TRAINING
+constexpr std::string_view baselineGateVersion = "3";
+#else
+constexpr std::string_view baselineGateVersion = "2";
+#endif
 constexpr std::string_view baselineMetadataPrefix = "training.baseline_gate.";
 constexpr std::string_view retainedStepMetadataName = "training.retained_step";
 
 volatile sig_atomic_t stopRequested = 0;
+
+size_t mctsWorkerCount()
+{
+    return std::max<size_t>(1, std::thread::hardware_concurrency());
+}
+
+class ThreadPool
+{
+public:
+    explicit ThreadPool(size_t workerCount)
+    {
+        assert(workerCount > 0);
+        m_workers.reserve(workerCount);
+        for (size_t worker = 0; worker < workerCount; ++worker)
+            m_workers.emplace_back([this] { run(); });
+    }
+
+    ~ThreadPool()
+    {
+        {
+            std::lock_guard lock{m_mutex};
+            m_stopping = true;
+        }
+        m_ready.notify_all();
+        for (std::thread& worker : m_workers)
+            worker.join();
+    }
+
+    template<typename Function>
+    auto submit(Function&& function)
+        -> std::future<std::invoke_result_t<std::decay_t<Function>>>
+    {
+        using Result = std::invoke_result_t<std::decay_t<Function>>;
+        auto task = std::make_shared<std::packaged_task<Result()>>(
+            std::forward<Function>(function));
+        std::future<Result> result = task->get_future();
+        {
+            std::lock_guard lock{m_mutex};
+            assert(!m_stopping);
+            m_tasks.emplace_back([task] { (*task)(); });
+        }
+        m_ready.notify_one();
+        return result;
+    }
+
+private:
+    void run()
+    {
+        for (;;)
+        {
+            std::function<void()> task;
+            {
+                std::unique_lock lock{m_mutex};
+                m_ready.wait(lock, [this] { return m_stopping || !m_tasks.empty(); });
+                if (m_stopping && m_tasks.empty())
+                    return;
+                task = std::move(m_tasks.front());
+                m_tasks.pop_front();
+            }
+            task();
+        }
+    }
+
+    std::mutex m_mutex;
+    std::condition_variable m_ready;
+    std::deque<std::function<void()>> m_tasks;
+    std::vector<std::thread> m_workers;
+    bool m_stopping = false;
+};
 
 struct MatchScore
 {
@@ -530,8 +620,16 @@ template<int SimulationCount>
 void finish(ActiveGame<SimulationCount>& game)
 {
     assert(game.outcome.has_value());
+    const uint64_t completedRounds = completedGameRounds(game.board);
     for (TrainingSample& sample : game.samples)
-        sample.outcome = outcomeFor(*game.outcome, sample.board.whiteToMove);
+    {
+        assert(completedRounds > sample.board.plyCount);
+        const uint64_t remainingMoves = completedRounds - sample.board.plyCount;
+        const float timeDiscount = std::pow(
+            terminalValueDiscountPerMove, static_cast<float>(remainingMoves));
+        sample.outcome = timeDiscount
+            * outcomeFor(*game.outcome, sample.board.whiteToMove);
+    }
 }
 
 void addExplorationNoise(Evaluation& evaluation, const Board& board,
@@ -586,17 +684,29 @@ public:
         };
         for (ActiveGame<SimulationCount>& game : games)
             initializeGame(game);
+        ThreadPool workers{mctsWorkerCount()};
         std::array<std::vector<const Board*>, 2> pendingBoards;
         std::array<std::vector<Evaluation>, 2> evaluations;
         while (completed < GameCount)
         {
+            std::vector<std::future<void>> advanced;
+            advanced.reserve(games.size());
+            for (ActiveGame<SimulationCount>& game : games)
+            {
+                if (game.active)
+                    advanced.push_back(workers.submit([&game] {
+                        advance<SimulationCount, false>(game);
+                    }));
+            }
+            for (std::future<void>& future : advanced)
+                future.get();
+
             for (std::vector<const Board*>& boards : pendingBoards)
                 boards.clear();
             for (ActiveGame<SimulationCount>& game : games)
             {
                 if (!game.active)
                     continue;
-                advance<SimulationCount, false>(game);
                 if (game.pendingLeaf == nullptr)
                 {
                     finish(game);
@@ -607,10 +717,7 @@ public:
                     assert(score.games() == completed);
                     updateGateStatus(score);
                     if (started < GameCount)
-                    {
                         initializeGame(game);
-                        advance<SimulationCount, false>(game);
-                    }
                     else
                     {
                         game.active = false;
@@ -657,19 +764,20 @@ private:
 class SelfPlayLane
 {
 public:
-    SelfPlayLane(uint64_t firstGameId, size_t gameCount, uint64_t randomSeed)
-        : m_games(std::min<size_t>(selfPlayLaneSize, gameCount)),
+    SelfPlayLane(uint64_t firstGameId, size_t gameCount, size_t activeGameCount,
+                 uint64_t randomSeed)
+        : m_games(std::min(activeGameCount, gameCount)),
           m_firstGameId(firstGameId), m_randomSeed(randomSeed),
           m_gameCount(gameCount), m_activeGames(m_games.size())
     {
         assert(gameCount > 0);
+        assert(activeGameCount > 0);
         for (ActiveGame<selfPlaySimulationCount>& game : m_games)
             initializeNext(game);
     }
 
     CompletedSelfPlay prepare()
     {
-        assert(!m_pending.has_value());
         assert(!m_prepared);
         m_pendingBoards.clear();
         CompletedSelfPlay completed;
@@ -707,38 +815,35 @@ public:
         return completed;
     }
 
-    void submit(const Network& network)
+    std::span<const Board* const> preparedBoards() const
     {
         assert(m_prepared);
-        assert(!m_pending.has_value());
-        m_evaluations.resize(m_pendingBoards.size());
-        m_pending.emplace(network.submit(m_pendingBoards));
-        m_prepared = false;
+        return m_pendingBoards;
     }
 
-    void absorb(const Network& network)
+    void absorb(std::span<const Evaluation> evaluations)
     {
-        assert(m_pending.has_value());
-        network.finish(std::move(*m_pending), m_evaluations);
-        m_pending.reset();
+        assert(m_prepared);
+        assert(evaluations.size() == m_pendingBoards.size());
         for (ActiveGame<selfPlaySimulationCount>& game : m_games)
         {
             if (!game.active)
                 continue;
             assert(game.pendingLeaf != nullptr);
-            Evaluation& evaluation = m_evaluations[game.evaluationOffset];
+            Evaluation evaluation = evaluations[game.evaluationOffset];
             if (game.firstLeafOfSearch)
                 addExplorationNoise(evaluation, *game.pendingLeaf, game.noiseRandom);
             game.search->absorb(evaluation.policy, evaluation.value);
             game.firstLeafOfSearch = false;
             game.pendingLeaf = nullptr;
         }
+        m_prepared = false;
     }
 
     bool hasPreparedEvaluations() const { return m_prepared; }
     bool finished() const
     {
-        return m_activeGames == 0 && !m_prepared && !m_pending.has_value();
+        return m_activeGames == 0 && !m_prepared;
     }
     size_t completedGames() const { return m_completedGames; }
 
@@ -753,8 +858,6 @@ private:
 
     std::vector<ActiveGame<selfPlaySimulationCount>> m_games;
     std::vector<const Board*> m_pendingBoards;
-    std::vector<Evaluation> m_evaluations;
-    std::optional<PendingEvaluations> m_pending;
     uint64_t m_firstGameId;
     uint64_t m_randomSeed;
     size_t m_gameCount;
@@ -769,16 +872,28 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
                                    uint64_t runSeed)
 {
     selfPlayStatus = SelfPlayStatus{};
-    std::array<SelfPlayLane, 2> lanes{
-        SelfPlayLane{nextGameId, selfPlayGamesPerLane, runSeed ^ nextGameId},
-        SelfPlayLane{nextGameId + selfPlayGamesPerLane, selfPlayGamesPerLane,
-                     runSeed ^ (nextGameId + selfPlayGamesPerLane)},
-    };
+    const size_t laneCount = std::min(
+        {mctsWorkerCount(), selfPlayEvaluationBatchSize,
+         static_cast<size_t>(selfPlayGameCount)});
+    const size_t gamesPerLane = selfPlayGameCount / laneCount;
+    const size_t extraGames = selfPlayGameCount % laneCount;
+    const size_t leavesPerLane = selfPlayEvaluationBatchSize / laneCount;
+    const size_t extraLeaves = selfPlayEvaluationBatchSize % laneCount;
+    std::vector<SelfPlayLane> lanes;
+    lanes.reserve(laneCount);
+    uint64_t firstGameId = nextGameId;
+    for (size_t laneIndex = 0; laneIndex < laneCount; ++laneIndex)
+    {
+        const size_t laneGames = gamesPerLane + (laneIndex < extraGames ? 1 : 0);
+        const size_t activeGames = leavesPerLane + (laneIndex < extraLeaves ? 1 : 0);
+        lanes.emplace_back(firstGameId, laneGames, activeGames, runSeed ^ firstGameId);
+        firstGameId += laneGames;
+    }
     nextGameId += selfPlayGameCount;
 
+    ThreadPool workers{laneCount};
     CompletedSelfPlay result;
-    const auto prepare = [&](SelfPlayLane& lane) {
-        CompletedSelfPlay completed = lane.prepare();
+    const auto collect = [&](CompletedSelfPlay completed) {
         if (!completed.samples.empty())
         {
             reportSelfPlayStatus(
@@ -792,48 +907,62 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
         }
     };
 
-    int submitted = 0;
-    prepare(lanes[submitted]);
-    assert(lanes[submitted].hasPreparedEvaluations());
-    lanes[submitted].submit(network);
     for (;;)
     {
-        const int preparing = 1 - submitted;
-        if (!lanes[preparing].finished()
-            && !lanes[preparing].hasPreparedEvaluations())
-            prepare(lanes[preparing]);
-
-        // finish() is the synchronization point. Everything in prepare() above
-        // ran while this lane's MLX batch was executing on the GPU.
-        lanes[submitted].absorb(network);
+        std::vector<std::future<CompletedSelfPlay>> prepared;
+        prepared.reserve(lanes.size());
+        for (SelfPlayLane& lane : lanes)
+        {
+            if (!lane.finished() && !lane.hasPreparedEvaluations())
+                prepared.push_back(workers.submit([&lane] { return lane.prepare(); }));
+        }
+        for (std::future<CompletedSelfPlay>& future : prepared)
+            collect(future.get());
         if (stopRequested)
             break;
 
-        if (lanes[preparing].hasPreparedEvaluations())
+        std::vector<const Board*> boards;
+        std::vector<size_t> offsets;
+        offsets.reserve(lanes.size() + 1);
+        for (const SelfPlayLane& lane : lanes)
         {
-            lanes[preparing].submit(network);
-            submitted = preparing;
-            continue;
-        }
-
-        if (!lanes[submitted].finished())
-        {
-            prepare(lanes[submitted]);
-            if (lanes[submitted].hasPreparedEvaluations())
-            {
-                lanes[submitted].submit(network);
+            offsets.push_back(boards.size());
+            if (!lane.hasPreparedEvaluations())
                 continue;
-            }
+            const std::span<const Board* const> pending = lane.preparedBoards();
+            boards.insert(boards.end(), pending.begin(), pending.end());
         }
-        break;
+        offsets.push_back(boards.size());
+
+        if (boards.empty())
+            break;
+
+        // MLX remains confined to this coordinator thread. The worker pool owns
+        // the irregular Board/MCTS work; this one call gives CUDA a large dense
+        // batch without requiring MLX arrays to cross worker-thread boundaries.
+        std::vector<Evaluation> evaluations(boards.size());
+        network(boards, evaluations);
+        for (size_t laneIndex = 0; laneIndex < lanes.size(); ++laneIndex)
+        {
+            if (!lanes[laneIndex].hasPreparedEvaluations())
+                continue;
+            const size_t offset = offsets[laneIndex];
+            const size_t count = offsets[laneIndex + 1] - offset;
+            lanes[laneIndex].absorb(
+                std::span<const Evaluation>{evaluations.data() + offset, count});
+        }
     }
 
     finishSelfPlayStatus();
     result.positionsPerSecond = selfPlayStatus.positionsPerSecond;
     if (!stopRequested)
     {
-        assert(lanes[0].completedGames() + lanes[1].completedGames()
-               == selfPlayGameCount);
+        const size_t completedGames = std::accumulate(
+            lanes.begin(), lanes.end(), size_t{0},
+            [](size_t total, const SelfPlayLane& lane) {
+                return total + lane.completedGames();
+            });
+        assert(completedGames == selfPlayGameCount);
         assert(result.games == selfPlayGameCount);
     }
     return result;
@@ -1218,16 +1347,28 @@ bool playBaselineGames(const Network& candidate, Baseline baseline,
     int completed = 0;
     for (BaselineGame& game : games)
         initialize(game, firstGameId + started++, randomSeed);
+    ThreadPool workers{mctsWorkerCount()};
     std::vector<const Board*> pendingBoards;
     std::vector<Evaluation> evaluations;
     while (completed < GameCount)
     {
+        std::vector<std::future<void>> advanced;
+        advanced.reserve(games.size());
+        for (BaselineGame& game : games)
+        {
+            if (!game.outcome.has_value() || started < GameCount)
+                advanced.push_back(workers.submit([&game, baseline] {
+                    advance(game, baseline);
+                }));
+        }
+        for (std::future<void>& future : advanced)
+            future.get();
+
         pendingBoards.clear();
         for (BaselineGame& game : games)
         {
             if (game.outcome.has_value() && started >= GameCount)
                 continue;
-            advance(game, baseline);
             if (game.outcome.has_value())
             {
                 score.add(*game.outcome, game.candidateWhite,
@@ -1238,7 +1379,6 @@ bool playBaselineGames(const Network& candidate, Baseline baseline,
                 if (started >= GameCount)
                     continue;
                 initialize(game, firstGameId + started++, randomSeed);
-                advance(game, baseline);
             }
             if (!game.outcome.has_value())
             {
@@ -1480,10 +1620,13 @@ int runTraining(const std::filesystem::path& weights,
             report("[train] checkpoint already passed baseline gate version {}; "
                    "skipping random and rollout-mcts",
                    baselineGateVersion);
-        report("[train] generation method: {} self-play games, {}+{} lanes, "
-               "{} visits, AdamW lr {}, up to {} epochs, {} validations/epoch",
-               selfPlayGameCount, selfPlayLaneSize, selfPlayLaneSize,
-               selfPlaySimulationCount, learningRate, maximumTrainingEpochs,
+        report("[train] generation method: {} self-play games, {} MCTS workers, "
+               "up to {} leaves/batch, "
+               "{} visits, AdamW lr {}, terminal discount/move {}, up to {} epochs, "
+               "{} validations/epoch",
+               selfPlayGameCount, mctsWorkerCount(), selfPlayEvaluationBatchSize,
+               selfPlaySimulationCount, learningRate, terminalValueDiscountPerMove,
+               maximumTrainingEpochs,
                validationPointsPerEpoch);
 
         std::mt19937_64 randomEngine{runSeed};

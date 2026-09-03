@@ -122,4 +122,48 @@ private:
     size_t m_valueOutputBiasIndex;
 };
 
+// This is intentionally a separate architecture rather than a widened version
+// of TransformerNetwork: safetensors loading is exact-shape only, and a new
+// identifier prevents an existing 6x128 checkpoint from being resumed into a
+// different computation graph by mistake.
+class TransformerNetworkXL final : public Network
+{
+public:
+    inline static constexpr const char* identifier =
+        "amoeba-relation-transformer-v2-8x256x8";
+
+    explicit TransformerNetworkXL(uint64_t seed);
+    explicit TransformerNetworkXL(const std::filesystem::path& checkpoint);
+
+private:
+    static constexpr int embeddingWidth = 256;
+    static constexpr int attentionHeadCount = 8;
+    static constexpr int blockCount = 8;
+
+    static float residualInitScale()
+    {
+        return 1.0f / std::sqrt(2.0f * blockCount);
+    }
+
+    Prediction forward(mlx::core::array inputBatch,
+                       std::span<const mlx::core::array> parameters) const override;
+
+    Linear<featuresPerHex + globalFeatureCount, embeddingWidth> m_embed;
+    size_t m_positionIndex;
+    TransformerBlock<embeddingWidth, attentionHeadCount> m_block0;
+    TransformerBlock<embeddingWidth, attentionHeadCount> m_block1;
+    TransformerBlock<embeddingWidth, attentionHeadCount> m_block2;
+    TransformerBlock<embeddingWidth, attentionHeadCount> m_block3;
+    TransformerBlock<embeddingWidth, attentionHeadCount> m_block4;
+    TransformerBlock<embeddingWidth, attentionHeadCount> m_block5;
+    TransformerBlock<embeddingWidth, attentionHeadCount> m_block6;
+    TransformerBlock<embeddingWidth, attentionHeadCount> m_block7;
+    LayerNorm<embeddingWidth> m_finalNorm;
+    Linear<embeddingWidth, policyOutputsPerHex> m_policy;
+    size_t m_valueHiddenIndex;
+    size_t m_valueHiddenBiasIndex;
+    size_t m_valueOutputIndex;
+    size_t m_valueOutputBiasIndex;
+};
+
 } // namespace amoeba_bot
