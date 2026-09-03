@@ -7,6 +7,9 @@ find_package(arena 0.1.0 CONFIG REQUIRED HINTS "${GAME_ARENA_SDK_ROOT}")
 
 option(AMOEBA_BUILD_MLX_FROM_SOURCE "Build the pinned MLX dependency from source" ON)
 option(AMOEBA_ENABLE_CUDA "Build MLX with its CUDA backend on Linux" ON)
+option(AMOEBA_BIG_GPU_TRAINING
+       "Use the high-throughput self-play and training profile for a large CUDA GPU"
+       OFF)
 
 if(AMOEBA_BUILD_MLX_FROM_SOURCE)
     include(FetchContent)
@@ -46,3 +49,5 @@ set(AMOEBA_SOURCES
 add_executable(amoeba_bot amoeba/main.cpp ${AMOEBA_SOURCES})
 target_compile_features(amoeba_bot PRIVATE cxx_std_23)
 target_link_libraries(amoeba_bot PRIVATE arena::arena mlx)
+target_compile_definitions(amoeba_bot PRIVATE
+    AMOEBA_BIG_GPU_TRAINING=$<BOOL:${AMOEBA_BIG_GPU_TRAINING}>)

@@ -48,6 +48,7 @@ namespace
 
 constexpr uint64_t healthReferenceSeed = 20260819;
 constexpr uint64_t evaluationOpeningSeed = healthReferenceSeed + 7777;
+#if AMOEBA_BIG_GPU_TRAINING
 // Self-play and the gate use the same search budget so the comparison does not
 // reward a candidate under different search conditions.
 constexpr int selfPlaySimulationCount = 512;
@@ -57,6 +58,14 @@ constexpr int evaluationSimulationCount = 512;
 // creates more, smaller lanes without silently increasing GPU memory use.
 constexpr size_t selfPlayEvaluationBatchSize = 4096;
 constexpr int selfPlayGameCount = 8192;
+#else
+// The default profile remains practical on an Apple-silicon laptop. It keeps
+// the old search/data sizes while retaining the newer training safeguards.
+constexpr int selfPlaySimulationCount = 256;
+constexpr int evaluationSimulationCount = 256;
+constexpr size_t selfPlayEvaluationBatchSize = 256;
+constexpr int selfPlayGameCount = 2048;
+#endif
 // Two hundred fifty-six paired openings give 512 games. Promotion uses the
 // lower bound across the 256 pair scores, rather than a raw win-rate threshold.
 constexpr int championGameCount = 512;
@@ -67,7 +76,11 @@ constexpr int concurrentEvaluationGames = 512;
 constexpr int samplingPlyCount = 20;
 constexpr float rootNoise = 0.25f;
 constexpr float noiseAlpha = 0.35f;
+#if AMOEBA_BIG_GPU_TRAINING
 constexpr size_t trainingBatchSize = 1024;
+#else
+constexpr size_t trainingBatchSize = 256;
+#endif
 // The split is by game, never by position. One eighth of the games generated
 // by a champion are validation-only, including games retained after a rejected
 // candidate.
@@ -82,9 +95,14 @@ constexpr float validationImprovement = 1e-4f;
 constexpr float learningRate = 5e-5f;
 constexpr float weightDecay = 1e-2f;
 constexpr double gateConfidenceZ = 1.645; // one-sided 95% lower bound
-// The 512-visit gate supersedes the v1 256-visit qualification. Bump this
-// whenever a fixed baseline, its game count, or its evaluation method changes.
+// A baseline qualification is only valid at the visit count used to earn it.
+// The default v2 checkpoint stays usable locally; the high-GPU 512-visit gate
+// is v3 and therefore requalifies it before trusting the saved result.
+#if AMOEBA_BIG_GPU_TRAINING
+constexpr std::string_view baselineGateVersion = "3";
+#else
 constexpr std::string_view baselineGateVersion = "2";
+#endif
 constexpr std::string_view baselineMetadataPrefix = "training.baseline_gate.";
 constexpr std::string_view retainedStepMetadataName = "training.retained_step";
 
