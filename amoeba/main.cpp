@@ -289,12 +289,12 @@ int runBot(const std::filesystem::path& weights,
            std::string_view networkIdentifier, bool continuous)
 {
     const char* botId = std::getenv("BOT1_ID");
+    if (botId == nullptr)
+        botId = "091ab881-97a9-4823-aaa0-7812e2217f58";
+
     const char* apiKey = std::getenv("BOT1_KEY");
-    if (botId == nullptr || apiKey == nullptr)
-    {
-        std::println(stderr, "set BOT1_ID and BOT1_KEY");
-        return EXIT_FAILURE;
-    }
+    if (apiKey == nullptr)
+        apiKey = "mmdCDhUd5JXZt_XaULUQDm3xdNDVmPgejPxs8SCSggTPMuSXU4mAZiVqoJaObkFx";
 
     BotContext context;
     try
