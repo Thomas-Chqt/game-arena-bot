@@ -872,26 +872,46 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
                                    uint64_t runSeed)
 {
     selfPlayStatus = SelfPlayStatus{};
-    const size_t laneCount = std::min(
-        {mctsWorkerCount(), selfPlayEvaluationBatchSize,
-         static_cast<size_t>(selfPlayGameCount)});
-    const size_t gamesPerLane = selfPlayGameCount / laneCount;
-    const size_t extraGames = selfPlayGameCount % laneCount;
-    const size_t leavesPerLane = selfPlayEvaluationBatchSize / laneCount;
-    const size_t extraLeaves = selfPlayEvaluationBatchSize % laneCount;
-    std::vector<SelfPlayLane> lanes;
-    lanes.reserve(laneCount);
-    uint64_t firstGameId = nextGameId;
-    for (size_t laneIndex = 0; laneIndex < laneCount; ++laneIndex)
-    {
-        const size_t laneGames = gamesPerLane + (laneIndex < extraGames ? 1 : 0);
-        const size_t activeGames = leavesPerLane + (laneIndex < extraLeaves ? 1 : 0);
-        lanes.emplace_back(firstGameId, laneGames, activeGames, runSeed ^ firstGameId);
-        firstGameId += laneGames;
-    }
-    nextGameId += selfPlayGameCount;
+    // Keep one complete GPU batch in flight while the MCTS workers prepare a
+    // second, independent set of games. A game cannot advance until its own
+    // evaluation arrives, but the other group can make CPU progress meanwhile.
+    constexpr size_t groupCount = 2;
+    const size_t gamesPerGroup = selfPlayGameCount / groupCount;
+    const size_t extraGames = selfPlayGameCount % groupCount;
+    const auto makeLanes = [&](uint64_t firstGameId, size_t gameCount) {
+        const size_t laneCount = std::min(
+            {mctsWorkerCount(), selfPlayEvaluationBatchSize, gameCount});
+        const size_t gamesPerLane = gameCount / laneCount;
+        const size_t extraGamesPerLane = gameCount % laneCount;
+        const size_t leavesPerLane = selfPlayEvaluationBatchSize / laneCount;
+        const size_t extraLeaves = selfPlayEvaluationBatchSize % laneCount;
+        std::vector<SelfPlayLane> lanes;
+        lanes.reserve(laneCount);
+        for (size_t laneIndex = 0; laneIndex < laneCount; ++laneIndex)
+        {
+            const size_t laneGames = gamesPerLane
+                + (laneIndex < extraGamesPerLane ? 1 : 0);
+            const size_t activeGames = leavesPerLane
+                + (laneIndex < extraLeaves ? 1 : 0);
+            lanes.emplace_back(firstGameId, laneGames, activeGames,
+                               runSeed ^ firstGameId);
+            firstGameId += laneGames;
+        }
+        return lanes;
+    };
 
-    ThreadPool workers{laneCount};
+    std::array<std::vector<SelfPlayLane>, groupCount> groups;
+    uint64_t firstGameId = nextGameId;
+    for (size_t groupIndex = 0; groupIndex < groupCount; ++groupIndex)
+    {
+        const size_t gameCount = gamesPerGroup
+            + (groupIndex < extraGames ? 1 : 0);
+        groups[groupIndex] = makeLanes(firstGameId, gameCount);
+        firstGameId += gameCount;
+    }
+    nextGameId = firstGameId;
+
+    ThreadPool workers{mctsWorkerCount()};
     CompletedSelfPlay result;
     const auto collect = [&](CompletedSelfPlay completed) {
         if (!completed.samples.empty())
@@ -907,8 +927,14 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
         }
     };
 
-    for (;;)
+    struct InferenceBatch
     {
+        std::vector<const Board*> boards;
+        std::vector<size_t> offsets;
+        std::vector<Evaluation> evaluations;
+    };
+    const auto prepare = [&](std::vector<SelfPlayLane>& lanes) {
+        InferenceBatch batch;
         std::vector<std::future<CompletedSelfPlay>> prepared;
         prepared.reserve(lanes.size());
         for (SelfPlayLane& lane : lanes)
@@ -918,38 +944,52 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
         }
         for (std::future<CompletedSelfPlay>& future : prepared)
             collect(future.get());
-        if (stopRequested)
-            break;
 
-        std::vector<const Board*> boards;
-        std::vector<size_t> offsets;
-        offsets.reserve(lanes.size() + 1);
+        batch.offsets.reserve(lanes.size() + 1);
         for (const SelfPlayLane& lane : lanes)
         {
-            offsets.push_back(boards.size());
+            batch.offsets.push_back(batch.boards.size());
             if (!lane.hasPreparedEvaluations())
                 continue;
             const std::span<const Board* const> pending = lane.preparedBoards();
-            boards.insert(boards.end(), pending.begin(), pending.end());
+            batch.boards.insert(batch.boards.end(), pending.begin(), pending.end());
         }
-        offsets.push_back(boards.size());
-
-        if (boards.empty())
-            break;
-
-        // MLX remains confined to this coordinator thread. The worker pool owns
-        // the irregular Board/MCTS work; this one call gives CUDA a large dense
-        // batch without requiring MLX arrays to cross worker-thread boundaries.
-        std::vector<Evaluation> evaluations(boards.size());
-        network(boards, evaluations);
+        batch.offsets.push_back(batch.boards.size());
+        batch.evaluations.resize(batch.boards.size());
+        return batch;
+    };
+    const auto absorb = [](std::vector<SelfPlayLane>& lanes, const InferenceBatch& batch) {
         for (size_t laneIndex = 0; laneIndex < lanes.size(); ++laneIndex)
         {
             if (!lanes[laneIndex].hasPreparedEvaluations())
                 continue;
-            const size_t offset = offsets[laneIndex];
-            const size_t count = offsets[laneIndex + 1] - offset;
+            const size_t offset = batch.offsets[laneIndex];
+            const size_t count = batch.offsets[laneIndex + 1] - offset;
             lanes[laneIndex].absorb(
-                std::span<const Evaluation>{evaluations.data() + offset, count});
+                std::span<const Evaluation>{batch.evaluations.data() + offset, count});
+        }
+    };
+
+    InferenceBatch current = prepare(groups[0]);
+    size_t currentGroup = 0;
+    while (!current.boards.empty() && !stopRequested)
+    {
+        // submit() queues the CUDA work, then prepare() uses the MCTS workers
+        // on the other group while that CUDA work is running.
+        PendingEvaluations pending = network.submit(current.boards);
+        const size_t otherGroup = 1 - currentGroup;
+        InferenceBatch other = prepare(groups[otherGroup]);
+        network.finish(std::move(pending), current.evaluations);
+        absorb(groups[currentGroup], current);
+
+        if (!other.boards.empty())
+        {
+            current = std::move(other);
+            currentGroup = otherGroup;
+        }
+        else
+        {
+            current = prepare(groups[currentGroup]);
         }
     }
 
@@ -958,9 +998,13 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
     if (!stopRequested)
     {
         const size_t completedGames = std::accumulate(
-            lanes.begin(), lanes.end(), size_t{0},
-            [](size_t total, const SelfPlayLane& lane) {
-                return total + lane.completedGames();
+            groups.begin(), groups.end(), size_t{0},
+            [](size_t total, const std::vector<SelfPlayLane>& group) {
+                return total + std::accumulate(
+                    group.begin(), group.end(), size_t{0},
+                    [](size_t laneTotal, const SelfPlayLane& lane) {
+                        return laneTotal + lane.completedGames();
+                    });
             });
         assert(completedGames == selfPlayGameCount);
         assert(result.games == selfPlayGameCount);

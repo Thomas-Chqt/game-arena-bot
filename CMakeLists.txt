@@ -23,11 +23,14 @@ if(NOT APPLE)
     find_package(CUDNN REQUIRED)
 endif()
 
-option(AMOEBA_BUILD_MLX_FROM_SOURCE "Build the pinned MLX dependency from source" ON)
+if(APPLE)
+    # MLX is installed through Homebrew on macOS; do not fetch and rebuild it.
+    set(AMOEBA_BUILD_MLX_FROM_SOURCE OFF CACHE BOOL "Build the pinned MLX dependency from source" FORCE)
+else()
+    option(AMOEBA_BUILD_MLX_FROM_SOURCE "Build the pinned MLX dependency from source" ON)
+endif()
 option(AMOEBA_ENABLE_CUDA "Build MLX with its CUDA backend on Linux" ON)
-option(AMOEBA_BIG_GPU_TRAINING
-       "Use the high-throughput self-play and training profile for a large CUDA GPU"
-       OFF)
+option(AMOEBA_BIG_GPU_TRAINING "Use the high-throughput self-play and training profile for a large CUDA GPU" OFF)
 
 if(AMOEBA_BUILD_MLX_FROM_SOURCE)
     include(FetchContent)
@@ -66,9 +69,24 @@ set(AMOEBA_SOURCES
 add_executable(amoeba_bot amoeba/main.cpp ${AMOEBA_SOURCES})
 target_compile_features(amoeba_bot PRIVATE cxx_std_23)
 target_link_libraries(amoeba_bot PRIVATE arena::arena mlx)
-target_compile_definitions(amoeba_bot PRIVATE
-    AMOEBA_BIG_GPU_TRAINING=$<BOOL:${AMOEBA_BIG_GPU_TRAINING}>)
+target_compile_definitions(amoeba_bot PRIVATE AMOEBA_BIG_GPU_TRAINING=$<BOOL:${AMOEBA_BIG_GPU_TRAINING}>)
 
 if(NOT APPLE)
     target_link_libraries(amoeba_bot PRIVATE CUDA::cudart)
+endif()
+
+
+option(BUID_AMOEBA_2 "build amoeba 2" ON)
+if (BUID_AMOEBA_2)
+    # A classical search bot.  It shares the authoritative board/rules layer with
+    # amoeba_bot, but deliberately has no MLX inference or checkpoint dependency.
+    add_executable(amoeba_2_bot
+        amoeba_2/main.cpp
+        amoeba_2/alpha_beta.cpp
+        amoeba_2/amoeba.cpp
+    )
+    target_compile_features(amoeba_2_bot PRIVATE cxx_std_23)
+    # amoeba.hpp declares the optional tensorEncoding() adapter, so MLX supplies
+    # its public headers even though this executable never links inference code.
+    target_link_libraries(amoeba_2_bot PRIVATE arena::arena mlx)
 endif()
