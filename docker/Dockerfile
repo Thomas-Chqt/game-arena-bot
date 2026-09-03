@@ -57,7 +57,7 @@ COPY *.safetensors ./
 RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DAMOEBA_BUILD_MLX_FROM_SOURCE=OFF \
-        -DAMOEBA_BIG_GPU_TRAINING=ON \
+        -DAMOEBA_BIG_GPU_TRAINING=OFF \
         -DBUID_AMOEBA_2=OFF \
     && cmake --build build
 
