@@ -1,0 +1,41 @@
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04 AS mlx-build
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG MLX_REF=v0.32.2
+# Build without requiring BuildKit to have access to a GPU. These cover the
+# T4, A100, RTX 30/A40, L40/RTX 4090, H100, and RTX 5090 classes commonly on Vast.
+ARG MLX_CUDA_ARCHITECTURES="75;80;86;89;90;120"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        git \
+        libblas-dev \
+        liblapack-dev \
+        liblapacke-dev \
+        ninja-build \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --branch "$MLX_REF" --depth 1 https://github.com/ml-explore/mlx.git /tmp/mlx \
+    && cmake -S /tmp/mlx -B /tmp/mlx/build \
+        -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=/opt/mlx \
+        -DMLX_BUILD_CUDA=ON \
+        -DMLX_CUDA_ARCHITECTURES="$MLX_CUDA_ARCHITECTURES" \
+        -DMLX_BUILD_EXAMPLES=OFF \
+        -DMLX_BUILD_TESTS=OFF \
+        -DMLX_BUILD_PYTHON_BINDINGS=OFF \
+    && cmake --build /tmp/mlx/build \
+    && cmake --install /tmp/mlx/build \
+    && rm -rf /tmp/mlx
+
+FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
+
+COPY --from=mlx-build /opt/mlx /opt/mlx
+
+LABEL org.opencontainers.image.source=https://github.com/Thomas-Chqt/game-arena-bot \
+      org.opencontainers.image.version=v0.32.2
