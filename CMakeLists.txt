@@ -23,7 +23,13 @@ if(NOT APPLE)
     find_package(CUDNN REQUIRED)
 endif()
 
-option(AMOEBA_BUILD_MLX_FROM_SOURCE "Build the pinned MLX dependency from source" ON)
+if(APPLE)
+    # MLX is installed through Homebrew on macOS; do not fetch and rebuild it.
+    set(AMOEBA_BUILD_MLX_FROM_SOURCE OFF CACHE BOOL
+        "Build the pinned MLX dependency from source" FORCE)
+else()
+    option(AMOEBA_BUILD_MLX_FROM_SOURCE "Build the pinned MLX dependency from source" ON)
+endif()
 option(AMOEBA_ENABLE_CUDA "Build MLX with its CUDA backend on Linux" ON)
 option(AMOEBA_BIG_GPU_TRAINING
        "Use the high-throughput self-play and training profile for a large CUDA GPU"
