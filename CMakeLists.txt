@@ -20,7 +20,6 @@ set(MLX_ROOT "${defaultMlxRoot}" CACHE PATH "Prefix where MLX is installed")
 if(NOT APPLE)
     list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
     find_package(CUDAToolkit REQUIRED)
-    find_package(CUDNN REQUIRED)
 endif()
 
 if(APPLE)
