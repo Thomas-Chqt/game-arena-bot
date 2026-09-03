@@ -335,7 +335,7 @@ void MCTS<SimulationCount>::backpropagate(float value)
 {
     for (size_t trailIndex = m_edgeTrailSize; trailIndex-- > 0;)
     {
-        value = -value;
+        value = -terminalValueDiscountPerMove * value;
         Edge& edge = m_edges[m_edgeTrail[trailIndex]];
         edge.valueSum += value;
         ++edge.visits;
