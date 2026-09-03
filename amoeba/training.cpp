@@ -341,51 +341,49 @@ void finishGateStatus()
     gateStatus.visible = false;
 }
 
-void drawSelfPlayStatus()
-{
-    if (!selfPlayStatus.visible || !isatty(STDOUT_FILENO))
-        return;
-    std::print("\r\x1b[2K[selfplay] generated {} positions from {} games, "
-               "{:.1f} rounds/game, {:.1f} positions/s average",
-               selfPlayStatus.totalPositions, selfPlayStatus.games,
-               static_cast<double>(selfPlayStatus.totalPlies) / selfPlayStatus.games,
-               selfPlayStatus.positionsPerSecond);
-    std::fflush(stdout);
-}
-
-void reportCudaMemory(std::string_view phase = {}, bool force = false)
+std::string cudaMemoryStatus()
 {
 #if defined(__APPLE__)
-    (void)phase;
-    (void)force;
+    return {};
 #else
-    static std::optional<std::pair<size_t, size_t>> previous;
     size_t freeBytes = 0;
     size_t totalBytes = 0;
     const cudaError_t error = cudaMemGetInfo(&freeBytes, &totalBytes);
     if (error != cudaSuccess)
-    {
-        std::println("[cuda-memory] {}cudaMemGetInfo failed: {}",
-                     phase.empty() ? "" : std::format("{}: ", phase),
-                     cudaGetErrorString(error));
-        std::fflush(stdout);
-        return;
-    }
-    if (!force && previous == std::pair{freeBytes, totalBytes})
-        return;
-    previous = std::pair{freeBytes, totalBytes};
+        return std::format("cudaMemGetInfo failed: {}", cudaGetErrorString(error));
     constexpr double bytesPerMiB = 1024.0 * 1024.0;
     const double totalMiB = static_cast<double>(totalBytes) / bytesPerMiB;
     const double freeMiB = static_cast<double>(freeBytes) / bytesPerMiB;
+    return std::format("{:.0f}/{:.0f} MiB used, {:.0f} MiB free",
+                       totalMiB - freeMiB, totalMiB, freeMiB);
+#endif
+}
+
+void drawSelfPlayStatus()
+{
+    if (!selfPlayStatus.visible || !isatty(STDOUT_FILENO))
+        return;
+    const std::string memory = cudaMemoryStatus();
+    std::print("\r\x1b[2K[selfplay] generated {} positions from {} games, "
+               "{:.1f} rounds/game, {:.1f} positions/s average{}",
+               selfPlayStatus.totalPositions, selfPlayStatus.games,
+               static_cast<double>(selfPlayStatus.totalPlies) / selfPlayStatus.games,
+               selfPlayStatus.positionsPerSecond,
+               memory.empty() ? "" : std::format(", {}", memory));
+    std::fflush(stdout);
+}
+
+void reportCudaMemory(std::string_view phase)
+{
+    const std::string memory = cudaMemoryStatus();
+    if (memory.empty())
+        return;
     if (selfPlayStatus.visible && isatty(STDOUT_FILENO))
         clearTerminalLine();
-    std::println("[cuda-memory] {}{:.0f}/{:.0f} MiB used, {:.0f} MiB free",
-                 phase.empty() ? "" : std::format("{}: ", phase),
-                 totalMiB - freeMiB, totalMiB, freeMiB);
+    std::println("[cuda-memory] {}: {}", phase, memory);
     std::fflush(stdout);
     if (selfPlayStatus.visible && isatty(STDOUT_FILENO))
         drawSelfPlayStatus();
-#endif
 }
 
 template<typename... Args>
@@ -397,7 +395,6 @@ void report(std::format_string<Args...> format, Args&&... args)
     std::fflush(stdout);
     if (selfPlayStatus.visible)
         selfPlayStatus.positions = 0;
-    reportCudaMemory();
 }
 
 void reportSelfPlayStatus(uint64_t generatedPositions, uint64_t completedGames,
@@ -416,15 +413,16 @@ void reportSelfPlayStatus(uint64_t generatedPositions, uint64_t completedGames,
         drawSelfPlayStatus();
     else
     {
+        const std::string memory = cudaMemoryStatus();
         std::println("[selfplay] generated {} positions from {} games, "
-                     "{:.1f} rounds/game, {:.1f} positions/s average",
+                     "{:.1f} rounds/game, {:.1f} positions/s average{}",
                      selfPlayStatus.totalPositions, selfPlayStatus.games,
                      static_cast<double>(selfPlayStatus.totalPlies)
                          / selfPlayStatus.games,
-                     selfPlayStatus.positionsPerSecond);
+                     selfPlayStatus.positionsPerSecond,
+                     memory.empty() ? "" : std::format(", {}", memory));
         std::fflush(stdout);
     }
-    reportCudaMemory();
 }
 
 void finishSelfPlayStatus()
@@ -1023,23 +1021,14 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
 
     InferenceBatch current = prepare(groups[0]);
     size_t currentGroup = 0;
-    size_t inferenceCount = 0;
     while (!current.boards.empty() && !stopRequested)
     {
         // submit() queues the CUDA work, then prepare() uses the MCTS workers
         // on the other group while that CUDA work is running.
-        ++inferenceCount;
-        reportCudaMemory(
-            std::format("self-play inference {} before submit, {} real boards padded to {}",
-                        inferenceCount, current.realBoardCount, current.boards.size()),
-            true);
         PendingEvaluations pending = network.submit(current.boards);
         const size_t otherGroup = 1 - currentGroup;
         InferenceBatch other = prepare(groups[otherGroup]);
         network.finish(std::move(pending), current.evaluations);
-        reportCudaMemory(
-            std::format("self-play inference {} after finish, {} real boards padded to {}",
-                        inferenceCount, current.realBoardCount, current.boards.size()));
         absorb(groups[currentGroup], current);
 
         if (!other.boards.empty())
@@ -1743,10 +1732,10 @@ int runTraining(const std::filesystem::path& weights,
         while (!stopRequested)
         {
             const uint64_t championStep = optimizerStep;
+            reportCudaMemory(std::format("before self-play generation {}", generation));
             report("[generation {}] self-play started from the champion", generation);
             CompletedSelfPlay generated =
                 generateSelfPlay(*network, nextGameId, runSeed);
-            reportCudaMemory(std::format("after self-play generation {}", generation), true);
             if (stopRequested)
                 break;
 
@@ -1771,9 +1760,9 @@ int runTraining(const std::filesystem::path& weights,
                    generated.positionsPerSecond, pooledGames,
                    training.size() + heldOut.size(), training.size(), heldOut.size());
 
+            reportCudaMemory(std::format("before training generation {}", generation));
             std::vector<mlx::core::array> parameters = network->parameters();
             Adam adam{parameters};
-            reportCudaMemory("after Adam state creation");
             const std::vector<uint8_t> decayMask = network->weightDecayMask();
             std::vector<size_t> trainingOrder(training.size());
             std::iota(trainingOrder.begin(), trainingOrder.end(), size_t{0});
@@ -1802,10 +1791,8 @@ int runTraining(const std::filesystem::path& weights,
                         heldOut,
                         std::span<const size_t>{heldOutOrder.data() + offset, count},
                         randomEngine, false);
-                    reportCudaMemory(std::format("validation before eval, batch {}", count), true);
                     const Loss loss = network->loss(values, batch);
                     mlx::core::eval({loss.policy, loss.value});
-                    reportCudaMemory(std::format("validation after eval, batch {}", count));
                     policy += count * loss.policy.item<float>();
                     value += count * loss.value.item<float>();
                     positions += count;
@@ -1848,11 +1835,8 @@ int runTraining(const std::filesystem::path& weights,
                     for (const mlx::core::array& gradient : result.gradients)
                         gradientNormSquared = gradientNormSquared
                             + mlx::core::sum(mlx::core::square(gradient));
-                    reportCudaMemory(
-                        std::format("training gradient before eval, batch {}", count), true);
                     mlx::core::eval(
                         {result.loss.policy, result.loss.value, gradientNormSquared});
-                    reportCudaMemory(std::format("training gradient after eval, batch {}", count));
                     const float policyLoss = result.loss.policy.item<float>();
                     const float valueLoss = result.loss.value.item<float>();
                     const float gradientNorm =
@@ -1882,10 +1866,7 @@ int runTraining(const std::filesystem::path& weights,
                         parameters = adam.updateParameters(
                             parameters, result.gradients, learningRate,
                             weightDecay, decayMask);
-                        reportCudaMemory(
-                            std::format("Adam update before eval, batch {}", count), true);
                         mlx::core::eval(parameters);
-                        reportCudaMemory(std::format("Adam update after eval, batch {}", count));
                         ++optimizerStep;
                         trainPolicy += count * policyLoss;
                         trainValue += count * valueLoss;
@@ -1967,6 +1948,7 @@ int runTraining(const std::filesystem::path& weights,
             report("[train] generation {} candidate uses epoch {} {}%, step {}",
                    generation, bestEpoch, bestEpochPercent, optimizerStep);
 
+            reportCudaMemory(std::format("before gate generation {}", generation));
             const uint64_t gateBase = generation * 1'000'000;
             bool baselinesPassed = true;
             std::optional<MatchScore> randomScore;
@@ -2027,6 +2009,7 @@ int runTraining(const std::filesystem::path& weights,
                         return championScore.games;
                     });
             finishGateStatus();
+            reportCudaMemory(std::format("after gate generation {}", generation));
             if (!championCompleted)
                 break;
             const double championLowerBound =
