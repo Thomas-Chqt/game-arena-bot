@@ -5,6 +5,7 @@ FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04 AS amoeba-cuda
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG GAME_ARENA_SDK_URL=https://game-arena-assets.irvine.jp/sdk/latest/game-arena-c-sdk.zip
+ARG GAME_ARENA_BOT_REPOSITORY=https://github.com/Thomas-Chqt/game-arena-bot.git
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -13,6 +14,7 @@ RUN apt-get update \
         cmake \
         curl \
         g++-14 \
+        git \
         libblas-dev \
         liblapack-dev \
         liblapacke-dev \
@@ -49,10 +51,20 @@ ENV CMAKE_GENERATOR=Ninja \
 
 WORKDIR /workspace
 
-COPY CMakeLists.txt ./
-COPY cmake ./cmake
-COPY amoeba ./amoeba
-COPY *.safetensors ./
+# Keep a complete checkout in the image so a container can pull and push changes.
+# The repository is public, so no credential is needed while building the image.
+RUN git clone "$GAME_ARENA_BOT_REPOSITORY" .
+
+# Git invokes this helper only when a remote asks for credentials.  A runtime
+# GITHUB_TOKEN is therefore usable for push/pull without being persisted in
+# the image or in /workspace/.git/config.
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        'test -n "$GITHUB_TOKEN" || exit 0' \
+        'printf "username=x-access-token\\npassword=%s\\n" "$GITHUB_TOKEN"' \
+        > /usr/local/bin/git-credential-github-token \
+    && chmod 755 /usr/local/bin/git-credential-github-token \
+    && git config --system credential.https://github.com.helper /usr/local/bin/git-credential-github-token
 
 RUN cmake -S . -B build -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
