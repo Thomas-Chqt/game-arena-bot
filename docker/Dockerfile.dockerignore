@@ -1,0 +1,7 @@
+*
+!CMakeLists.txt
+!*.safetensors
+!cmake/
+!cmake/**
+!amoeba/
+!amoeba/**
