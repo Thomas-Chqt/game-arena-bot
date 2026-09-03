@@ -55,13 +55,13 @@ constexpr uint64_t evaluationOpeningSeed = healthReferenceSeed + 7777;
 #if AMOEBA_BIG_GPU_TRAINING
 // Self-play and the gate use the same search budget so the comparison does not
 // reward a candidate under different search conditions.
-constexpr int selfPlaySimulationCount = 512;
-constexpr int evaluationSimulationCount = 512;
+constexpr int selfPlaySimulationCount = 256;
+constexpr int evaluationSimulationCount = 256;
 // CPU lanes are sized at runtime from the available hardware threads. Their
 // combined pending leaves stay capped here, so a machine with more CPU cores
 // creates more, smaller lanes without silently increasing GPU memory use.
-constexpr size_t selfPlayEvaluationBatchSize = 4096;
-constexpr int selfPlayGameCount = 8192;
+constexpr size_t selfPlayEvaluationBatchSize = 1024;
+constexpr int selfPlayGameCount = 4096;
 #else
 // The default profile remains practical on an Apple-silicon laptop. It keeps
 // the old search/data sizes while retaining the newer training safeguards.
@@ -911,41 +911,30 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
                                    uint64_t runSeed)
 {
     selfPlayStatus = SelfPlayStatus{};
-    // Keep one complete GPU batch in flight while the MCTS workers prepare a
-    // second, independent set of games. A game cannot advance until its own
-    // evaluation arrives, but the other group can make CPU progress meanwhile.
-    constexpr size_t groupCount = 2;
-    const size_t gamesPerGroup = selfPlayGameCount / groupCount;
-    const size_t extraGames = selfPlayGameCount % groupCount;
-    const auto makeLanes = [&](uint64_t firstGameId, size_t gameCount) {
-        const size_t laneCount = std::min(
-            {mctsWorkerCount(), selfPlayEvaluationBatchSize, gameCount});
-        const size_t gamesPerLane = gameCount / laneCount;
-        const size_t extraGamesPerLane = gameCount % laneCount;
-        const size_t leavesPerLane = selfPlayEvaluationBatchSize / laneCount;
-        const size_t extraLeaves = selfPlayEvaluationBatchSize % laneCount;
-        std::vector<SelfPlayLane> lanes;
-        lanes.reserve(laneCount);
-        for (size_t laneIndex = 0; laneIndex < laneCount; ++laneIndex)
-        {
-            const size_t laneGames = gamesPerLane
-                + (laneIndex < extraGamesPerLane ? 1 : 0);
-            const size_t activeGames = leavesPerLane
-                + (laneIndex < extraLeaves ? 1 : 0);
-            lanes.emplace_back(firstGameId, laneGames, activeGames,
-                               runSeed ^ firstGameId);
-            firstGameId += laneGames;
-        }
-        return lanes;
-    };
+    // A lane produces a fixed-size chunk of leaves. Two batches' worth of
+    // lanes let workers prepare the next batch while CUDA evaluates the one
+    // already submitted. The number of chunks divides a full GPU batch, so a
+    // batch can be assembled from whichever lanes finish first.
+    const size_t maximumLanesPerBatch = std::min(
+        {selfPlayEvaluationBatchSize, mctsWorkerCount() * 2,
+         static_cast<size_t>(selfPlayGameCount / 2)});
+    size_t lanesPerBatch = maximumLanesPerBatch;
+    while (selfPlayEvaluationBatchSize % lanesPerBatch != 0)
+        --lanesPerBatch;
+    const size_t leavesPerLane = selfPlayEvaluationBatchSize / lanesPerBatch;
+    const size_t laneCount = lanesPerBatch * 2;
+    const size_t gamesPerLane = selfPlayGameCount / laneCount;
+    const size_t extraGames = selfPlayGameCount % laneCount;
 
-    std::array<std::vector<SelfPlayLane>, groupCount> groups;
+    std::vector<SelfPlayLane> lanes;
+    lanes.reserve(laneCount);
     uint64_t firstGameId = nextGameId;
-    for (size_t groupIndex = 0; groupIndex < groupCount; ++groupIndex)
+    for (size_t laneIndex = 0; laneIndex < laneCount; ++laneIndex)
     {
-        const size_t gameCount = gamesPerGroup
-            + (groupIndex < extraGames ? 1 : 0);
-        groups[groupIndex] = makeLanes(firstGameId, gameCount);
+        const size_t gameCount = gamesPerLane
+            + (laneIndex < extraGames ? 1 : 0);
+        lanes.emplace_back(firstGameId, gameCount, leavesPerLane,
+                           runSeed ^ firstGameId);
         firstGameId += gameCount;
     }
     nextGameId = firstGameId;
@@ -970,29 +959,86 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
     {
         std::vector<const Board*> boards;
         std::vector<size_t> offsets;
+        std::vector<SelfPlayLane*> lanes;
         std::vector<Evaluation> evaluations;
         size_t realBoardCount = 0;
     };
-    const auto prepare = [&](std::vector<SelfPlayLane>& lanes) {
-        InferenceBatch batch;
-        std::vector<std::future<CompletedSelfPlay>> prepared;
-        prepared.reserve(lanes.size());
+    struct PendingPrepare
+    {
+        SelfPlayLane* lane;
+        std::future<CompletedSelfPlay> result;
+    };
+    std::vector<PendingPrepare> preparing;
+    preparing.reserve(lanes.size());
+    std::deque<SelfPlayLane*> readyLanes;
+
+    const auto schedule = [&] {
         for (SelfPlayLane& lane : lanes)
         {
-            if (!lane.finished() && !lane.hasPreparedEvaluations())
-                prepared.push_back(workers.submit([&lane] { return lane.prepare(); }));
+            const bool alreadyPreparing = std::ranges::any_of(
+                preparing, [&lane](const PendingPrepare& pending) {
+                    return pending.lane == &lane;
+                });
+            if (!lane.finished() && !lane.hasPreparedEvaluations() && !alreadyPreparing)
+            {
+                preparing.push_back({
+                    &lane, workers.submit([lane = &lane] { return lane->prepare(); })});
+            }
         }
-        for (std::future<CompletedSelfPlay>& future : prepared)
-            collect(future.get());
-
-        batch.offsets.reserve(lanes.size() + 1);
-        for (const SelfPlayLane& lane : lanes)
+    };
+    const auto collectFinished = [&] {
+        for (auto iterator = preparing.begin(); iterator != preparing.end();)
         {
-            batch.offsets.push_back(batch.boards.size());
-            if (!lane.hasPreparedEvaluations())
+            if (iterator->result.wait_for(std::chrono::seconds{0})
+                != std::future_status::ready)
+            {
+                ++iterator;
                 continue;
-            const std::span<const Board* const> pending = lane.preparedBoards();
+            }
+            collect(iterator->result.get());
+            if (iterator->lane->hasPreparedEvaluations())
+                readyLanes.push_back(iterator->lane);
+            iterator = preparing.erase(iterator);
+        }
+    };
+    const auto waitForOne = [&] {
+        assert(!preparing.empty());
+        PendingPrepare pending = std::move(preparing.front());
+        preparing.erase(preparing.begin());
+        collect(pending.result.get());
+        if (pending.lane->hasPreparedEvaluations())
+            readyLanes.push_back(pending.lane);
+    };
+    const auto appendReady = [&](InferenceBatch& batch) {
+        while (!readyLanes.empty())
+        {
+            SelfPlayLane* lane = readyLanes.front();
+            const std::span<const Board* const> pending = lane->preparedBoards();
+            assert(pending.size() <= leavesPerLane);
+            if (batch.boards.size() + pending.size() > selfPlayEvaluationBatchSize)
+                break;
+            batch.offsets.push_back(batch.boards.size());
+            batch.lanes.push_back(lane);
             batch.boards.insert(batch.boards.end(), pending.begin(), pending.end());
+            readyLanes.pop_front();
+        }
+    };
+    const auto prepareBatch = [&] {
+        InferenceBatch batch;
+        for (;;)
+        {
+            collectFinished();
+            appendReady(batch);
+            if (batch.boards.size() == selfPlayEvaluationBatchSize)
+                break;
+            if (!batch.boards.empty()
+                && (!readyLanes.empty() || preparing.empty()))
+            {
+                break;
+            }
+            if (preparing.empty())
+                break;
+            waitForOne();
         }
         batch.offsets.push_back(batch.boards.size());
         batch.realBoardCount = batch.boards.size();
@@ -1007,38 +1053,45 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
         batch.evaluations.resize(batch.boards.size());
         return batch;
     };
-    const auto absorb = [](std::vector<SelfPlayLane>& lanes, const InferenceBatch& batch) {
-        for (size_t laneIndex = 0; laneIndex < lanes.size(); ++laneIndex)
+    const auto absorb = [](const InferenceBatch& batch) {
+        for (size_t laneIndex = 0; laneIndex < batch.lanes.size(); ++laneIndex)
         {
-            if (!lanes[laneIndex].hasPreparedEvaluations())
-                continue;
             const size_t offset = batch.offsets[laneIndex];
             const size_t count = batch.offsets[laneIndex + 1] - offset;
-            lanes[laneIndex].absorb(
+            batch.lanes[laneIndex]->absorb(
                 std::span<const Evaluation>{batch.evaluations.data() + offset, count});
         }
     };
 
-    InferenceBatch current = prepare(groups[0]);
-    size_t currentGroup = 0;
+    schedule();
+    InferenceBatch current = prepareBatch();
     while (!current.boards.empty() && !stopRequested)
     {
         // submit() queues the CUDA work, then prepare() uses the MCTS workers
-        // on the other group while that CUDA work is running.
-        PendingEvaluations pending = network.submit(current.boards);
-        const size_t otherGroup = 1 - currentGroup;
-        InferenceBatch other = prepare(groups[otherGroup]);
-        network.finish(std::move(pending), current.evaluations);
-        absorb(groups[currentGroup], current);
+        // on the remaining lanes while that CUDA work is running.
+        // A short final batch would underuse the GPU. Repeating one live board
+        // fills it without affecting self-play because only the leading,
+        // non-padding evaluations are returned to the MCTS lanes.
+        assert(current.boards.size() <= selfPlayEvaluationBatchSize);
+        std::vector<const Board*> submittedBoards = current.boards;
+        submittedBoards.resize(selfPlayEvaluationBatchSize, submittedBoards.front());
+        std::vector<Evaluation> submittedEvaluations(submittedBoards.size());
+        PendingEvaluations pending = network.submit(submittedBoards);
+        InferenceBatch next = prepareBatch();
+        network.finish(std::move(pending), submittedEvaluations);
+        std::ranges::copy_n(
+            submittedEvaluations.begin(), current.evaluations.size(),
+            current.evaluations.begin());
+        absorb(current);
+        schedule();
 
-        if (!other.boards.empty())
+        if (!next.boards.empty())
         {
-            current = std::move(other);
-            currentGroup = otherGroup;
+            current = std::move(next);
         }
         else
         {
-            current = prepare(groups[currentGroup]);
+            current = prepareBatch();
         }
     }
 
@@ -1047,13 +1100,9 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
     if (!stopRequested)
     {
         const size_t completedGames = std::accumulate(
-            groups.begin(), groups.end(), size_t{0},
-            [](size_t total, const std::vector<SelfPlayLane>& group) {
-                return total + std::accumulate(
-                    group.begin(), group.end(), size_t{0},
-                    [](size_t laneTotal, const SelfPlayLane& lane) {
-                        return laneTotal + lane.completedGames();
-                    });
+            lanes.begin(), lanes.end(), size_t{0},
+            [](size_t total, const SelfPlayLane& lane) {
+                return total + lane.completedGames();
             });
         assert(completedGames == selfPlayGameCount);
         assert(result.games == selfPlayGameCount);
