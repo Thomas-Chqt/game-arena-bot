@@ -81,3 +81,5 @@ RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAMOEBA_BUILD_MLX_F
     && cmake --build build
 
 ENTRYPOINT ["bash"]
+
+LABEL org.opencontainers.image.source=https://github.com/Thomas-Chqt/game-arena-bot
