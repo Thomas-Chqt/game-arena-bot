@@ -77,7 +77,11 @@ COPY cmake ./cmake
 COPY amoeba ./amoeba
 COPY *.safetensors ./
 
-RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DAMOEBA_BUILD_MLX_FROM_SOURCE=OFF \
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DAMOEBA_BUILD_MLX_FROM_SOURCE=ON \
+        -DAMOEBA_BIG_GPU_TRAINING=ON \
+        -DBUID_AMOEBA_2=OFF \
     && cmake --build build
 
 ENTRYPOINT ["bash"]
