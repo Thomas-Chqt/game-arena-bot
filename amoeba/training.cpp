@@ -3,6 +3,10 @@
 #include "mcts.hpp"
 #include "network.hpp"
 
+#if !defined(__APPLE__)
+#include <cuda_runtime_api.h>
+#endif
+
 #include <signal.h>
 #include <unistd.h>
 
@@ -358,6 +362,30 @@ void report(std::format_string<Args...> format, Args&&... args)
     std::fflush(stdout);
     if (selfPlayStatus.visible)
         selfPlayStatus.positions = 0;
+}
+
+void reportCudaMemory(std::string_view phase, size_t inferenceCount, size_t batchSize)
+{
+#if defined(__APPLE__)
+    (void)phase;
+    (void)inferenceCount;
+    (void)batchSize;
+#else
+    size_t freeBytes = 0;
+    size_t totalBytes = 0;
+    const cudaError_t error = cudaMemGetInfo(&freeBytes, &totalBytes);
+    if (error != cudaSuccess)
+    {
+        report("[cuda-memory] inference {} {} batch {}: cudaMemGetInfo failed: {}",
+               inferenceCount, phase, batchSize, cudaGetErrorString(error));
+        return;
+    }
+    constexpr double bytesPerMiB = 1024.0 * 1024.0;
+    const double totalMiB = static_cast<double>(totalBytes) / bytesPerMiB;
+    const double freeMiB = static_cast<double>(freeBytes) / bytesPerMiB;
+    report("[cuda-memory] inference {} {} batch {}: {:.0f}/{:.0f} MiB used, {:.0f} MiB free",
+           inferenceCount, phase, batchSize, totalMiB - freeMiB, totalMiB, freeMiB);
+#endif
 }
 
 void reportSelfPlayStatus(uint64_t generatedPositions, uint64_t completedGames,
@@ -972,14 +1000,18 @@ CompletedSelfPlay generateSelfPlay(const Network& network,
 
     InferenceBatch current = prepare(groups[0]);
     size_t currentGroup = 0;
+    size_t inferenceCount = 0;
     while (!current.boards.empty() && !stopRequested)
     {
         // submit() queues the CUDA work, then prepare() uses the MCTS workers
         // on the other group while that CUDA work is running.
+        ++inferenceCount;
+        reportCudaMemory("before submit", inferenceCount, current.boards.size());
         PendingEvaluations pending = network.submit(current.boards);
         const size_t otherGroup = 1 - currentGroup;
         InferenceBatch other = prepare(groups[otherGroup]);
         network.finish(std::move(pending), current.evaluations);
+        reportCudaMemory("after finish", inferenceCount, current.boards.size());
         absorb(groups[currentGroup], current);
 
         if (!other.boards.empty())
