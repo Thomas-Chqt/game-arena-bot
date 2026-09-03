@@ -72,3 +72,15 @@ target_compile_definitions(amoeba_bot PRIVATE
 if(NOT APPLE)
     target_link_libraries(amoeba_bot PRIVATE CUDA::cudart)
 endif()
+
+# A classical search bot.  It shares the authoritative board/rules layer with
+# amoeba_bot, but deliberately has no MLX inference or checkpoint dependency.
+add_executable(amoeba_2_bot
+    amoeba_2/main.cpp
+    amoeba_2/alpha_beta.cpp
+    amoeba_2/amoeba.cpp
+)
+target_compile_features(amoeba_2_bot PRIVATE cxx_std_23)
+# amoeba.hpp declares the optional tensorEncoding() adapter, so MLX supplies
+# its public headers even though this executable never links inference code.
+target_link_libraries(amoeba_2_bot PRIVATE arena::arena mlx)
