@@ -70,13 +70,24 @@ constexpr int evaluationSimulationCount = 256;
 constexpr size_t selfPlayEvaluationBatchSize = 256;
 constexpr int selfPlayGameCount = 2048;
 #endif
+constexpr int evaluationOpeningPlyCount = 4;
+#if AMOEBA_BIG_GPU_TRAINING
+// Keep every gate network fed with a full 1,024-leaf inference batch. Champion
+// games are paired and split evenly between the candidate and champion, hence
+// 2,048 concurrent games. Promotion still uses the lower bound over paired
+// scores rather than a raw win-rate threshold.
+constexpr int championGameCount = 2048;
+constexpr int randomGameCount = 1024;
+constexpr int rolloutGameCount = 1024;
+constexpr int concurrentEvaluationGames = 2048;
+#else
 // Two hundred fifty-six paired openings give 512 games. Promotion uses the
 // lower bound across the 256 pair scores, rather than a raw win-rate threshold.
 constexpr int championGameCount = 512;
-constexpr int evaluationOpeningPlyCount = 4;
 constexpr int randomGameCount = 256;
 constexpr int rolloutGameCount = 256;
 constexpr int concurrentEvaluationGames = 512;
+#endif
 constexpr int samplingPlyCount = 20;
 constexpr float rootNoise = 0.25f;
 constexpr float noiseAlpha = 0.35f;
@@ -690,6 +701,25 @@ void addExplorationNoise(Evaluation& evaluation, const Board& board,
     });
 }
 
+void evaluateGateBatch(const Network& network, std::vector<const Board*>& boards,
+                       std::vector<Evaluation>& evaluations)
+{
+    assert(!boards.empty());
+#if AMOEBA_BIG_GPU_TRAINING
+    // Gate game counts can become uneven as games finish. Keep the CUDA graph
+    // and GPU work at the fixed high-throughput shape; only real leaves have
+    // offsets in their games, so filler evaluations are never absorbed.
+    const size_t realBoardCount = boards.size();
+    boards.resize(selfPlayEvaluationBatchSize, boards.back());
+    evaluations.resize(boards.size());
+    network(boards, evaluations);
+    evaluations.resize(realBoardCount);
+#else
+    evaluations.resize(boards.size());
+    network(boards, evaluations);
+#endif
+}
+
 template<int SimulationCount>
 class NetworkMatchRunner
 {
@@ -776,9 +806,9 @@ public:
             {
                 if (pendingBoards[networkIndex].empty())
                     continue;
-                evaluations[networkIndex].resize(pendingBoards[networkIndex].size());
-                (*m_networks[networkIndex])(
-                    pendingBoards[networkIndex], evaluations[networkIndex]);
+                evaluateGateBatch(*m_networks[networkIndex],
+                                  pendingBoards[networkIndex],
+                                  evaluations[networkIndex]);
             }
             for (ActiveGame<SimulationCount>& game : games)
             {
@@ -1530,8 +1560,7 @@ bool playBaselineGames(const Network& candidate, Baseline baseline,
         }
         if (completed == GameCount)
             break;
-        evaluations.resize(pendingBoards.size());
-        candidate(pendingBoards, evaluations);
+        evaluateGateBatch(candidate, pendingBoards, evaluations);
         for (BaselineGame& game : games)
         {
             if (game.outcome.has_value() || game.pendingLeaf == nullptr)
