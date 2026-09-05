@@ -63,4 +63,4 @@ RUN cmake -S . -B build -G Ninja \
 
 ENTRYPOINT ["bash"]
 
-LABEL org.opencontainers.image.source=https://github.com/Thomas-Chqt/game-arena-bot
+LABEL org.opencontainers.image.source=https://github.com
